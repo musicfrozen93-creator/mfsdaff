@@ -37,6 +37,11 @@ class Settings:
     DAILY_LOSS_LIMIT_PCT: float = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "-20.0"))
     DAILY_MAX_TRADES: int = int(os.getenv("DAILY_MAX_TRADES", "25"))
 
+    # Anti-overtrading controls
+    MAX_VOLATILITY_PCT: float = float(os.getenv("MAX_VOLATILITY_PCT", "5.0"))
+    HOURLY_MAX_TRADES: int = int(os.getenv("HOURLY_MAX_TRADES", "3"))
+    COIN_COOLDOWN_MINUTES: int = int(os.getenv("COIN_COOLDOWN_MINUTES", "60"))
+
     def __post_init__(self):
         self.EXCLUDED_COINS = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 

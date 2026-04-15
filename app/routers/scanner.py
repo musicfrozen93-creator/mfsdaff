@@ -1,4 +1,4 @@
-"""Scanner API endpoint — returns single coin"""
+"""Scanner API endpoint — returns up to 100 coins"""
 
 import logging
 from fastapi import APIRouter, HTTPException
@@ -11,21 +11,17 @@ logger = logging.getLogger(__name__)
 @router.get("/scan")
 async def scan_market():
     """
-    Scan Binance Futures and return 1 randomly selected coin.
-    Top volume → top 10 → top 5 → random 1.
+    Scan Binance Futures and return up to 100 coins
+    sorted by 24h volume that pass quality filters.
     """
     try:
         scanner = MarketScanner()
-        results = await scanner.scan(top_n=1)
-
-        if not results:
-            return {"status": "ok", "count": 0, "coins": [], "selected": None}
+        results = await scanner.scan(top_n=100)
 
         return {
             "status": "ok",
             "count": len(results),
             "coins": results,
-            "selected": results[0],
         }
     except Exception as e:
         logger.error(f"Scan failed: {e}")

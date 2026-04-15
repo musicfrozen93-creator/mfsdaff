@@ -1,8 +1,8 @@
 """
 Scalping AI Decision Engine
 Fast RSI-based logic — no external API needed.
-RSI < 30 → BUY, RSI > 70 → SELL, else → HOLD
-Less strict thresholds for more trades.
+RSI < 35 → BUY, RSI > 65 → SELL, else → HOLD
+Slightly wider thresholds for more opportunities without extra risk.
 """
 
 import logging
@@ -90,9 +90,11 @@ class ScalpingEngine:
 
     async def analyze(self, symbol: str) -> ScalpDecision:
         """
-        Scalping analysis:
-        - RSI < 30 → BUY
-        - RSI > 70 → SELL
+        Scalping analysis with slightly wider RSI thresholds:
+        - RSI < 35 → BUY  (was 30)
+        - RSI > 65 → SELL (was 70)
+        - RSI < 42 + UP trend → BUY  (was 40)
+        - RSI > 58 + DOWN trend → SELL (was 60)
         - Else → HOLD
         Uses short-term EMA trend for confidence boost.
         """
@@ -131,15 +133,16 @@ class ScalpingEngine:
             else:
                 trend = "NEUTRAL"
 
-            # --- SCALPING DECISION LOGIC ---
+            # --- SCALPING DECISION LOGIC (widened RSI thresholds) ---
             action = "HOLD"
             confidence = 0
             reason = ""
 
-            if rsi < 30:
+            # PRIMARY SIGNALS: RSI extremes (widened from 30/70 to 35/65)
+            if rsi < 35:
                 action = "BUY"
                 # Base confidence from RSI extremity
-                rsi_strength = (30 - rsi) / 30 * 100
+                rsi_strength = (35 - rsi) / 35 * 100
                 confidence = int(min(65 + rsi_strength * 0.35, 95))
 
                 if trend == "UP":
@@ -151,9 +154,9 @@ class ScalpingEngine:
                 else:
                     reason = f"RSI={rsi:.1f} oversold — bounce expected"
 
-            elif rsi > 70:
+            elif rsi > 65:
                 action = "SELL"
-                rsi_strength = (rsi - 70) / 30 * 100
+                rsi_strength = (rsi - 65) / 35 * 100
                 confidence = int(min(65 + rsi_strength * 0.35, 95))
 
                 if trend == "DOWN":
@@ -165,15 +168,16 @@ class ScalpingEngine:
                 else:
                     reason = f"RSI={rsi:.1f} overbought — pullback expected"
 
-            elif rsi < 40 and trend == "UP":
+            # SECONDARY SIGNALS: Trend-confirmed near-extreme (widened from 40/60 to 42/58)
+            elif rsi < 42 and trend == "UP":
                 action = "BUY"
-                confidence = int(55 + (40 - rsi) * 0.8)
+                confidence = int(55 + (42 - rsi) * 0.8)
                 confidence = min(confidence, 78)
                 reason = f"RSI={rsi:.1f} approaching oversold + uptrend"
 
-            elif rsi > 60 and trend == "DOWN":
+            elif rsi > 58 and trend == "DOWN":
                 action = "SELL"
-                confidence = int(55 + (rsi - 60) * 0.8)
+                confidence = int(55 + (rsi - 58) * 0.8)
                 confidence = min(confidence, 78)
                 reason = f"RSI={rsi:.1f} approaching overbought + downtrend"
 
@@ -181,6 +185,13 @@ class ScalpingEngine:
                 action = "HOLD"
                 confidence = max(20, int(50 - abs(rsi - 50)))
                 reason = f"RSI={rsi:.1f} neutral zone — no clear signal"
+
+            # --- VOLATILITY PENALTY ---
+            # Reduce confidence slightly for very high volatility (safety measure)
+            if atr_pct > 3.0 and action != "HOLD":
+                penalty = int((atr_pct - 3.0) * 3)
+                confidence = max(confidence - penalty, 50)
+                reason += f" | high volatility ATR%={atr_pct:.1f}"
 
             logger.info(f"  Action={action} | Confidence={confidence} | RSI={rsi} | Trend={trend}")
 

@@ -1,6 +1,7 @@
 """
 Executor API endpoint — Scalping mode
-Integrates dynamic risk management, daily limits, duplicate protection.
+Integrates dynamic risk management, daily limits, duplicate protection,
+per-coin cooldown, hourly rate limit, and volatility skip.
 """
 
 import logging
@@ -37,10 +38,12 @@ async def execute_trade(req: ExecuteRequest):
     """
     Scalping execution:
     1. Check daily risk limits
-    2. Check duplicate trades
-    3. Apply dynamic risk engine
-    4. Execute trade
-    5. Send Telegram notification
+    2. Check hourly rate limit (max 3/hour)
+    3. Check per-coin cooldown (1 hour)
+    4. Check volatility (skip if ATR% too high)
+    5. Apply dynamic risk engine
+    6. Execute trade
+    7. Send Telegram notification
     """
     telegram = TelegramNotifier()
 
@@ -63,6 +66,28 @@ async def execute_trade(req: ExecuteRequest):
     # ── Confidence check ─────────────────────────────────────────────
     if req.confidence < settings.MIN_CONFIDENCE:
         msg = f"Confidence {req.confidence} < minimum {settings.MIN_CONFIDENCE}"
+        return {"status": "skipped", "reason": msg}
+
+    # ── Hourly rate limit (max 3 trades/hour) ────────────────────────
+    hourly_limited, hourly_count = state_manager.is_hourly_limit_reached()
+    if hourly_limited:
+        msg = f"Hourly limit reached: {hourly_count}/{settings.HOURLY_MAX_TRADES} trades this hour"
+        logger.info(f"  ⏰ {msg}")
+        return {"status": "skipped", "reason": msg}
+
+    # ── Per-coin cooldown (1 hour) ───────────────────────────────────
+    on_cooldown, remaining_secs = state_manager.is_coin_on_cooldown(req.symbol)
+    if on_cooldown:
+        remaining_min = remaining_secs // 60
+        msg = f"Cooldown: {req.symbol} was traded recently — {remaining_min}m remaining"
+        logger.info(f"  🕐 {msg}")
+        return {"status": "skipped", "reason": msg}
+
+    # ── Volatility skip (ATR% too high) ──────────────────────────────
+    if req.atr_pct > settings.MAX_VOLATILITY_PCT:
+        msg = f"Volatility too high: ATR%={req.atr_pct:.2f}% > max {settings.MAX_VOLATILITY_PCT}%"
+        logger.info(f"  🌊 {msg}")
+        await telegram.trade_skipped(req.symbol, msg)
         return {"status": "skipped", "reason": msg}
 
     # ── Duplicate trade protection ───────────────────────────────────

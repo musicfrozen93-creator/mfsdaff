@@ -1,13 +1,17 @@
 """
 In-memory trade state tracker with daily risk control.
-Tracks last trades for duplicate protection and daily P&L limits.
+Tracks last trades for duplicate protection, per-coin cooldown,
+hourly rate limits, and daily P&L limits.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, List
-from datetime import datetime, date
+from typing import Optional, List, Dict
+from datetime import datetime, date, timedelta
 import json
 import os
+import time
+
+from app.config import settings
 
 STATE_FILE = "logs/trade_state.json"
 
@@ -29,6 +33,12 @@ class TradeState:
     daily_starting_balance: float = 0.0
     trading_paused: bool = False
     pause_reason: str = ""
+
+    # Per-coin cooldown: { "XRPUSDT": 1713200000.0, ... } (unix timestamps)
+    coin_last_trade_times: Dict[str, float] = field(default_factory=dict)
+
+    # Hourly rate limit: list of unix timestamps of recent trades
+    hourly_trade_timestamps: List[float] = field(default_factory=list)
 
 
 class StateManager:
@@ -92,9 +102,9 @@ class StateManager:
                 return {"allowed": False, "reason": self.state.pause_reason}
 
         # Check max trades
-        if self.state.daily_trades >= 25:
+        if self.state.daily_trades >= settings.DAILY_MAX_TRADES:
             self.state.trading_paused = True
-            self.state.pause_reason = f"Daily trade limit hit: {self.state.daily_trades} >= 25"
+            self.state.pause_reason = f"Daily trade limit hit: {self.state.daily_trades} >= {settings.DAILY_MAX_TRADES}"
             self.save()
             return {"allowed": False, "reason": self.state.pause_reason}
 
@@ -105,6 +115,63 @@ class StateManager:
         last_two = self.state.last_traded_symbols[-2:]
         return symbol in last_two
 
+    # ─── NEW: Per-Coin Cooldown ──────────────────────────────────────
+
+    def is_coin_on_cooldown(self, symbol: str) -> tuple[bool, int]:
+        """
+        Check if a coin was traded within the cooldown period.
+        Returns (is_on_cooldown, remaining_seconds).
+        """
+        last_time = self.state.coin_last_trade_times.get(symbol)
+        if last_time is None:
+            return False, 0
+
+        now = time.time()
+        cooldown_seconds = settings.COIN_COOLDOWN_MINUTES * 60
+        elapsed = now - last_time
+        remaining = cooldown_seconds - elapsed
+
+        if remaining > 0:
+            return True, int(remaining)
+        return False, 0
+
+    def _record_coin_trade_time(self, symbol: str):
+        """Record the current time as the last trade time for a coin."""
+        self.state.coin_last_trade_times[symbol] = time.time()
+        # Prune old entries (older than 24h) to prevent dict growing forever
+        cutoff = time.time() - 86400
+        self.state.coin_last_trade_times = {
+            s: t for s, t in self.state.coin_last_trade_times.items()
+            if t > cutoff
+        }
+
+    # ─── NEW: Hourly Rate Limit ──────────────────────────────────────
+
+    def is_hourly_limit_reached(self) -> tuple[bool, int]:
+        """
+        Check if the hourly trade limit has been reached.
+        Returns (is_limited, current_count_this_hour).
+        """
+        now = time.time()
+        one_hour_ago = now - 3600
+
+        # Prune timestamps older than 1 hour
+        self.state.hourly_trade_timestamps = [
+            ts for ts in self.state.hourly_trade_timestamps
+            if ts > one_hour_ago
+        ]
+
+        count = len(self.state.hourly_trade_timestamps)
+        if count >= settings.HOURLY_MAX_TRADES:
+            return True, count
+        return False, count
+
+    def _record_hourly_trade(self):
+        """Record a trade timestamp for hourly rate limiting."""
+        self.state.hourly_trade_timestamps.append(time.time())
+
+    # ─── Trade Lifecycle ─────────────────────────────────────────────
+
     def open_trade(self, symbol: str):
         self.state.has_open_trade = True
         self.state.open_symbol = symbol
@@ -114,6 +181,11 @@ class StateManager:
         # Keep only last 10 symbols in memory
         if len(self.state.last_traded_symbols) > 10:
             self.state.last_traded_symbols = self.state.last_traded_symbols[-10:]
+
+        # Record cooldown and hourly timestamps
+        self._record_coin_trade_time(symbol)
+        self._record_hourly_trade()
+
         self.save()
 
     def close_trade(self, pnl: float):
@@ -134,6 +206,15 @@ class StateManager:
         )
         starting = self.state.daily_starting_balance
         daily_pnl_pct = (self.state.daily_pnl / starting * 100) if starting > 0 else 0.0
+
+        # Calculate current hourly trade count
+        now = time.time()
+        one_hour_ago = now - 3600
+        hourly_count = len([
+            ts for ts in self.state.hourly_trade_timestamps
+            if ts > one_hour_ago
+        ])
+
         return {
             "total_trades": total,
             "winning_trades": self.state.winning_trades,
@@ -149,6 +230,9 @@ class StateManager:
             "daily_pnl_pct": round(daily_pnl_pct, 2),
             "trading_paused": self.state.trading_paused,
             "pause_reason": self.state.pause_reason,
+            "hourly_trades": hourly_count,
+            "hourly_max": settings.HOURLY_MAX_TRADES,
+            "coin_cooldown_minutes": settings.COIN_COOLDOWN_MINUTES,
         }
 
 
