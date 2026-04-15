@@ -6,12 +6,16 @@ services:
     container_name: crypto-trading-bot
     ports:
       - "8000:8000"
-  environment:
-  - BINANCE_TESTNET=true
-  - OPENAI_MODEL=gpt-4o
-  - ACCOUNT_BALANCE=50
-  - MIN_CONFIDENCE=70
-  
+    environment:
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_SECRET_KEY=${BINANCE_SECRET_KEY}
+      - BINANCE_TESTNET=${BINANCE_TESTNET}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - ACCOUNT_BALANCE=${ACCOUNT_BALANCE}
+      - MIN_CONFIDENCE=${MIN_CONFIDENCE}
     volumes:
       - ./logs:/app/logs
     restart: unless-stopped
@@ -32,11 +36,12 @@ services:
       - N8N_BASIC_AUTH_ACTIVE=true
       - N8N_BASIC_AUTH_USER=admin
       - N8N_BASIC_AUTH_PASSWORD=changeme
-      - N8N_HOST=89.116.28.83
+      - N8N_HOST=0.0.0.0
       - N8N_PORT=5678
       - N8N_PROTOCOL=http
       - WEBHOOK_URL=http://89.116.28.83:5678/
       - GENERIC_TIMEZONE=UTC
+      - N8N_SECURE_COOKIE=false
     volumes:
       - n8n_data:/home/node/.n8n
     restart: unless-stopped
