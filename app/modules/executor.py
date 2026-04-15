@@ -14,7 +14,6 @@ from urllib.parse import urlencode
 import httpx
 
 from app.config import settings
-from app.modules.risk_engine import TradeParameters
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +84,22 @@ class BinanceExecutor:
 
             resp.raise_for_status()
             return resp.json()
+
+    # ─── Price Fetching ───────────────────────────────────────────────
+
+    async def get_market_price(self, symbol: str) -> float:
+        """Fetch the current market price for a symbol"""
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{self.base_url}/fapi/v1/ticker/price",
+                params={"symbol": symbol},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            price = float(data["price"])
+            if price <= 0:
+                raise ValueError(f"Invalid price {price} for {symbol}")
+            return price
 
     # ─── Precision ────────────────────────────────────────────────────
 
@@ -225,11 +240,74 @@ class BinanceExecutor:
         }
         return await self._signed_request("POST", "/fapi/v1/order", params)
 
-    # ─── Full Trade Flow ──────────────────────────────────────────────
+    # ─── Simple USDT-Based Execution ─────────────────────────────────
 
-    async def execute_trade(self, params: TradeParameters) -> OrderResult:
+    async def execute_simple(self, symbol: str, side: str, usdt_amount: float) -> dict:
         """
-        Full trade execution flow:
+        Simple trade execution from USDT amount:
+        1. Fetch current market price
+        2. Get symbol precision
+        3. Convert USDT → quantity (quantity = usdt_amount / price)
+        4. Validate quantity and notional
+        5. Place market order
+
+        Returns a clean result dict.
+        """
+        logger.info(f"⚡ Simple execute: {side} ${usdt_amount} of {symbol}...")
+
+        # 1. Fetch current market price
+        price = await self.get_market_price(symbol)
+        logger.info(f"  Market price: ${price}")
+
+        # 2. Get symbol precision
+        precision = await self.get_precision(symbol)
+
+        # 3. Convert USDT → quantity
+        raw_quantity = usdt_amount / price
+        quantity = round(raw_quantity, precision.quantity_precision)
+        logger.info(f"  Quantity: {raw_quantity} → rounded to {quantity} (precision={precision.quantity_precision})")
+
+        # 4. Validate
+        if quantity <= 0:
+            raise ValueError(
+                f"Quantity is 0 after rounding. "
+                f"usdt_amount={usdt_amount}, price={price}, precision={precision.quantity_precision}"
+            )
+
+        notional = quantity * price
+        if notional < precision.min_notional:
+            raise ValueError(
+                f"Notional {notional:.2f} USDT below minimum {precision.min_notional}. "
+                f"Increase usdt_amount (currently {usdt_amount})"
+            )
+
+        if quantity < precision.min_qty:
+            raise ValueError(
+                f"Quantity {quantity} below minimum {precision.min_qty} for {symbol}"
+            )
+
+        # 5. Set margin type (ignore if already set)
+        await self.set_margin_type(symbol, "ISOLATED")
+
+        # 6. Place market order
+        order = await self.place_market_order(symbol, side, quantity, precision)
+        order_id = order.get("orderId")
+        logger.info(f"  ✅ Market order placed: #{order_id}")
+
+        return {
+            "order_id": order_id,
+            "symbol": symbol,
+            "side": side,
+            "quantity": quantity,
+            "price": price,
+            "notional": round(notional, 2),
+        }
+
+    # ─── Full Trade Flow (with SL/TP) ────────────────────────────────
+
+    async def execute_trade(self, params) -> OrderResult:
+        """
+        Full trade execution flow with SL/TP:
         1. Validate precision
         2. Set leverage + margin type
         3. Place market order
