@@ -1,8 +1,10 @@
 """
-Telegram Notification Module — Scalping Format
+V2 Telegram Notification Module — Premium Message Formats
+Clean, professional trade alerts with no order ID clutter.
 """
 
 import logging
+from typing import Optional
 import httpx
 from app.config import settings
 
@@ -29,6 +31,7 @@ class TelegramNotifier:
                         "chat_id": self.chat_id,
                         "text": message,
                         "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
                     },
                 )
                 resp.raise_for_status()
@@ -37,37 +40,112 @@ class TelegramNotifier:
             logger.error(f"Telegram notification failed: {e}")
             return False
 
-    async def scalp_trade(
+    # ─── Trade Opened ─────────────────────────────────────────────────
+
+    async def trade_opened(
         self,
         symbol: str,
-        action: str,
-        confidence: int,
+        side: str,
         entry_price: float,
+        leverage: int,
+        position_size: float,
         take_profit: float,
         stop_loss: float,
-        leverage: int,
-        reason: str,
+        confidence: int,
+        account_label: str = "",
     ):
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        account_line = f"\nAccount: <b>{account_label}</b>" if account_label else ""
         msg = (
-            f"🚀 <b>SCALP TRADE</b>\n\n"
-            f"Symbol: <b>{symbol}</b>\n"
-            f"Action: <b>{action}</b>\n"
-            f"Confidence: <b>{confidence}%</b>\n\n"
+            f"✅ <b>TRADE OPENED</b>\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
             f"Entry: <b>${entry_price:,.6f}</b>\n"
+            f"Leverage: <b>{leverage}x</b>\n"
+            f"Size: <b>${position_size:,.2f}</b>\n"
             f"TP: <b>${take_profit:,.6f}</b>\n"
             f"SL: <b>${stop_loss:,.6f}</b>\n"
-            f"Leverage: <b>{leverage}x</b>\n\n"
-            f"Reason: <i>{reason}</i>"
+            f"Confidence: <b>{confidence}%</b>"
+            f"{account_line}"
         )
         await self.send(msg)
 
-    async def trade_skipped(self, symbol: str, reason: str):
+    # ─── Signal Summary (Multi-Account) ───────────────────────────────
+
+    async def signal_summary(
+        self,
+        symbol: str,
+        side: str,
+        confidence: int,
+        executed_count: int,
+        skipped_count: int,
+        skip_reasons: dict,  # {"Low Balance": 3, "Risk Limit": 1, ...}
+        total_accounts: int,
+    ):
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+
+        lines = [
+            f"📊 <b>SIGNAL SUMMARY</b>\n",
+            f"Coin: <b>{symbol}</b>",
+            f"Side: <b>{direction}</b>",
+            f"Confidence: <b>{confidence}%</b>\n",
+            f"✅ Executed: <b>{executed_count}</b> accounts",
+            f"⏭️ Skipped: <b>{skipped_count}</b> accounts",
+        ]
+
+        if skip_reasons:
+            lines.append("\n<b>Skip Reasons:</b>")
+            for reason, count in skip_reasons.items():
+                lines.append(f"  • {count} {reason}")
+
+        msg = "\n".join(lines)
+        await self.send(msg)
+
+    # ─── Trade Skipped ────────────────────────────────────────────────
+
+    async def trade_skipped(self, symbol: str, reason: str, account_label: str = ""):
+        account_line = f"\nAccount: {account_label}" if account_label else ""
         msg = (
             f"⏭️ <b>TRADE SKIPPED</b>\n"
             f"Symbol: {symbol}\n"
             f"Reason: <i>{reason}</i>"
+            f"{account_line}"
         )
         await self.send(msg)
+
+    # ─── Scan Complete ────────────────────────────────────────────────
+
+    async def scan_complete(self, count: int, top_coins: list, tradeable_count: int = 0):
+        if count == 0:
+            msg = (
+                f"🔍 <b>SCAN COMPLETE — NO CANDIDATES</b>\n"
+                f"No coins passed quality filters.\n"
+                f"Next scan in 5 minutes."
+            )
+        else:
+            coin_list = ", ".join(top_coins[:5])
+            if len(top_coins) > 5:
+                coin_list += f" +{len(top_coins) - 5} more"
+            msg = (
+                f"🔍 <b>SCAN COMPLETE</b>\n\n"
+                f"Candidates: <b>{count}</b>\n"
+                f"Tradeable signals: <b>{tradeable_count}</b>\n"
+                f"Top: {coin_list}"
+            )
+        await self.send(msg)
+
+    # ─── No Signals ───────────────────────────────────────────────────
+
+    async def no_signals(self, analyzed_count: int = 0):
+        msg = (
+            f"🔍 <b>SCAN COMPLETE — NO SIGNALS</b>\n"
+            f"Analyzed: {analyzed_count} coins\n"
+            f"No trades met confluence criteria.\n"
+            f"Next scan in 5 minutes."
+        )
+        await self.send(msg)
+
+    # ─── Trading Paused ──────────────────────────────────────────────
 
     async def trading_paused(self, reason: str):
         msg = (
@@ -75,6 +153,41 @@ class TelegramNotifier:
             f"Reason: <i>{reason}</i>"
         )
         await self.send(msg)
+
+    # ─── Loss Cooldown ────────────────────────────────────────────────
+
+    async def loss_cooldown(self, consecutive_losses: int, cooldown_minutes: int):
+        msg = (
+            f"🔴 <b>LOSS COOLDOWN ACTIVATED</b>\n\n"
+            f"Consecutive losses: <b>{consecutive_losses}</b>\n"
+            f"Pausing for: <b>{cooldown_minutes} minutes</b>"
+        )
+        await self.send(msg)
+
+    # ─── Daily Report ─────────────────────────────────────────────────
+
+    async def daily_report(
+        self,
+        total_trades: int,
+        win_rate: float,
+        pnl: float,
+        active_accounts: int,
+        skipped_trades: int,
+        ai_calls: int,
+    ):
+        pnl_emoji = "📈" if pnl >= 0 else "📉"
+        msg = (
+            f"📊 <b>DAILY REPORT</b>\n\n"
+            f"Total Trades: <b>{total_trades}</b>\n"
+            f"Win Rate: <b>{win_rate:.1f}%</b>\n"
+            f"P&L: <b>{pnl_emoji} ${pnl:,.2f}</b>\n"
+            f"Active Accounts: <b>{active_accounts}</b>\n"
+            f"Skipped Trades: <b>{skipped_trades}</b>\n"
+            f"AI Calls: <b>{ai_calls}</b>"
+        )
+        await self.send(msg)
+
+    # ─── Error Alert ──────────────────────────────────────────────────
 
     async def error_alert(self, context: str, error: str):
         msg = (

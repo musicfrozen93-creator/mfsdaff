@@ -1,40 +1,42 @@
-# 🤖 AI Crypto Futures Trading Bot
+# 🤖 V2 Multi-Account Crypto Futures Scalping Bot
 
-A fully automated, AI-powered crypto futures trading system for small accounts ($10–$50).
-Built with FastAPI, OpenAI GPT-4o, Binance Futures API, and n8n automation.
+A professional, automated crypto futures scalping system with multi-account support,
+layered confluence signals, AI verification, dynamic risk management, and encrypted API key storage.
+
+Built with FastAPI, PostgreSQL, OpenAI GPT-4o, Binance Futures API, and n8n workflow automation.
 
 ---
 
 ## ⚠️ DISCLAIMER
 
 Trading crypto futures involves significant risk of loss. This system is provided for
-educational and research purposes. Always start on **testnet** and never risk more than
-you can afford to lose. Past performance does not guarantee future results.
+educational and research purposes. Always start on **Binance Testnet** and never risk
+more than you can afford to lose. Past performance does not guarantee future results.
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        n8n Workflow                         │
-│  [Cron 4h] → [Scan] → [Analyze] → [AI] → [Risk] → [Trade] │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ HTTP
-┌──────────────────────────▼──────────────────────────────────┐
-│                   FastAPI Backend                           │
-│  ┌──────────┐  ┌──────────┐  ┌────────────┐  ┌─────────┐  │
-│  │ Scanner  │  │ Analyzer │  │ Risk Engine│  │Executor │  │
-│  └──────────┘  └──────────┘  └────────────┘  └─────────┘  │
-│  ┌──────────┐  ┌──────────┐  ┌────────────┐               │
-│  │OrderBook │  │AI Engine │  │Safety Layer│               │
-│  └──────────┘  └──────────┘  └────────────┘               │
-└────────────┬───────────────────────────┬────────────────────┘
-             │                           │
-    ┌────────▼────────┐        ┌─────────▼────────┐
-    │  Binance Futures│        │    OpenAI GPT-4o  │
-    │  USDT Perps     │        │    Decision Engine│
-    └─────────────────┘        └──────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                        n8n Workflow (Every 5m)                       │
+│  [Schedule] → [Scan] → [Batch Analyze] → [Filter] → [Execute Multi] │
+└────────────────────────────────┬─────────────────────────────────────┘
+                                 │ HTTP
+┌────────────────────────────────▼─────────────────────────────────────┐
+│                     FastAPI Backend (V2)                              │
+│  ┌──────────┐  ┌──────────┐  ┌────────────┐  ┌───────────────────┐  │
+│  │ Scanner  │  │ Analyzer │  │ AI Engine  │  │ Multi-Acc Executor│  │
+│  └──────────┘  └──────────┘  │ (OpenAI +  │  └───────────────────┘  │
+│  ┌──────────┐  ┌──────────┐  │ Technical) │  ┌───────────────────┐  │
+│  │OrderBook │  │Risk Eng. │  └────────────┘  │ Accounts Manager  │  │
+│  └──────────┘  └──────────┘                  └───────────────────┘  │
+└──────┬──────────────┬──────────────┬──────────────────┬──────────────┘
+       │              │              │                  │
+┌──────▼──────┐ ┌─────▼──────┐ ┌────▼─────┐  ┌────────▼────────┐
+│  Binance    │ │ PostgreSQL │ │ OpenAI   │  │   Telegram Bot  │
+│  Futures    │ │  Database  │ │ GPT-4o   │  │   Notifications │
+└─────────────┘ └────────────┘ └──────────┘  └─────────────────┘
 ```
 
 ---
@@ -44,25 +46,34 @@ you can afford to lose. Past performance does not guarantee future results.
 ```
 crypto_bot/
 ├── app/
-│   ├── main.py               # FastAPI entry point
-│   ├── config.py             # Settings + env vars
+│   ├── main.py                    # FastAPI entry point + DB lifecycle
+│   ├── config.py                  # All settings from env vars
+│   ├── database.py                # Async SQLAlchemy engine + sessions
+│   ├── models/
+│   │   ├── user.py                # User, Account, ApiConnection, Balance
+│   │   ├── trading.py             # Signal, Trade, Position, TradeSkip
+│   │   └── system.py              # Setting, Subscription, AuditLog
 │   ├── modules/
-│   │   ├── scanner.py        # Market scanning + ranking
-│   │   ├── analyzer.py       # Technical indicators
-│   │   ├── orderbook.py      # L2 order book analysis
-│   │   ├── ai_engine.py      # OpenAI decision engine
-│   │   ├── risk_engine.py    # Dynamic risk + safety filters
-│   │   ├── executor.py       # Binance trade execution
-│   │   └── telegram.py       # Telegram notifications
+│   │   ├── scanner.py             # Market scanning + volume ranking
+│   │   ├── analyzer.py            # Technical indicators (VWAP, EMA, RSI, ATR)
+│   │   ├── ai_engine.py           # Confluence + OpenAI verification
+│   │   ├── risk_engine.py         # Balance-based dynamic risk
+│   │   ├── executor.py            # Binance trade execution
+│   │   ├── orderbook.py           # L2 order book analysis
+│   │   ├── telegram.py            # Premium Telegram notifications
+│   │   └── crypto_utils.py        # API key encryption/decryption
 │   ├── routers/
-│   │   ├── scanner.py        # GET /api/v1/scan
-│   │   ├── analyzer.py       # POST /api/v1/analyze
-│   │   ├── executor.py       # POST /api/v1/execute
-│   │   └── status.py         # GET /api/v1/status
+│   │   ├── scanner.py             # GET  /api/v1/scan
+│   │   ├── analyzer.py            # POST /api/v1/analyze, /analyze-batch
+│   │   ├── executor.py            # POST /api/v1/execute, /execute-full, /execute-multi
+│   │   ├── status.py              # GET  /api/v1/status
+│   │   └── accounts.py            # CRUD /api/v1/accounts
 │   └── utils/
-│       ├── logger.py         # Rotating file + console logger
-│       └── state.py          # Trade state persistence
-├── n8n_workflow.json          # Import this into n8n
+│       ├── logger.py              # Rotating file + console logger
+│       └── state.py               # In-memory trade state manager
+├── migrations/
+│   └── schema.sql                 # PostgreSQL schema (auto-runs on first start)
+├── n8n_workflow_v2.json           # Import into n8n
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -73,190 +84,359 @@ crypto_bot/
 
 ## 🚀 Quick Start
 
-### Option A: Docker (Recommended)
+### Step 1: Configure Environment
 
 ```bash
-# 1. Clone and enter directory
-git clone <your-repo>
-cd crypto_bot
-
-# 2. Set up environment
 cp .env.example .env
-nano .env   # Fill in your API keys
-
-# 3. Start everything
-docker-compose up -d
-
-# 4. Open n8n
-# Visit http://localhost:5678
-# Login: admin / changeme
-# Import n8n_workflow.json via Workflows → Import
 ```
 
-### Option B: Local Development
+Edit `.env` with your actual values:
+
+```env
+# Required
+BINANCE_API_KEY=your_binance_api_key
+BINANCE_SECRET_KEY=your_binance_secret_key
+BINANCE_TESTNET=true
+
+# Generate encryption key
+# python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+ENCRYPTION_KEY=your_generated_fernet_key
+
+# Optional (needed for AI verification)
+OPENAI_API_KEY=your_openai_key
+
+# Optional (for notifications)
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+```
+
+### Step 2: Start Everything
 
 ```bash
-# 1. Create virtual environment
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-venv\Scripts\activate     # Windows
+docker-compose up -d --build
+```
 
-# 2. Install dependencies
-pip install -r requirements.txt
+This starts:
+- **PostgreSQL** (port 5432) — auto-creates tables from `schema.sql`
+- **Trading Bot** (port 8000) — FastAPI backend
+- **n8n** (port 5678) — Workflow automation
 
-# 3. Configure environment
-cp .env.example .env
-nano .env
+### Step 3: Verify
 
-# 4. Run the server
-uvicorn app.main:app --reload --port 8000
-
-# 5. Test endpoints
+```bash
+# Health check
 curl http://localhost:8000/health
+
+# Test scan
 curl http://localhost:8000/api/v1/scan
+
+# Check status
 curl http://localhost:8000/api/v1/status
 ```
 
+### Step 4: Add Trading Accounts
+
+```bash
+# Add your first account
+curl -X POST http://localhost:8000/api/v1/accounts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "Main Account",
+    "api_key": "your_binance_api_key",
+    "api_secret": "your_binance_secret_key"
+  }'
+
+# Test the connection
+curl -X POST http://localhost:8000/api/v1/accounts/1/test
+
+# Add more accounts for multi-account trading
+curl -X POST http://localhost:8000/api/v1/accounts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label": "Client Account 2",
+    "api_key": "client_api_key",
+    "api_secret": "client_api_secret"
+  }'
+```
+
+### Step 5: Import n8n Workflow
+
+1. Open n8n at `http://localhost:5678` (admin / changeme)
+2. **Workflows** → **Import from file** → Select `n8n_workflow_v2.json`
+3. Update Telegram credentials in the workflow
+4. **Activate** the workflow
+5. Bot runs every 5 minutes automatically
+
 ---
 
-## ⚙️ Configuration
+## 📊 Signal Logic — Layered Confluence
 
-Edit `.env`:
+### Entry Conditions (ALL must align)
 
-| Variable | Description | Default |
+| # | LONG Condition | SHORT Condition |
 |---|---|---|
-| `BINANCE_API_KEY` | Binance Futures API key | required |
-| `BINANCE_SECRET_KEY` | Binance Futures secret | required |
-| `BINANCE_TESTNET` | Use testnet (paper trade) | `true` |
-| `OPENAI_API_KEY` | OpenAI API key | required |
-| `OPENAI_MODEL` | GPT model to use | `gpt-4o` |
-| `TELEGRAM_BOT_TOKEN` | Telegram bot token | optional |
-| `TELEGRAM_CHAT_ID` | Telegram chat ID | optional |
-| `ACCOUNT_BALANCE` | Starting USDT balance | `20.0` |
-| `MIN_CONFIDENCE` | Minimum AI confidence to trade | `70` |
+| 1 | EMA 9 > EMA 21 | EMA 9 < EMA 21 |
+| 2 | Price above VWAP | Price below VWAP |
+| 3 | RSI 52-68 | RSI 32-48 |
+| 4 | Volume spike (>1.5x avg) | Volume spike (>1.5x avg) |
+| 5 | Spread < 0.15% | Spread < 0.15% |
+| 6 | ATR% < max volatility | ATR% < max volatility |
+| 7 | Bullish candle confirmed | Bearish candle confirmed |
+| 8 | 15m HTF trend bullish | 15m HTF trend bearish |
+
+**Minimum 5/8 conditions** required for a signal. Confidence scales with matching conditions.
+
+### Avoid Trade If
+- Sideways chop detected (EMAs converging)
+- Spread too high (>0.15%)
+- ATR% exceeds max volatility
+- Weak volume
+- Existing open position on same symbol
+
+### AI Verification (Optional Layer 2)
+- OpenAI receives indicator + orderbook summary
+- Returns strict JSON: `{"action": "BUY", "confidence": 87, "reason": "..."}`
+- If AI agrees with technical → confidence boosted
+- If AI disagrees → confidence reduced
+- If AI fails → falls back to technical rules only
 
 ---
 
-## 📊 Dynamic Risk Tiers
+## 💰 Risk Management Math
 
-| AI Confidence | Leverage | Capital Risk |
-|---|---|---|
-| < 70 | NO TRADE | — |
-| 70–79 | 5x | 5% |
-| 80–89 | 10x | 10% |
-| 90–94 | 12x | 15% |
-| 95–100 | 15x | 20% |
+### Balance Risk Tiers
 
----
-
-## 🔒 Scanner Filters
-
-| Filter | Rule |
+| Account Balance | Risk % per Trade |
 |---|---|
-| Coins excluded | BTC, ETH, BNB |
-| Price range | $0.001 – $50 |
-| 24h volume | > $5,000,000 USDT |
-| Price change | > 3% (absolute) |
-| Bid-ask spread | < 0.2% |
+| $20 – $100 | 8% |
+| $101 – $300 | 6% |
+| $301 – $1,000 | 4% |
+| $1,000+ | 2% |
+
+### Position Sizing Formula
+
+```
+safe_margin   = balance × risk_percent
+position_size = safe_margin × leverage
+quantity      = position_size / entry_price
+```
+
+**Example:**
+```
+Balance = $50
+Risk    = 8% (tier: $20-$100)
+Margin  = $4.00
+Leverage = 5x (confidence 75)
+Position = $20.00
+```
+
+### Leverage by Confidence
+
+| Confidence | Leverage |
+|---|---|
+| < 70 | ❌ NO TRADE |
+| 65 – 79 | 5x |
+| 80 – 89 | 8x |
+| 90 – 94 | 10x |
+| 95+ | 12x |
+
+### TP/SL by Confidence
+
+| Confidence | Take Profit | Stop Loss |
+|---|---|---|
+| 65 – 79 (Low) | 5% | 2% |
+| 80 – 89 (Med) | 10% | 5% |
+| 90+ (High) | 15% | 6% |
+
+> SL widens slightly for volatile coins (ATR-adjusted).
+
+### Safe Margin Caps
+
+| Balance | Max Single-Trade Margin |
+|---|---|
+| $20 | ~$2 |
+| $50 | ~$4 |
+| $100 | ~$7 |
+| $300+ | ~$15 |
+
+### Symbol Minimum Filter
+
+Before every trade:
+1. Fetch Binance symbol filters (minQty, stepSize, tickSize, minNotional)
+2. If position < minNotional → try bumping to minimum
+3. If bump would exceed safe margin → **SKIP** (account too small for this coin)
 
 ---
 
-## 🔒 Safety Checks (Pre-Trade)
+## 🔒 Security
 
-All must pass or the trade is skipped:
-1. No existing open position
-2. ATR% < 8% (no extreme volatility spikes)
-3. Spread still < 0.3%
-4. Not the same coin as last trade
-5. Volume not dropped below 50% of threshold
+### API Key Encryption
+- All API keys encrypted with **AES-256 (Fernet)** before database storage
+- Keys never stored in plaintext, never logged, never returned in API responses
+- Display uses masked format: `abcd...wxyz`
+
+### API Key Permissions
+- Only **futures trading** permission required
+- **Never** enable withdrawal permission
+- Use IP whitelisting on Binance where possible
+
+### Encryption Key
+Generate with:
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+---
+
+## 📱 Telegram Notifications
+
+### Trade Opened
+```
+✅ TRADE OPENED
+Coin: SOLUSDT
+Side: 🟢 LONG
+Entry: $145.22
+Leverage: 8x
+Size: $15.00
+TP: $146.40
+SL: $144.60
+Confidence: 87%
+```
+
+### Multi-Account Signal Summary
+```
+📊 SIGNAL SUMMARY
+Coin: BTCUSDT
+Side: 🟢 LONG
+Confidence: 87%
+
+✅ Executed: 12 accounts
+⏭️ Skipped: 5 accounts
+
+Skip Reasons:
+  • 3 Low Balance
+  • 1 Risk Limit
+  • 1 Min Notional
+```
 
 ---
 
 ## 🔌 API Endpoints
 
-### `GET /api/v1/scan`
-Scans market and returns top 3 ranked coins.
-
-### `POST /api/v1/analyze`
-Full technical + AI analysis for a single coin.
-
-**Body:**
-```json
-{
-  "symbol": "SOLUSDT",
-  "price_change_pct": 5.2,
-  "volume_24h": 120000000,
-  "score": 78.4,
-  "spread_pct": 0.04,
-  "bid": 145.20,
-  "ask": 145.26
-}
-```
-
-### `POST /api/v1/execute`
-Apply risk engine + safety filters + execute trade.
-
-### `GET /api/v1/status`
-Returns bot stats (trades, win rate, PnL).
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/health` | Service health check |
+| GET | `/api/v1/scan` | Scan market for candidates |
+| POST | `/api/v1/analyze` | Analyze single coin |
+| POST | `/api/v1/analyze-batch` | Batch analyze multiple coins |
+| POST | `/api/v1/execute` | Simple single-account trade |
+| POST | `/api/v1/execute-full` | Full single-account with risk engine |
+| POST | `/api/v1/execute-multi` | Multi-account execution |
+| GET | `/api/v1/status` | Full dashboard status |
+| POST | `/api/v1/accounts` | Create trading account |
+| GET | `/api/v1/accounts` | List all accounts |
+| GET | `/api/v1/accounts/{id}` | Get account details |
+| PUT | `/api/v1/accounts/{id}` | Update account |
+| DELETE | `/api/v1/accounts/{id}` | Deactivate account |
+| POST | `/api/v1/accounts/{id}/test` | Test API connection |
 
 ---
 
-## 📲 n8n Setup Guide
+## 🛡️ Trade Limits & Safety
 
-1. Open n8n at `http://localhost:5678`
-2. Go to **Workflows** → **Import from file**
-3. Select `n8n_workflow.json`
-4. Add Telegram credentials:
-   - Settings → Credentials → New → Telegram
-   - Paste your bot token
-5. Set n8n variables:
-   - Settings → Variables → `TELEGRAM_CHAT_ID`
-6. Activate the workflow
-7. The bot will run every 4 hours automatically
-
----
-
-## 📈 Coin Scoring Formula
-
-```
-score = (volatility_pct * 0.4) + (normalized_volume * 0.3) + (trend_strength * 0.3)
-```
-
-- **Volatility**: 24h price change % (capped at 30%)
-- **Normalized Volume**: Log-scaled to 0–100
-- **Trend Strength**: % of up-candles in last 24 hourly candles
+| Control | Default |
+|---|---|
+| Hourly max trades | 10 |
+| Daily max trades | 100 |
+| Coin cooldown | 30 minutes |
+| Max coin repeats/hour | 2 |
+| Loss cooldown trigger | 3 consecutive losses |
+| Loss cooldown duration | 15 minutes |
+| Daily profit limit | 150% |
+| Daily loss limit | -20% |
+| Drawdown pause | -10% |
+| Max volatility (ATR%) | 5% |
 
 ---
 
-## 🛡️ Production Safety Checklist
+## 🧪 Testing on Binance Testnet
 
-- [ ] Start on **Binance Testnet** (`BINANCE_TESTNET=true`)
-- [ ] Run for 2–4 weeks on paper before going live
-- [ ] Review AI decisions in Telegram before trusting them
-- [ ] Set `ACCOUNT_BALANCE` accurately
-- [ ] Never use funds you cannot afford to lose
-- [ ] Monitor logs daily: `docker logs crypto-trading-bot -f`
+1. Set `BINANCE_TESTNET=true` in `.env`
+2. Get testnet API keys from: https://testnet.binancefuture.com
+3. Start the system: `docker-compose up -d --build`
+4. Add testnet account via API
+5. Monitor logs: `docker logs crypto-trading-bot -f`
+6. Check Telegram for trade notifications
+7. Run for 1-2 weeks before considering mainnet
+
+---
+
+## 📊 Database Tables
+
+| Table | Purpose |
+|---|---|
+| `users` | User accounts |
+| `accounts` | Trading accounts (1 user → many accounts) |
+| `api_connections` | Encrypted Binance API keys |
+| `balances` | Account balances |
+| `signals` | Generated trading signals + AI logs |
+| `trades` | Executed trades with P&L |
+| `positions` | Open positions |
+| `trade_skips` | Skipped trades with reasons |
+| `settings` | Per-account risk overrides |
+| `subscriptions` | Subscription plans (for future website) |
+| `audit_logs` | Security audit trail |
+
+---
+
+## 🔧 Multi-Account Execution Flow
+
+```
+Signal Generated (BUY SOLUSDT, conf=87)
+    │
+    ├── Save signal to DB
+    │
+    ├── Load all active accounts
+    │
+    └── For EACH account (parallel):
+        ├── Decrypt API keys
+        ├── Fetch live balance from Binance
+        ├── Calculate risk % (balance tier)
+        ├── Calculate leverage (from confidence)
+        ├── Calculate safe margin + position size
+        ├── Fetch symbol filters (minQty, minNotional)
+        ├── Validate: position >= minimum?
+        │   ├── YES → Place trade + SL + TP → Save to DB
+        │   └── NO  → Safe to bump? 
+        │       ├── YES → Use minimum size → Place trade
+        │       └── NO  → Skip (log reason to DB)
+        └── Include in Telegram summary
+```
 
 ---
 
 ## 📋 Logs
 
-- Location: `logs/trading_bot.log`
-- Rotates at 10 MB, keeps 5 backups
-- Trade state persisted in `logs/trade_state.json`
+- Application logs: `logs/trading_bot.log` (10 MB × 5 rotations)
+- Docker logs: `docker logs crypto-trading-bot -f`
+- Database: All trades, signals, and skips persisted in PostgreSQL
 
 ---
 
-## 🔧 Extending the System
+## 🚀 Deployment
 
-### Add a new indicator
-Edit `app/modules/analyzer.py` → add method → include in `to_dict()`
+### VPS Requirements
+- 2+ CPU cores
+- 4 GB+ RAM
+- 20 GB+ disk
+- Docker + Docker Compose installed
 
-### Change scan interval
-Edit the `scheduleTrigger` node in n8n (or modify cron settings)
-
-### Add more safety checks
-Edit `app/modules/risk_engine.py` → `SafetyFilter.check()`
-
-### Switch to a different exchange
-Replace `app/modules/executor.py` with your exchange's API client
+### Production Checklist
+- [ ] Generate unique `ENCRYPTION_KEY`
+- [ ] Set `BINANCE_TESTNET=false` (only after thorough testing!)
+- [ ] Change n8n password from `changeme`
+- [ ] Set PostgreSQL password to something strong
+- [ ] Enable firewall (only expose ports you need)
+- [ ] Set up monitoring (healthcheck endpoint)
+- [ ] Review Telegram notifications daily
+- [ ] Never enable withdrawal API permissions

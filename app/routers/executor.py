@@ -1,276 +1,503 @@
 """
-Executor API endpoint
-Supports two modes:
-  1. SIMPLE MODE: { symbol, action, usdt_amount }
-     → Backend fetches price, calculates quantity, places order
-  2. AI PIPELINE MODE: { symbol, action, confidence, reason, current_price, ... }
-     → Full safety checks + risk engine + SL/TP
+V2 Executor API — Multi-Account Trade Execution
+
+Endpoints:
+  POST /execute       — Single-account backward-compatible execution
+  POST /execute-full  — Single-account with risk engine + SL/TP
+  POST /execute-multi — Multi-account execution for all connected accounts
 """
 
+import asyncio
 import logging
-from fastapi import APIRouter, HTTPException
+from datetime import datetime
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 
-from app.modules.risk_engine import RiskEngine, TradeParameters
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.modules.risk_engine import RiskEngine
 from app.modules.executor import BinanceExecutor
 from app.modules.telegram import TelegramNotifier
+from app.modules.crypto_utils import decrypt_api_key
 from app.utils.state import state_manager
 from app.config import settings
+from app.database import get_db, async_session
+from app.models.user import Account, ApiConnection, Balance
+from app.models.trading import Signal, Trade, TradeSkip
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-# ─── Simple Execute Request ──────────────────────────────────────────
-# n8n sends ONLY this: { symbol, action, usdt_amount }
-# Backend handles EVERYTHING else.
+# ─── Request Models ──────────────────────────────────────────────────
 
 class SimpleExecuteRequest(BaseModel):
     symbol: str
-    action: str                     # BUY | SELL
-    usdt_amount: float = 5.0        # Amount in USDT to trade
+    action: str
+    usdt_amount: float = 5.0
 
-
-# ─── Full AI Pipeline Request (kept for backward compat) ────────────
 
 class FullExecuteRequest(BaseModel):
     symbol: str
-    action: str                     # BUY | SELL | HOLD
+    action: str
     confidence: int
-    reason: str
-    current_price: float
+    reason: str = ""
+    current_price: float = 0.0
     spread_pct: float = 0.0
     volume_24h: float = 0.0
     atr: float = 0.0
     atr_pct: float = 0.0
 
 
+class MultiExecuteRequest(BaseModel):
+    symbol: str
+    action: str  # BUY | SELL
+    confidence: int
+    reason: str = ""
+    current_price: float = 0.0
+    atr_pct: float = 0.0
+    spread_pct: float = 0.0
+    indicators: dict = {}
+
+
 # ═══════════════════════════════════════════════════════════════════════
-# SIMPLE EXECUTE — n8n sends { symbol, action, usdt_amount }
+# SIMPLE EXECUTE — backward compatible
 # ═══════════════════════════════════════════════════════════════════════
 
 @router.post("/execute")
 async def execute_trade(req: SimpleExecuteRequest):
-    """
-    Simple trade execution.
-    n8n sends: { "symbol": "SOLUSDT", "action": "BUY", "usdt_amount": 5 }
-    Backend handles:
-      1. Validate input
-      2. Check daily limits + cooldowns
-      3. Fetch market price
-      4. Convert USDT → quantity with correct precision
-      5. Validate notional & min qty
-      6. Place MARKET order
-      7. Return clean result
-    """
+    """Simple trade execution — backward compatible with v1 n8n workflow."""
     telegram = TelegramNotifier()
     binance = BinanceExecutor()
 
-    # ── Input validation ─────────────────────────────────────────────
     symbol = req.symbol.upper().strip()
     action = req.action.upper().strip()
 
     if action not in ("BUY", "SELL"):
-        return {"status": "error", "message": f"Invalid action '{req.action}'. Must be BUY or SELL."}
-
+        return {"status": "error", "message": f"Invalid action '{req.action}'"}
     if req.usdt_amount <= 0:
-        return {"status": "error", "message": f"usdt_amount must be > 0, got {req.usdt_amount}"}
-
+        return {"status": "error", "message": f"usdt_amount must be > 0"}
     if not symbol.endswith("USDT"):
-        return {"status": "error", "message": f"Invalid symbol '{symbol}'. Must end with USDT."}
+        return {"status": "error", "message": f"Invalid symbol '{symbol}'"}
 
-    # ── Daily risk control ───────────────────────────────────────────
+    # Daily risk control
     try:
         balance = await binance.get_account_balance()
     except Exception:
-        balance = settings.ACCOUNT_BALANCE
+        balance = 20.0
 
     daily_check = state_manager.check_daily_limits(balance)
     if not daily_check["allowed"]:
         await telegram.trading_paused(daily_check["reason"])
         return {"status": "error", "message": f"Trading paused: {daily_check['reason']}"}
 
-    # ── Hourly rate limit ────────────────────────────────────────────
+    # Hourly rate limit
     hourly_limited, hourly_count = state_manager.is_hourly_limit_reached()
     if hourly_limited:
-        msg = f"Hourly limit reached: {hourly_count}/{settings.HOURLY_MAX_TRADES} trades this hour"
-        return {"status": "error", "message": msg}
+        return {"status": "error", "message": f"Hourly limit: {hourly_count}/{settings.HOURLY_MAX_TRADES}"}
 
-    # ── Per-coin cooldown ────────────────────────────────────────────
+    # Cooldown
     on_cooldown, remaining_secs = state_manager.is_coin_on_cooldown(symbol)
     if on_cooldown:
-        remaining_min = remaining_secs // 60
-        msg = f"Cooldown: {symbol} was traded recently — {remaining_min}m remaining"
-        return {"status": "error", "message": msg}
+        return {"status": "error", "message": f"Cooldown: {symbol} — {remaining_secs // 60}m remaining"}
 
-    # ── Open position check ──────────────────────────────────────────
+    # Loss cooldown
+    loss_cd, loss_remaining = state_manager.is_loss_cooldown_active()
+    if loss_cd:
+        return {"status": "error", "message": f"Loss cooldown active — {loss_remaining}s remaining"}
+
+    # Position check
     try:
-        has_position = await binance.has_open_position(symbol)
-        if has_position:
-            msg = f"Already have open position on {symbol}"
-            return {"status": "error", "message": msg}
+        if await binance.has_open_position(symbol):
+            return {"status": "error", "message": f"Open position exists on {symbol}"}
     except Exception as e:
         logger.warning(f"Position check failed: {e}")
 
-    # ── Execute the trade ────────────────────────────────────────────
+    # Execute
     try:
-        result = await binance.execute_simple(
-            symbol=symbol,
-            side=action,
-            usdt_amount=req.usdt_amount,
-        )
+        result = await binance.execute_simple(symbol=symbol, side=action, usdt_amount=req.usdt_amount)
+        state_manager.record_trade_opened(symbol)
 
-        # Record in state
-        state_manager.open_trade(symbol)
-
-        # Send Telegram notification
-        await telegram.send(
-            f"✅ <b>TRADE EXECUTED</b>\n"
-            f"Symbol: <b>{symbol}</b>\n"
-            f"Side: <b>{action}</b>\n"
-            f"Amount: <b>${req.usdt_amount}</b>\n"
-            f"Price: <b>${result['price']:,.6f}</b>\n"
-            f"Quantity: <b>{result['quantity']}</b>\n"
-            f"Order ID: <b>{result['order_id']}</b>"
+        await telegram.trade_opened(
+            symbol=symbol, side=action, entry_price=result["price"],
+            leverage=1, position_size=req.usdt_amount,
+            take_profit=0, stop_loss=0, confidence=0,
         )
 
         return {
-            "status": "success",
-            "symbol": symbol,
-            "side": action,
-            "quantity": result["quantity"],
-            "price": result["price"],
-            "notional": result["notional"],
-            "order_id": result["order_id"],
+            "status": "success", "symbol": symbol, "side": action,
+            "quantity": result["quantity"], "price": result["price"],
+            "notional": result["notional"], "order_id": result["order_id"],
         }
-
     except Exception as e:
-        error_msg = str(e)
-        logger.error(f"❌ Trade execution failed: {error_msg}")
-        await telegram.error_alert("Trade Execution", error_msg)
-        return {"status": "error", "message": error_msg}
+        logger.error(f"❌ Trade failed: {e}")
+        await telegram.error_alert("Trade Execution", str(e))
+        return {"status": "error", "message": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# FULL AI PIPELINE EXECUTE — with risk engine, SL/TP, confidence checks
+# FULL AI PIPELINE EXECUTE — single account with risk engine
 # ═══════════════════════════════════════════════════════════════════════
 
 @router.post("/execute-full")
 async def execute_trade_full(req: FullExecuteRequest):
-    """
-    Full AI pipeline execution with risk engine, SL/TP.
-    Kept for the automated AI analysis pipeline.
-    """
+    """Full single-account execution with V2 risk engine + SL/TP."""
     telegram = TelegramNotifier()
+    binance = BinanceExecutor()
 
-    # ── Daily risk control ───────────────────────────────────────────
+    # Daily limits
     try:
-        binance = BinanceExecutor()
         balance = await binance.get_account_balance()
     except Exception:
-        balance = settings.ACCOUNT_BALANCE
+        balance = 20.0
 
     daily_check = state_manager.check_daily_limits(balance)
     if not daily_check["allowed"]:
         await telegram.trading_paused(daily_check["reason"])
         return {"status": "trading_paused", "reason": daily_check["reason"]}
 
-    # ── HOLD check ───────────────────────────────────────────────────
     if req.action == "HOLD":
         return {"status": "skipped", "reason": f"HOLD — {req.reason}"}
 
-    # ── Confidence check ─────────────────────────────────────────────
     if req.confidence < settings.MIN_CONFIDENCE:
-        msg = f"Confidence {req.confidence} < minimum {settings.MIN_CONFIDENCE}"
-        return {"status": "skipped", "reason": msg}
+        return {"status": "skipped", "reason": f"Confidence {req.confidence} < {settings.MIN_CONFIDENCE}"}
 
-    # ── Hourly rate limit (max 3 trades/hour) ────────────────────────
+    # Rate limits
     hourly_limited, hourly_count = state_manager.is_hourly_limit_reached()
     if hourly_limited:
-        msg = f"Hourly limit reached: {hourly_count}/{settings.HOURLY_MAX_TRADES} trades this hour"
-        logger.info(f"  ⏰ {msg}")
-        return {"status": "skipped", "reason": msg}
+        return {"status": "skipped", "reason": f"Hourly limit: {hourly_count}/{settings.HOURLY_MAX_TRADES}"}
 
-    # ── Per-coin cooldown (1 hour) ───────────────────────────────────
-    on_cooldown, remaining_secs = state_manager.is_coin_on_cooldown(req.symbol)
+    on_cooldown, remaining = state_manager.is_coin_on_cooldown(req.symbol)
     if on_cooldown:
-        remaining_min = remaining_secs // 60
-        msg = f"Cooldown: {req.symbol} was traded recently — {remaining_min}m remaining"
-        logger.info(f"  🕐 {msg}")
-        return {"status": "skipped", "reason": msg}
+        return {"status": "skipped", "reason": f"Cooldown: {req.symbol} — {remaining // 60}m"}
 
-    # ── Volatility skip (ATR% too high) ──────────────────────────────
+    loss_cd, loss_remaining = state_manager.is_loss_cooldown_active()
+    if loss_cd:
+        return {"status": "skipped", "reason": f"Loss cooldown — {loss_remaining}s remaining"}
+
     if req.atr_pct > settings.MAX_VOLATILITY_PCT:
-        msg = f"Volatility too high: ATR%={req.atr_pct:.2f}% > max {settings.MAX_VOLATILITY_PCT}%"
-        logger.info(f"  🌊 {msg}")
-        await telegram.trade_skipped(req.symbol, msg)
-        return {"status": "skipped", "reason": msg}
+        return {"status": "skipped", "reason": f"ATR%={req.atr_pct:.2f}% > max {settings.MAX_VOLATILITY_PCT}%"}
 
-    # ── Duplicate trade protection ───────────────────────────────────
-    if state_manager.is_duplicate_trade(req.symbol):
-        msg = f"Duplicate: {req.symbol} was in last 2 trades — skipping"
-        await telegram.trade_skipped(req.symbol, msg)
-        return {"status": "skipped", "reason": msg}
-
-    # ── Open position check ──────────────────────────────────────────
     try:
-        binance = BinanceExecutor()
-        has_position = await binance.has_open_position(req.symbol)
-        if has_position:
-            msg = f"Already have open position on {req.symbol}"
-            await telegram.trade_skipped(req.symbol, msg)
-            return {"status": "skipped", "reason": msg}
-    except Exception as e:
-        logger.warning(f"Position check failed: {e}")
+        if await binance.has_open_position(req.symbol):
+            return {"status": "skipped", "reason": f"Open position on {req.symbol}"}
+    except Exception:
+        pass
 
-    # ── Dynamic risk engine ──────────────────────────────────────────
+    # Risk engine
     side = "BUY" if req.action == "BUY" else "SELL"
+    precision = await binance.get_precision(req.symbol)
 
     risk_engine = RiskEngine()
+    entry_price = req.current_price if req.current_price > 0 else await binance.get_market_price(req.symbol)
+
     trade_params = risk_engine.calculate(
-        symbol=req.symbol,
-        side=side,
-        confidence=req.confidence,
-        entry_price=req.current_price,
-        atr_pct=req.atr_pct,
+        symbol=req.symbol, side=side, confidence=req.confidence,
+        entry_price=entry_price, atr_pct=req.atr_pct,
         account_balance=balance,
+        min_notional=precision.min_notional, min_qty=precision.min_qty,
+        step_size=precision.step_size,
+        quantity_precision=precision.quantity_precision,
+        price_precision=precision.price_precision,
     )
 
     if not trade_params.approved:
         await telegram.trade_skipped(req.symbol, trade_params.reject_reason)
         return {"status": "skipped", "reason": trade_params.reject_reason}
 
-    # ── Execute ──────────────────────────────────────────────────────
+    # Execute
     result = await binance.execute_trade(trade_params)
 
     if result.success:
-        state_manager.open_trade(req.symbol)
+        state_manager.record_trade_opened(req.symbol)
 
-        await telegram.scalp_trade(
-            symbol=req.symbol,
-            action=side,
+        await telegram.trade_opened(
+            symbol=req.symbol, side=side, entry_price=entry_price,
+            leverage=trade_params.leverage, position_size=trade_params.position_size_usdt,
+            take_profit=trade_params.take_profit, stop_loss=trade_params.stop_loss,
             confidence=req.confidence,
-            entry_price=req.current_price,
-            take_profit=trade_params.take_profit,
-            stop_loss=trade_params.stop_loss,
-            leverage=trade_params.leverage,
-            reason=req.reason,
         )
 
         return {
-            "status": "executed",
-            "order_id": result.order_id,
-            "symbol": req.symbol,
-            "side": side,
-            "quantity": trade_params.quantity,
-            "entry_price": req.current_price,
-            "stop_loss": trade_params.stop_loss,
-            "take_profit": trade_params.take_profit,
-            "leverage": trade_params.leverage,
-            "risk_reward": trade_params.risk_reward,
-            "confidence": req.confidence,
+            "status": "executed", "order_id": result.order_id,
+            "symbol": req.symbol, "side": side,
+            "quantity": trade_params.quantity, "entry_price": entry_price,
+            "stop_loss": trade_params.stop_loss, "take_profit": trade_params.take_profit,
+            "leverage": trade_params.leverage, "risk_reward": trade_params.risk_reward,
+            "confidence": req.confidence, "position_size": trade_params.position_size_usdt,
         }
     else:
         await telegram.error_alert("Trade Execution", result.error or "Unknown error")
         raise HTTPException(status_code=500, detail=result.error)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MULTI-ACCOUNT EXECUTE — processes signal across all connected accounts
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.post("/execute-multi")
+async def execute_multi_account(req: MultiExecuteRequest):
+    """
+    Multi-account execution flow:
+    1. Save signal to DB
+    2. Load all active accounts
+    3. For each: validate → calculate risk → execute → log
+    4. Send Telegram summary
+    """
+    telegram = TelegramNotifier()
+
+    symbol = req.symbol.upper().strip()
+    side = req.action.upper().strip()
+
+    if side not in ("BUY", "SELL"):
+        return {"status": "error", "message": f"Invalid action: {req.action}"}
+    if req.confidence < settings.MIN_CONFIDENCE:
+        return {"status": "skipped", "reason": f"Confidence {req.confidence} < {settings.MIN_CONFIDENCE}"}
+
+    # Global rate limits
+    hourly_limited, _ = state_manager.is_hourly_limit_reached()
+    if hourly_limited:
+        return {"status": "skipped", "reason": "Hourly trade limit reached"}
+
+    daily_check = state_manager.check_daily_limits(0)
+    if not daily_check["allowed"]:
+        return {"status": "trading_paused", "reason": daily_check["reason"]}
+
+    loss_cd, _ = state_manager.is_loss_cooldown_active()
+    if loss_cd:
+        return {"status": "skipped", "reason": "Loss cooldown active"}
+
+    on_cooldown, _ = state_manager.is_coin_on_cooldown(symbol)
+    if on_cooldown:
+        return {"status": "skipped", "reason": f"Cooldown active for {symbol}"}
+
+    # ── Save signal to DB ────────────────────────────────────────────
+    signal_id = None
+    try:
+        async with async_session() as session:
+            signal = Signal(
+                symbol=symbol, side=side, confidence=req.confidence,
+                reason=req.reason, indicators_json=req.indicators,
+            )
+            session.add(signal)
+            await session.commit()
+            await session.refresh(signal)
+            signal_id = signal.id
+            logger.info(f"📝 Signal #{signal_id} saved: {symbol} {side} conf={req.confidence}")
+    except Exception as e:
+        logger.warning(f"Failed to save signal to DB: {e}")
+
+    # ── Load active accounts ─────────────────────────────────────────
+    accounts_data = []
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(Account)
+                .where(Account.is_active == True)
+            )
+            accounts = result.scalars().all()
+
+            for acc in accounts:
+                if acc.api_connection and acc.api_connection.is_active:
+                    accounts_data.append({
+                        "id": acc.id,
+                        "label": acc.label,
+                        "api_key_enc": acc.api_connection.api_key_encrypted,
+                        "api_secret_enc": acc.api_connection.api_secret_encrypted,
+                    })
+    except Exception as e:
+        logger.warning(f"Failed to load accounts from DB: {e}")
+
+    # Fallback to master account if no DB accounts
+    if not accounts_data:
+        if settings.BINANCE_API_KEY:
+            accounts_data = [{
+                "id": 0,
+                "label": "Master",
+                "api_key_enc": None,
+                "api_secret_enc": None,
+            }]
+        else:
+            return {"status": "error", "message": "No active accounts found"}
+
+    # ── Execute for each account ─────────────────────────────────────
+    risk_engine = RiskEngine()
+    executed = []
+    skipped = []
+    skip_reasons_map = {}
+
+    semaphore = asyncio.Semaphore(5)  # Max 5 concurrent account executions
+
+    async def execute_for_account(acc_data: dict):
+        async with semaphore:
+            acc_id = acc_data["id"]
+            label = acc_data["label"]
+
+            try:
+                # Create executor with account's credentials
+                if acc_data["api_key_enc"]:
+                    api_key = decrypt_api_key(acc_data["api_key_enc"])
+                    api_secret = decrypt_api_key(acc_data["api_secret_enc"])
+                    executor = BinanceExecutor(api_key=api_key, secret_key=api_secret)
+                else:
+                    executor = BinanceExecutor()
+
+                # Get balance
+                balance = await executor.get_account_balance()
+
+                if balance < 5:
+                    return _skip(acc_id, label, "Low Balance", f"Balance ${balance:.2f} too low")
+
+                # Check open position
+                try:
+                    if await executor.has_open_position(symbol):
+                        return _skip(acc_id, label, "Existing Position", f"Already has {symbol} position")
+                except Exception:
+                    pass
+
+                # Get entry price
+                entry_price = req.current_price if req.current_price > 0 else await executor.get_market_price(symbol)
+
+                # Get precision
+                precision = await executor.get_precision(symbol)
+
+                # Calculate risk
+                trade_params = risk_engine.calculate(
+                    symbol=symbol, side=side, confidence=req.confidence,
+                    entry_price=entry_price, atr_pct=req.atr_pct,
+                    account_balance=balance,
+                    min_notional=precision.min_notional, min_qty=precision.min_qty,
+                    step_size=precision.step_size,
+                    quantity_precision=precision.quantity_precision,
+                    price_precision=precision.price_precision,
+                )
+
+                if not trade_params.approved:
+                    category = "Min Notional" if "notional" in trade_params.reject_reason.lower() else "Risk Limit"
+                    return _skip(acc_id, label, category, trade_params.reject_reason)
+
+                # Execute trade
+                result = await executor.execute_trade(trade_params)
+
+                if result.success:
+                    # Save trade to DB
+                    try:
+                        async with async_session() as session:
+                            trade = Trade(
+                                signal_id=signal_id, account_id=acc_id,
+                                symbol=symbol, side=side,
+                                entry_price=entry_price, quantity=trade_params.quantity,
+                                position_size_usdt=trade_params.position_size_usdt,
+                                leverage=trade_params.leverage,
+                                take_profit=trade_params.take_profit,
+                                stop_loss=trade_params.stop_loss,
+                                risk_pct=trade_params.risk_pct,
+                                confidence=req.confidence,
+                                order_id=str(result.order_id),
+                                sl_order_id=str(result.stop_loss_order_id) if result.stop_loss_order_id else None,
+                                tp_order_id=str(result.take_profit_order_id) if result.take_profit_order_id else None,
+                                status="open",
+                            )
+                            session.add(trade)
+                            await session.commit()
+                    except Exception as e:
+                        logger.warning(f"Failed to save trade to DB: {e}")
+
+                    return {
+                        "status": "executed",
+                        "account_id": acc_id,
+                        "label": label,
+                        "balance": balance,
+                        "leverage": trade_params.leverage,
+                        "position_size": trade_params.position_size_usdt,
+                        "quantity": trade_params.quantity,
+                        "tp": trade_params.take_profit,
+                        "sl": trade_params.stop_loss,
+                    }
+                else:
+                    return _skip(acc_id, label, "Execution Error", result.error or "Unknown")
+
+            except Exception as e:
+                logger.error(f"Account {label} execution failed: {e}")
+                return _skip(acc_id, label, "Error", str(e)[:100])
+
+    def _skip(acc_id, label, category, reason):
+        """Helper to build a skip result."""
+        # Save skip to DB
+        try:
+            # We'll batch save skips after all accounts complete
+            pass
+        except Exception:
+            pass
+        return {
+            "status": "skipped",
+            "account_id": acc_id,
+            "label": label,
+            "category": category,
+            "reason": reason,
+        }
+
+    # Execute all accounts
+    tasks = [execute_for_account(acc) for acc in accounts_data]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for r in results:
+        if isinstance(r, Exception):
+            skipped.append({"status": "skipped", "category": "Error", "reason": str(r)})
+            continue
+        if r.get("status") == "executed":
+            executed.append(r)
+        else:
+            skipped.append(r)
+            category = r.get("category", "Unknown")
+            skip_reasons_map[category] = skip_reasons_map.get(category, 0) + 1
+
+    # Record in state manager
+    if executed:
+        state_manager.record_trade_opened(symbol)
+
+    for s in skipped:
+        state_manager.record_skip()
+
+    # Save skips to DB
+    try:
+        async with async_session() as session:
+            for s in skipped:
+                skip_record = TradeSkip(
+                    signal_id=signal_id,
+                    account_id=s.get("account_id"),
+                    symbol=symbol,
+                    reason=s.get("reason", "Unknown"),
+                    category=s.get("category", "Unknown"),
+                )
+                session.add(skip_record)
+            await session.commit()
+    except Exception as e:
+        logger.warning(f"Failed to save skips to DB: {e}")
+
+    # Send Telegram summary
+    await telegram.signal_summary(
+        symbol=symbol, side=side, confidence=req.confidence,
+        executed_count=len(executed), skipped_count=len(skipped),
+        skip_reasons=skip_reasons_map, total_accounts=len(accounts_data),
+    )
+
+    logger.info(
+        f"📊 Multi-account result: {len(executed)} executed, {len(skipped)} skipped "
+        f"out of {len(accounts_data)} accounts"
+    )
+
+    return {
+        "status": "ok",
+        "symbol": symbol,
+        "side": side,
+        "confidence": req.confidence,
+        "total_accounts": len(accounts_data),
+        "executed_count": len(executed),
+        "skipped_count": len(skipped),
+        "executed": executed,
+        "skipped": skipped,
+        "skip_reasons": skip_reasons_map,
+    }

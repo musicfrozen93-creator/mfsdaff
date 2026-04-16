@@ -1,32 +1,71 @@
 version: "3.9"
 
 services:
+  # ── PostgreSQL Database ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: trading-db
+    environment:
+      POSTGRES_USER: botuser
+      POSTGRES_PASSWORD: botpass
+      POSTGRES_DB: trading_bot
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    networks:
+      - bot-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U botuser -d trading_bot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Trading Bot Backend ──────────────────────────────────────────────
   trading-bot:
     build: .
     container_name: crypto-trading-bot
     ports:
       - "8000:8000"
     environment:
+      # Database
+      - DATABASE_URL=postgresql+asyncpg://botuser:botpass@postgres:5432/trading_bot
+      # Binance
       - BINANCE_API_KEY=${BINANCE_API_KEY}
       - BINANCE_SECRET_KEY=${BINANCE_SECRET_KEY}
-      - BINANCE_TESTNET=${BINANCE_TESTNET}
+      - BINANCE_TESTNET=${BINANCE_TESTNET:-true}
+      # OpenAI
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_MODEL=${OPENAI_MODEL}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      # Encryption
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      # Telegram
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
-      - ACCOUNT_BALANCE=${ACCOUNT_BALANCE}
-      - MIN_CONFIDENCE=${MIN_CONFIDENCE}
+      # Trading
+      - MIN_CONFIDENCE=${MIN_CONFIDENCE:-70}
+      - DAILY_MAX_TRADES=${DAILY_MAX_TRADES:-100}
+      - HOURLY_MAX_TRADES=${HOURLY_MAX_TRADES:-10}
+      - COIN_COOLDOWN_MINUTES=${COIN_COOLDOWN_MINUTES:-30}
+      - MAX_VOLATILITY_PCT=${MAX_VOLATILITY_PCT:-5.0}
+      - DAILY_PROFIT_LIMIT_PCT=${DAILY_PROFIT_LIMIT_PCT:-150.0}
+      - DAILY_LOSS_LIMIT_PCT=${DAILY_LOSS_LIMIT_PCT:-20.0}
+      - LOSS_COOLDOWN_COUNT=${LOSS_COOLDOWN_COUNT:-3}
+      - LOSS_COOLDOWN_MINUTES=${LOSS_COOLDOWN_MINUTES:-15}
+      - DRAWDOWN_PAUSE_PCT=${DRAWDOWN_PAUSE_PCT:--10.0}
+      - MAX_COIN_REPEATS_PER_HOUR=${MAX_COIN_REPEATS_PER_HOUR:-2}
     volumes:
       - ./logs:/app/logs
     restart: unless-stopped
     networks:
       - bot-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+    depends_on:
+      postgres:
+        condition: service_healthy
 
+  # ── n8n Workflow Automation ──────────────────────────────────────────
   n8n:
     image: n8nio/n8n:latest
     container_name: n8n
@@ -51,6 +90,7 @@ services:
       - trading-bot
 
 volumes:
+  postgres_data:
   n8n_data:
 
 networks:
