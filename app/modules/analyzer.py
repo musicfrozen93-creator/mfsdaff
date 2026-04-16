@@ -12,6 +12,7 @@ import httpx
 import numpy as np
 
 from app.config import settings
+from app.utils.serialization import clean_json_types
 
 logger = logging.getLogger(__name__)
 
@@ -194,8 +195,8 @@ class TechnicalAnalyzer:
         """
         if ema_slow == 0:
             return False, 0.0
-        distance_pct = abs(ema_fast - ema_slow) / ema_slow * 100
-        is_choppy = distance_pct < 0.1
+        distance_pct = float(abs(ema_fast - ema_slow) / ema_slow * 100)
+        is_choppy = bool(distance_pct < 0.1)
         return is_choppy, round(distance_pct, 4)
 
     def detect_volume_spike(self, volumes: np.ndarray, lookback: int = 20) -> tuple[bool, float]:
@@ -206,8 +207,8 @@ class TechnicalAnalyzer:
         current_vol = volumes[-1]
         if avg_vol == 0:
             return False, 1.0
-        ratio = current_vol / avg_vol
-        return ratio > 1.5, round(ratio, 2)
+        ratio = float(current_vol / avg_vol)
+        return bool(ratio > 1.5), round(ratio, 2)
 
     # ─── Higher Timeframe Trend ────────────────────────────────────────
 
@@ -352,7 +353,7 @@ class TechnicalAnalyzer:
 
     def to_dict(self, result: IndicatorResult) -> dict:
         """Serialize IndicatorResult to dict for API / AI prompt"""
-        return {
+        raw = {
             "symbol": result.symbol,
             "timeframe": result.timeframe,
             "current_price": result.current_price,
@@ -401,3 +402,4 @@ class TechnicalAnalyzer:
                 "atr_pct": result.atr_pct,
             },
         }
+        return clean_json_types(raw)

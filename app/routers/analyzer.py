@@ -12,6 +12,7 @@ from typing import List, Optional
 from app.modules.ai_engine import ScalpingEngine
 from app.modules.orderbook import OrderBookAnalyzer
 from app.config import settings
+from app.utils.serialization import clean_json_types
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -69,11 +70,11 @@ async def analyze_coin(req: AnalyzeRequest):
         )
         result = engine.to_dict(decision)
 
-        return {
+        return clean_json_types({
             "status": "ok",
             "symbol": req.symbol,
             "ai_decision": result,
-        }
+        })
 
     except Exception as e:
         logger.error(f"Analysis failed for {req.symbol}: {e}")
@@ -160,7 +161,7 @@ async def analyze_batch(req: BatchAnalyzeRequest):
         ", ".join(f"{c['symbol']}({c['action']}/{c['confidence']})" for c in tradeable[:5])
     )
 
-    return {
+    return clean_json_types({
         "status": "ok",
         "analyzed": len(analyzed),
         "count": len(top_coins),
@@ -168,4 +169,4 @@ async def analyze_batch(req: BatchAnalyzeRequest):
         "has_signals": has_signals,
         "summary": summary,
         "coins": top_coins,
-    }
+    })

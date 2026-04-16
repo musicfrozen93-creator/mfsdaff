@@ -24,6 +24,7 @@ import httpx
 import numpy as np
 
 from app.config import settings
+from app.utils.serialization import clean_json_types
 
 logger = logging.getLogger(__name__)
 
@@ -360,23 +361,23 @@ class ScalpingEngine:
             closes = np.array([float(k[4]) for k in raw])
             volumes = np.array([float(k[5]) for k in raw])
 
-            current_price = closes[-1]
-            rsi = self.calc_rsi(closes, period=14)
-            atr = self.calc_atr(highs, lows, closes, period=14)
-            atr_pct = (atr / current_price) * 100 if current_price > 0 else 0
+            current_price = float(closes[-1])
+            rsi = float(self.calc_rsi(closes, period=14))
+            atr = float(self.calc_atr(highs, lows, closes, period=14))
+            atr_pct = float((atr / current_price) * 100) if current_price > 0 else 0.0
 
             ema_9 = self.calc_ema(closes, 9)
             ema_21 = self.calc_ema(closes, 21)
-            ema_fast_val = ema_9[-1]
-            ema_slow_val = ema_21[-1]
+            ema_fast_val = float(ema_9[-1])
+            ema_slow_val = float(ema_21[-1])
 
-            vwap = self.calc_vwap(highs, lows, closes, volumes)
+            vwap = float(self.calc_vwap(highs, lows, closes, volumes))
 
             # Volume spike
             avg_vol = float(np.mean(volumes[-21:-1])) if len(volumes) > 21 else float(np.mean(volumes))
             cur_vol = float(volumes[-1])
-            volume_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
-            volume_spike = volume_ratio > 1.5
+            volume_ratio = float(cur_vol / avg_vol) if avg_vol > 0 else 1.0
+            volume_spike = bool(volume_ratio > 1.5)
 
             # Candle type
             o, h, l, c = opens[-1], highs[-1], lows[-1], closes[-1]
@@ -388,8 +389,8 @@ class ScalpingEngine:
                 candle_type = "BULLISH" if c > o else "BEARISH"
 
             # Chop detection
-            ema_dist = abs(ema_fast_val - ema_slow_val) / ema_slow_val * 100 if ema_slow_val > 0 else 0
-            is_choppy = ema_dist < 0.1
+            ema_dist = float(abs(ema_fast_val - ema_slow_val) / ema_slow_val * 100) if ema_slow_val > 0 else 0.0
+            is_choppy = bool(ema_dist < 0.1)
 
             # Trend
             if ema_fast_val > ema_slow_val:
@@ -499,7 +500,7 @@ class ScalpingEngine:
             )
 
     def to_dict(self, decision: AIDecision) -> dict:
-        return {
+        raw = {
             "action": decision.action,
             "confidence": decision.confidence,
             "reason": decision.reason,
@@ -519,3 +520,4 @@ class ScalpingEngine:
             "ai_latency_ms": decision.ai_latency_ms,
             "ai_fallback": decision.ai_fallback,
         }
+        return clean_json_types(raw)
