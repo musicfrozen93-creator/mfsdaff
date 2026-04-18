@@ -137,6 +137,14 @@ async def analyze_batch(req: BatchAnalyzeRequest):
             "ai_fallback": ai_result.get("ai_fallback", False),
             "spread_pct": coin_info.spread_pct if coin_info else 0.0,
             "volume_24h": coin_info.volume_24h if coin_info else 0.0,
+            # V3: New fields for downstream
+            "setup_grade": ai_result.get("setup_grade", "C"),
+            "macd_crossover": ai_result.get("macd_crossover", "NONE"),
+            "bb_position": ai_result.get("bb_position", "MID"),
+            "is_pullback": ai_result.get("is_pullback", False),
+            "is_chase": ai_result.get("is_chase", False),
+            "conditions_passed": ai_result.get("conditions_passed", 0),
+            "conditions_total": ai_result.get("conditions_total", 10),
         })
 
     # Sort by confidence descending

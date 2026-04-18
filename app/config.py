@@ -1,5 +1,5 @@
 """
-V2 Configuration — Multi-Account Scalping Bot
+V3 Configuration — Multi-Account Scalping Bot
 All settings loaded from environment variables with safe defaults.
 """
 
@@ -40,7 +40,7 @@ class Settings:
     # ── Scanner filters ──────────────────────────────────────────────
     MIN_VOLUME_24H: float = 3_000_000.0
     MIN_PRICE_CHANGE: float = 1.0
-    MAX_SPREAD_PCT: float = 0.3
+    MAX_SPREAD_PCT: float = 0.15       # V3: tightened from 0.3
     MIN_PRICE: float = 0.0001
     MAX_PRICE: float = 100000.0
     EXCLUDED_COINS: list = None
@@ -53,11 +53,21 @@ class Settings:
 
     # ── Risk controls ────────────────────────────────────────────────
     MAX_VOLATILITY_PCT: float = float(os.getenv("MAX_VOLATILITY_PCT", "5.0"))
-    DAILY_PROFIT_LIMIT_PCT: float = float(os.getenv("DAILY_PROFIT_LIMIT_PCT", "150.0"))
-    DAILY_LOSS_LIMIT_PCT: float = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "-20.0"))
+    DAILY_PROFIT_LIMIT_PCT: float = float(os.getenv("DAILY_PROFIT_LIMIT_PCT", "7.0"))
+    DAILY_LOSS_LIMIT_PCT: float = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "-8.0"))
     LOSS_COOLDOWN_COUNT: int = int(os.getenv("LOSS_COOLDOWN_COUNT", "3"))
     LOSS_COOLDOWN_MINUTES: int = int(os.getenv("LOSS_COOLDOWN_MINUTES", "15"))
     DRAWDOWN_PAUSE_PCT: float = float(os.getenv("DRAWDOWN_PAUSE_PCT", "-10.0"))
+
+    # ── V3 Daily Guard (per-account) ─────────────────────────────────
+    DAILY_SAFE_MODE_PCT: float = float(os.getenv("DAILY_SAFE_MODE_PCT", "5.0"))
+    DAILY_LOSS_REDUCE_PCT: float = float(os.getenv("DAILY_LOSS_REDUCE_PCT", "5.0"))
+    CONSECUTIVE_LOSS_REDUCE_THRESHOLD: int = int(os.getenv("CONSECUTIVE_LOSS_REDUCE_THRESHOLD", "2"))
+    CONSECUTIVE_LOSS_PAUSE_THRESHOLD: int = int(os.getenv("CONSECUTIVE_LOSS_PAUSE_THRESHOLD", "4"))
+    CONSECUTIVE_LOSS_PAUSE_MINUTES: int = int(os.getenv("CONSECUTIVE_LOSS_PAUSE_MINUTES", "60"))
+
+    # ── V3 Pre-entry checks ──────────────────────────────────────────
+    MAX_SPREAD_ENTRY_PCT: float = float(os.getenv("MAX_SPREAD_ENTRY_PCT", "0.10"))
 
     def __post_init__(self):
         self.EXCLUDED_COINS = []

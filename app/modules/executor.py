@@ -1,9 +1,18 @@
 """
-V2 Binance Futures Execution Module
+V3 Binance Futures Execution Module
 Handles order placement, precision handling, leverage setting,
-multi-account execution, and exchange filter caching.
+multi-account execution, exchange filter caching, TP/SL with retry,
+and pre-entry quality checks.
+
+V3 Changes:
+  - TP/SL use closePosition=true for reliable closing
+  - 3-retry loop for SL and TP placement
+  - Pre-entry spread/chase/fee checks
+  - Get actual fill price from order response
+  - Limit order support for better fills
 """
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -21,6 +30,10 @@ logger = logging.getLogger(__name__)
 _exchange_info_cache: dict = {}
 _exchange_info_ts: float = 0.0
 CACHE_TTL = 300  # 5 minutes
+
+# ── TP/SL retry config ───────────────────────────────────────────────
+TP_SL_MAX_RETRIES = 3
+TP_SL_RETRY_DELAY = 1.0  # seconds
 
 
 @dataclass
@@ -42,15 +55,28 @@ class OrderResult:
     side: str
     quantity: float
     entry_price: float
+    fill_price: float = 0.0           # V3: actual fill price
     stop_loss_order_id: Optional[int] = None
     take_profit_order_id: Optional[int] = None
+    sl_attached: bool = False          # V3: tracking
+    tp_attached: bool = False          # V3: tracking
     error: Optional[str] = None
+
+
+@dataclass
+class PreEntryCheck:
+    """V3: Pre-entry quality check result."""
+    passed: bool
+    reason: str = ""
+    spread_pct: float = 0.0
+    slippage_estimate: float = 0.0
+    fee_impact_pct: float = 0.0
 
 
 class BinanceExecutor:
     """
-    V2 Executor — supports per-account API credentials.
-    Caches exchange info to reduce API calls.
+    V3 Executor — supports per-account API credentials.
+    Caches exchange info, retries TP/SL placement, pre-entry checks.
     """
 
     def __init__(self, api_key: str = None, secret_key: str = None, testnet: bool = None):
@@ -111,6 +137,22 @@ class BinanceExecutor:
                 raise ValueError(f"Invalid price {price} for {symbol}")
             return price
 
+    async def get_book_ticker(self, symbol: str) -> dict:
+        """Get best bid/ask for a symbol."""
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{self.base_url}/fapi/v1/ticker/bookTicker",
+                params={"symbol": symbol},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "bid": float(data.get("bidPrice", 0)),
+                "ask": float(data.get("askPrice", 0)),
+                "bid_qty": float(data.get("bidQty", 0)),
+                "ask_qty": float(data.get("askQty", 0)),
+            }
+
     # ─── Precision (with caching) ─────────────────────────────────────
 
     async def get_precision(self, symbol: str) -> PrecisionInfo:
@@ -166,6 +208,80 @@ class BinanceExecutor:
 
     def format_price(self, price: float, precision: int) -> str:
         return f"{price:.{precision}f}"
+
+    # ─── V3: Pre-Entry Quality Checks ─────────────────────────────────
+
+    async def pre_entry_check(
+        self,
+        symbol: str,
+        side: str,
+        tp_pct: float,
+        atr: float = 0.0,
+        entry_price: float = 0.0,
+    ) -> PreEntryCheck:
+        """
+        V3: Pre-entry quality checks to prevent instant negative trades.
+        1. Spread check (skip if > 0.10%)
+        2. Candle chase detection (skip if last candle > 2x ATR)
+        3. Fee impact check (skip if fees > 30% of TP reward)
+        """
+        try:
+            book = await self.get_book_ticker(symbol)
+            bid, ask = book["bid"], book["ask"]
+
+            if bid <= 0 or ask <= 0:
+                return PreEntryCheck(passed=False, reason="Invalid bid/ask prices")
+
+            # 1. Spread check
+            spread_pct = ((ask - bid) / bid) * 100
+            max_spread = settings.MAX_SPREAD_ENTRY_PCT
+            if spread_pct > max_spread:
+                return PreEntryCheck(
+                    passed=False,
+                    reason=f"Spread too wide: {spread_pct:.4f}% > {max_spread}%",
+                    spread_pct=spread_pct,
+                )
+
+            # 2. Slippage estimate (based on spread)
+            slippage_estimate = spread_pct / 2  # Half-spread as slippage estimate
+
+            # 3. Fee impact check
+            # Binance taker fee = 0.04% (VIP0), maker = 0.02%
+            # Round trip = 0.08% minimum
+            fee_pct = 0.08  # Round-trip taker fees
+            total_cost_pct = fee_pct + spread_pct  # Fees + spread
+            if tp_pct > 0:
+                fee_impact = (total_cost_pct / tp_pct) * 100
+                if fee_impact > 30:
+                    return PreEntryCheck(
+                        passed=False,
+                        reason=f"Fee impact too high: {fee_impact:.1f}% of TP reward consumed by fees+spread",
+                        spread_pct=spread_pct,
+                        fee_impact_pct=fee_impact,
+                    )
+
+            # 4. Candle chase filter (if ATR available)
+            if atr > 0 and entry_price > 0:
+                price = await self.get_market_price(symbol)
+                price_diff = abs(price - entry_price)
+                if price_diff > atr * 2:
+                    return PreEntryCheck(
+                        passed=False,
+                        reason=f"Candle chase detected: price moved {price_diff:.6f} > 2×ATR ({atr * 2:.6f})",
+                        spread_pct=spread_pct,
+                    )
+
+            return PreEntryCheck(
+                passed=True,
+                spread_pct=round(spread_pct, 4),
+                slippage_estimate=round(slippage_estimate, 4),
+                fee_impact_pct=round((fee_pct + spread_pct) / tp_pct * 100, 1) if tp_pct > 0 else 0,
+            )
+
+        except Exception as e:
+            logger.warning(f"Pre-entry check failed for {symbol}: {e}")
+            # Don't block trade on check failure — just warn
+            return PreEntryCheck(passed=True, reason=f"Check failed: {e}")
 
     # ─── Account / Position Checks ────────────────────────────────────
 
@@ -224,44 +340,103 @@ class BinanceExecutor:
         }
         return await self._signed_request("POST", "/fapi/v1/order", params)
 
-    async def place_stop_loss(self, symbol: str, side: str, quantity: float, stop_price: float, precision: PrecisionInfo) -> dict:
+    async def place_limit_order(self, symbol: str, side: str, quantity: float, price: float, precision: PrecisionInfo) -> dict:
+        """V3: Limit order for better fills on liquid pairs."""
         qty_str = self.format_quantity(quantity, precision.quantity_precision)
+        price_str = self.format_price(price, precision.price_precision)
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "LIMIT",
+            "quantity": qty_str,
+            "price": price_str,
+            "timeInForce": "GTC",
+        }
+        return await self._signed_request("POST", "/fapi/v1/order", params)
+
+    # ─── V3: TP/SL with closePosition + Retry ────────────────────────
+
+    async def place_stop_loss(self, symbol: str, side: str, stop_price: float, precision: PrecisionInfo) -> dict:
+        """V3: Uses closePosition=true for reliable SL. No quantity needed."""
         price_str = self.format_price(stop_price, precision.price_precision)
         params = {
             "symbol": symbol,
             "side": side,
             "type": "STOP_MARKET",
             "stopPrice": price_str,
-            "quantity": qty_str,
-            "reduceOnly": "true",
+            "closePosition": "true",
             "timeInForce": "GTE_GTC",
         }
         return await self._signed_request("POST", "/fapi/v1/order", params)
 
-    async def place_take_profit(self, symbol: str, side: str, quantity: float, stop_price: float, precision: PrecisionInfo) -> dict:
-        qty_str = self.format_quantity(quantity, precision.quantity_precision)
+    async def place_take_profit(self, symbol: str, side: str, stop_price: float, precision: PrecisionInfo) -> dict:
+        """V3: Uses closePosition=true for reliable TP. No quantity needed."""
         price_str = self.format_price(stop_price, precision.price_precision)
         params = {
             "symbol": symbol,
             "side": side,
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": price_str,
-            "quantity": qty_str,
-            "reduceOnly": "true",
+            "closePosition": "true",
             "timeInForce": "GTE_GTC",
         }
         return await self._signed_request("POST", "/fapi/v1/order", params)
 
-    # ─── Full Trade Flow (with SL/TP) ────────────────────────────────
-
-    async def execute_trade(self, params) -> OrderResult:
+    async def _place_with_retry(
+        self,
+        place_func,
+        order_type: str,
+        symbol: str,
+        side: str,
+        stop_price: float,
+        precision: PrecisionInfo,
+    ) -> tuple[Optional[dict], str]:
         """
-        Full trade execution flow:
+        V3: Retry TP/SL placement up to 3 times.
+        Returns (order_result, error_message).
+        """
+        last_error = ""
+        for attempt in range(1, TP_SL_MAX_RETRIES + 1):
+            try:
+                result = await place_func(symbol, side, stop_price, precision)
+                logger.info(f"  ✅ {order_type} placed on attempt {attempt}: #{result.get('orderId')}")
+                return result, ""
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(
+                    f"  ⚠️ {order_type} attempt {attempt}/{TP_SL_MAX_RETRIES} failed: {e}"
+                )
+                if attempt < TP_SL_MAX_RETRIES:
+                    await asyncio.sleep(TP_SL_RETRY_DELAY)
+
+        logger.error(f"  ❌ {order_type} FAILED after {TP_SL_MAX_RETRIES} retries: {last_error}")
+        return None, last_error
+
+    def _get_fill_price(self, order_response: dict) -> float:
+        """V3: Extract actual fill price from market order response."""
+        # Try avgPrice first (most accurate)
+        avg_price = float(order_response.get("avgPrice", 0))
+        if avg_price > 0:
+            return avg_price
+        # Fallback to price field
+        price = float(order_response.get("price", 0))
+        if price > 0:
+            return price
+        return 0.0
+
+    # ─── V3: Full Trade Flow (with SL/TP Retry) ──────────────────────
+
+    async def execute_trade(self, params, telegram_notifier=None) -> OrderResult:
+        """
+        V3 Full trade execution flow:
         1. Get precision
         2. Validate notional + min qty
         3. Set leverage + margin type
         4. Place market order
-        5. Place SL + TP bracket orders
+        5. Get actual fill price
+        6. Recalculate TP/SL from fill price
+        7. Place SL + TP with retry (closePosition=true)
+        8. Alert on failure
         """
         symbol = params.symbol
         logger.info(f"⚡ Executing {params.side} on {symbol} (lev={params.leverage}x qty={params.quantity})...")
@@ -285,19 +460,63 @@ class BinanceExecutor:
             order_id = order["orderId"]
             logger.info(f"  ✅ Market order: #{order_id}")
 
+            # V3: Get actual fill price
+            fill_price = self._get_fill_price(order)
+            if fill_price <= 0:
+                fill_price = params.entry_price  # Fallback to estimated price
+
+            # V3: Recalculate TP/SL from actual fill price
+            if hasattr(params, 'tp_pct') and params.tp_pct > 0:
+                tp_pct_decimal = params.tp_pct / 100.0
+                sl_pct_decimal = params.sl_pct / 100.0
+                if params.side == "BUY":
+                    actual_tp = round(fill_price * (1 + tp_pct_decimal), precision.price_precision)
+                    actual_sl = round(fill_price * (1 - sl_pct_decimal), precision.price_precision)
+                else:
+                    actual_tp = round(fill_price * (1 - tp_pct_decimal), precision.price_precision)
+                    actual_sl = round(fill_price * (1 + sl_pct_decimal), precision.price_precision)
+            else:
+                actual_tp = params.take_profit
+                actual_sl = params.stop_loss
+
             close_side = "SELL" if params.side == "BUY" else "BUY"
 
-            # SL
-            sl_order = await self.place_stop_loss(
-                symbol, close_side, params.quantity, params.stop_loss, precision
+            # V3: SL with retry
+            sl_order, sl_error = await self._place_with_retry(
+                self.place_stop_loss, "STOP_LOSS",
+                symbol, close_side, actual_sl, precision,
             )
-            logger.info(f"  🛡️ SL at {params.stop_loss}")
 
-            # TP
-            tp_order = await self.place_take_profit(
-                symbol, close_side, params.quantity, params.take_profit, precision
+            # V3: TP with retry
+            tp_order, tp_error = await self._place_with_retry(
+                self.place_take_profit, "TAKE_PROFIT",
+                symbol, close_side, actual_tp, precision,
             )
-            logger.info(f"  🎯 TP at {params.take_profit}")
+
+            # V3: Alert on TP/SL failure via Telegram
+            sl_attached = sl_order is not None
+            tp_attached = tp_order is not None
+
+            if not sl_attached or not tp_attached:
+                failure_msg = []
+                if not sl_attached:
+                    failure_msg.append(f"SL: {sl_error}")
+                if not tp_attached:
+                    failure_msg.append(f"TP: {tp_error}")
+                error_detail = " | ".join(failure_msg)
+                logger.error(f"  🚨 TP/SL INCOMPLETE for {symbol}: {error_detail}")
+
+                if telegram_notifier:
+                    await telegram_notifier.tp_sl_failed(
+                        symbol=symbol, side=params.side,
+                        sl_attached=sl_attached, tp_attached=tp_attached,
+                        error=error_detail,
+                    )
+
+            logger.info(
+                f"  📊 Trade summary: fill={fill_price} TP={actual_tp} SL={actual_sl} "
+                f"SL_ok={sl_attached} TP_ok={tp_attached}"
+            )
 
             return OrderResult(
                 success=True,
@@ -306,8 +525,11 @@ class BinanceExecutor:
                 side=params.side,
                 quantity=params.quantity,
                 entry_price=params.entry_price,
-                stop_loss_order_id=sl_order.get("orderId"),
-                take_profit_order_id=tp_order.get("orderId"),
+                fill_price=fill_price,
+                stop_loss_order_id=sl_order.get("orderId") if sl_order else None,
+                take_profit_order_id=tp_order.get("orderId") if tp_order else None,
+                sl_attached=sl_attached,
+                tp_attached=tp_attached,
             )
 
         except Exception as e:

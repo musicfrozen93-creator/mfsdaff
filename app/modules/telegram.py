@@ -1,6 +1,11 @@
 """
-V2 Telegram Notification Module — Premium Message Formats
-Clean, professional trade alerts with no order ID clutter.
+V3 Telegram Notification Module — Premium Message Formats
+Clean, professional trade alerts with V3 additions:
+  - TP/SL percentages
+  - Setup grade (A/B/C)
+  - Daily progress %
+  - TP/SL failure alerts
+  - Daily target/loss limit alerts
 """
 
 import logging
@@ -40,7 +45,7 @@ class TelegramNotifier:
             logger.error(f"Telegram notification failed: {e}")
             return False
 
-    # ─── Trade Opened ─────────────────────────────────────────────────
+    # ─── V3 Trade Opened (Enhanced) ───────────────────────────────────
 
     async def trade_opened(
         self,
@@ -53,9 +58,30 @@ class TelegramNotifier:
         stop_loss: float,
         confidence: int,
         account_label: str = "",
+        # V3 additions
+        tp_pct: float = 0.0,
+        sl_pct: float = 0.0,
+        setup_grade: str = "",
+        daily_pnl_pct: float = 0.0,
     ):
         direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
         account_line = f"\nAccount: <b>{account_label}</b>" if account_label else ""
+
+        # V3: Grade emoji
+        grade_emoji = {"A": "🅰️", "B": "🅱️", "C": "©️"}.get(setup_grade, "")
+        grade_line = f"\nGrade: <b>{grade_emoji} {setup_grade}</b>" if setup_grade else ""
+
+        # V3: TP/SL percentage display
+        tp_sl_pct_line = ""
+        if tp_pct > 0 or sl_pct > 0:
+            tp_sl_pct_line = f"\nTP: <b>{tp_pct:.1f}%</b> | SL: <b>{sl_pct:.1f}%</b>"
+
+        # V3: Daily progress
+        daily_line = ""
+        if daily_pnl_pct != 0:
+            daily_emoji = "📈" if daily_pnl_pct >= 0 else "📉"
+            daily_line = f"\nDaily: <b>{daily_emoji} {daily_pnl_pct:+.1f}%</b>"
+
         msg = (
             f"✅ <b>TRADE OPENED</b>\n"
             f"Coin: <b>{symbol}</b>\n"
@@ -64,10 +90,95 @@ class TelegramNotifier:
             f"Leverage: <b>{leverage}x</b>\n"
             f"Size: <b>${position_size:,.2f}</b>\n"
             f"TP: <b>${take_profit:,.6f}</b>\n"
-            f"SL: <b>${stop_loss:,.6f}</b>\n"
+            f"SL: <b>${stop_loss:,.6f}</b>"
+            f"{tp_sl_pct_line}\n"
             f"Confidence: <b>{confidence}%</b>"
+            f"{grade_line}"
+            f"{daily_line}"
             f"{account_line}"
         )
+        await self.send(msg)
+
+    # ─── V3: TP/SL Failed Alert ───────────────────────────────────────
+
+    async def tp_sl_failed(
+        self,
+        symbol: str,
+        side: str,
+        sl_attached: bool,
+        tp_attached: bool,
+        error: str,
+    ):
+        """V3: Alert when TP/SL placement fails after 3 retries."""
+        failed_items = []
+        if not sl_attached:
+            failed_items.append("❌ STOP LOSS")
+        if not tp_attached:
+            failed_items.append("❌ TAKE PROFIT")
+
+        msg = (
+            f"🚨 <b>TP/SL ATTACHMENT FAILED</b>\n\n"
+            f"Symbol: <b>{symbol}</b>\n"
+            f"Side: <b>{side}</b>\n"
+            f"Failed: {', '.join(failed_items)}\n"
+            f"Error: <code>{error[:200]}</code>\n\n"
+            f"⚠️ <b>UNPROTECTED POSITION — Manual action required!</b>"
+        )
+        await self.send(msg)
+
+    # ─── V3: Daily Target Hit ─────────────────────────────────────────
+
+    async def daily_target_hit(
+        self,
+        account_label: str,
+        daily_pnl_pct: float,
+        mode: str = "safe",  # "safe" or "stop"
+    ):
+        """V3: Alert when account hits daily profit target."""
+        if mode == "stop":
+            msg = (
+                f"🔒 <b>DAILY PROFIT TARGET — TRADING STOPPED</b>\n\n"
+                f"Account: <b>{account_label}</b>\n"
+                f"Daily P&L: <b>+{daily_pnl_pct:.1f}%</b>\n\n"
+                f"✅ Gains locked. No more trades until tomorrow.\n"
+                f"Great discipline! 💪"
+            )
+        else:
+            msg = (
+                f"🛡️ <b>SAFE MODE ACTIVATED</b>\n\n"
+                f"Account: <b>{account_label}</b>\n"
+                f"Daily P&L: <b>+{daily_pnl_pct:.1f}%</b>\n\n"
+                f"Only elite setups (91%+ confidence) allowed.\n"
+                f"Position size reduced by 50%.\n"
+                f"Max 1 more trade."
+            )
+        await self.send(msg)
+
+    # ─── V3: Daily Loss Limit Hit ─────────────────────────────────────
+
+    async def daily_loss_hit(
+        self,
+        account_label: str,
+        daily_pnl_pct: float,
+        mode: str = "reduce",  # "reduce" or "stop"
+    ):
+        """V3: Alert when account hits daily loss limit."""
+        if mode == "stop":
+            msg = (
+                f"🛑 <b>DAILY LOSS LIMIT — TRADING STOPPED</b>\n\n"
+                f"Account: <b>{account_label}</b>\n"
+                f"Daily P&L: <b>{daily_pnl_pct:.1f}%</b>\n\n"
+                f"Account protected. No more trades until tomorrow.\n"
+                f"Reviewing strategy is recommended."
+            )
+        else:
+            msg = (
+                f"⚠️ <b>DAILY LOSS REDUCTION ACTIVE</b>\n\n"
+                f"Account: <b>{account_label}</b>\n"
+                f"Daily P&L: <b>{daily_pnl_pct:.1f}%</b>\n\n"
+                f"Position size reduced by 50%.\n"
+                f"Only elite setups allowed."
+            )
         await self.send(msg)
 
     # ─── Signal Summary (Multi-Account) ───────────────────────────────
@@ -120,7 +231,7 @@ class TelegramNotifier:
             msg = (
                 f"🔍 <b>SCAN COMPLETE — NO CANDIDATES</b>\n"
                 f"No coins passed quality filters.\n"
-                f"Next scan in 5 minutes."
+                f"Next scan in 30 minutes."
             )
         else:
             coin_list = ", ".join(top_coins[:5])
@@ -141,7 +252,7 @@ class TelegramNotifier:
             f"🔍 <b>SCAN COMPLETE — NO SIGNALS</b>\n"
             f"Analyzed: {analyzed_count} coins\n"
             f"No trades met confluence criteria.\n"
-            f"Next scan in 5 minutes."
+            f"Next scan in 30 minutes."
         )
         await self.send(msg)
 

@@ -1,9 +1,13 @@
 """
-V2 AI Decision Engine — Layered Confluence + OpenAI Verification
+V3 AI Decision Engine — Layered Confluence + OpenAI Verification
 
 Layer 1: Technical Rules Engine (confluence logic)
-  - All conditions must align for BUY/SELL signal
+  - 10 conditions must align for BUY/SELL signal (V3: up from 8)
+  - Min 6/10 for a signal
   - Confidence scored by number of passing conditions
+  - Pullback-to-EMA detection for LONG entries
+  - Rejection bounce detection for SHORT entries
+  - Candle chase filter reduces confidence
 
 Layer 2: OpenAI Verification (optional)
   - Sends indicator + orderbook summary
@@ -11,7 +15,14 @@ Layer 2: OpenAI Verification (optional)
   - Adjusts confidence by averaging with technical score
   - Falls back to Layer 1 if OpenAI fails
 
-Full logging: AI called, tokens, model, latency, fallback status.
+V3 Changes:
+  - Added MACD crossover condition (#9)
+  - Added Bollinger Band position condition (#10)
+  - Pullback-to-EMA and rejection bounce detection
+  - Candle chase filter (large candle = reduced confidence)
+  - Setup grade output (A/B/C)
+  - Tightened spread block from 0.15% to 0.10%
+  - Volume spike required for A-grade setups
 """
 
 import json
@@ -54,6 +65,14 @@ class AIDecision:
     volume_spike: bool = False
     candle_type: str = "DOJI"
     is_choppy: bool = False
+    # V3: New fields
+    setup_grade: str = "C"       # A | B | C
+    macd_crossover: str = "NONE" # BULLISH | BEARISH | NONE
+    bb_position: str = "MID"     # UPPER | LOWER | MID
+    is_pullback: bool = False
+    is_chase: bool = False
+    conditions_passed: int = 0
+    conditions_total: int = 10
     # AI logging
     ai_called: bool = False
     ai_tokens_used: int = 0
@@ -64,7 +83,7 @@ class AIDecision:
 
 class ScalpingEngine:
     """
-    V2 Scalping Decision Engine with layered confluence + optional OpenAI.
+    V3 Scalping Decision Engine with 10-condition confluence + optional OpenAI.
     """
 
     def __init__(self):
@@ -129,6 +148,26 @@ class ScalpingEngine:
             return closes[-1]
         return float((cum_tp_vol / cum_vol)[-1])
 
+    def calc_macd(self, closes: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9):
+        """MACD Line, Signal Line, Histogram"""
+        ema_fast = self.calc_ema(closes, fast)
+        ema_slow = self.calc_ema(closes, slow)
+        macd_line = ema_fast - ema_slow
+        signal_line = self.calc_ema(macd_line, signal)
+        histogram = macd_line - signal_line
+        return macd_line, signal_line, histogram
+
+    def calc_bollinger(self, closes: np.ndarray, period: int = 20, std_dev: float = 2.0):
+        """Bollinger Bands: upper, middle, lower"""
+        if len(closes) < period:
+            mid = closes[-1]
+            return mid, mid, mid
+        middle = np.convolve(closes, np.ones(period) / period, mode="valid")
+        std = np.array([np.std(closes[i:i + period]) for i in range(len(closes) - period + 1)])
+        upper = middle + std_dev * std
+        lower = middle - std_dev * std
+        return float(upper[-1]), float(middle[-1]), float(lower[-1])
+
     async def fetch_htf_trend(self, symbol: str) -> str:
         """15m higher timeframe trend via EMA 9/21."""
         try:
@@ -147,7 +186,44 @@ class ScalpingEngine:
         except Exception:
             return "NEUTRAL"
 
-    # ─── Layer 1: Technical Rules Engine (Confluence) ─────────────────
+    # ─── V3: Pullback / Chase Detection ───────────────────────────────
+
+    def detect_pullback(
+        self, closes: np.ndarray, ema_fast: np.ndarray, ema_slow: np.ndarray
+    ) -> bool:
+        """
+        V3: Detect pullback-to-EMA for quality entries.
+        LONG: Price recently touched or went below EMA 9/21, now reclaiming above.
+        """
+        if len(closes) < 5:
+            return False
+        # Check if price was near/below EMA in last 3 candles, now above
+        recent_low = min(closes[-3], closes[-4]) if len(closes) >= 4 else closes[-2]
+        touched_ema = (recent_low <= ema_fast[-3] * 1.002) or (recent_low <= ema_slow[-3] * 1.002)
+        now_above = closes[-1] > ema_fast[-1] and closes[-1] > ema_slow[-1]
+        return touched_ema and now_above
+
+    def detect_rejection(
+        self, closes: np.ndarray, highs: np.ndarray, ema_fast: np.ndarray, ema_slow: np.ndarray
+    ) -> bool:
+        """
+        V3: Detect rejection bounce for SHORT entries.
+        SHORT: Price recently touched or went above EMA, rejected back down.
+        """
+        if len(closes) < 5:
+            return False
+        recent_high = max(highs[-3], highs[-4]) if len(highs) >= 4 else highs[-2]
+        touched_ema = (recent_high >= ema_fast[-3] * 0.998) or (recent_high >= ema_slow[-3] * 0.998)
+        now_below = closes[-1] < ema_fast[-1] and closes[-1] < ema_slow[-1]
+        return touched_ema and now_below
+
+    def detect_chase(self, body: float, atr: float) -> bool:
+        """V3: Detect if last candle is a chase (body > 2×ATR)."""
+        if atr <= 0:
+            return False
+        return body > atr * 2
+
+    # ─── V3 Layer 1: Technical Rules Engine (10-Condition Confluence) ─
 
     def _evaluate_confluence(
         self,
@@ -162,54 +238,60 @@ class ScalpingEngine:
         candle_type: str,
         htf_trend: str,
         is_choppy: bool,
+        macd_crossover: str,
+        bb_position: str,
+        is_pullback: bool,
+        is_rejection: bool,
+        is_chase: bool,
     ) -> tuple[str, int, str]:
         """
-        Layered confluence scoring.
+        V3 Layered confluence scoring — 10 conditions.
         Returns (action, confidence, reason).
         """
         # ── AVOID conditions (hard blocks) ───────────────────────────
         if is_choppy:
             return "HOLD", 0, "Sideways chop detected — EMAs too close"
-        if spread_pct > 0.15:
-            return "HOLD", 0, f"Spread too high: {spread_pct:.3f}%"
+        if spread_pct > settings.MAX_SPREAD_ENTRY_PCT:
+            return "HOLD", 0, f"Spread too high: {spread_pct:.3f}% > {settings.MAX_SPREAD_ENTRY_PCT}%"
         if atr_pct > settings.MAX_VOLATILITY_PCT:
             return "HOLD", 0, f"Extreme volatility: ATR%={atr_pct:.2f}%"
-        if not volume_spike:
-            # Not a hard block, but reduces confidence significantly
-            pass
 
-        # ── LONG conditions ──────────────────────────────────────────
+        # ── LONG conditions (10 total) ───────────────────────────────
         long_conditions = {
             "ema_cross": ema_fast > ema_slow,
             "above_vwap": price > vwap,
             "rsi_range": 52 <= rsi <= 68,
             "volume_spike": volume_spike,
-            "spread_ok": spread_pct < 0.15,
+            "spread_ok": spread_pct < settings.MAX_SPREAD_ENTRY_PCT,
             "volatility_ok": atr_pct < settings.MAX_VOLATILITY_PCT,
             "candle_bullish": candle_type == "BULLISH",
             "htf_bullish": htf_trend == "BULLISH",
+            "macd_bullish": macd_crossover == "BULLISH" or macd_crossover == "NONE",  # Not bearish
+            "bb_favorable": bb_position != "UPPER",  # Not overbought at upper band
         }
 
-        # ── SHORT conditions ─────────────────────────────────────────
+        # ── SHORT conditions (10 total) ──────────────────────────────
         short_conditions = {
             "ema_cross": ema_fast < ema_slow,
             "below_vwap": price < vwap,
             "rsi_range": 32 <= rsi <= 48,
             "volume_spike": volume_spike,
-            "spread_ok": spread_pct < 0.15,
+            "spread_ok": spread_pct < settings.MAX_SPREAD_ENTRY_PCT,
             "volatility_ok": atr_pct < settings.MAX_VOLATILITY_PCT,
             "candle_bearish": candle_type == "BEARISH",
             "htf_bearish": htf_trend == "BEARISH",
+            "macd_bearish": macd_crossover == "BEARISH" or macd_crossover == "NONE",
+            "bb_favorable": bb_position != "LOWER",  # Not oversold at lower band
         }
 
         long_score = sum(1 for v in long_conditions.values() if v)
         short_score = sum(1 for v in short_conditions.values() if v)
-        total_conditions = 8
+        total_conditions = 10
+
+        # V3: Minimum 6/10 conditions for signal (up from 5/8)
+        min_conditions = 6
 
         # ── Decision logic ───────────────────────────────────────────
-        # Need at least 5/8 conditions for a signal
-        min_conditions = 5
-
         if long_score >= min_conditions and long_score > short_score:
             confidence = int(50 + (long_score / total_conditions) * 50)
             passed = [k for k, v in long_conditions.items() if v]
@@ -217,6 +299,17 @@ class ScalpingEngine:
             reason = f"LONG confluence {long_score}/{total_conditions}: {', '.join(passed)}"
             if failed:
                 reason += f" | Missing: {', '.join(failed)}"
+
+            # V3: Pullback bonus
+            if is_pullback:
+                confidence = min(confidence + 5, 98)
+                reason += " | ✅ Pullback entry"
+
+            # V3: Chase penalty
+            if is_chase:
+                confidence = max(confidence - 15, 50)
+                reason += " | ⚠️ Chase detected"
+
             return "BUY", min(confidence, 98), reason
 
         elif short_score >= min_conditions and short_score > long_score:
@@ -226,11 +319,23 @@ class ScalpingEngine:
             reason = f"SHORT confluence {short_score}/{total_conditions}: {', '.join(passed)}"
             if failed:
                 reason += f" | Missing: {', '.join(failed)}"
+
+            # V3: Rejection bonus
+            if is_rejection:
+                confidence = min(confidence + 5, 98)
+                reason += " | ✅ Rejection entry"
+
+            # V3: Chase penalty
+            if is_chase:
+                confidence = max(confidence - 15, 50)
+                reason += " | ⚠️ Chase detected"
+
             return "SELL", min(confidence, 98), reason
 
         else:
             best = max(long_score, short_score)
-            return "HOLD", max(20, int(best / total_conditions * 40)), f"Insufficient confluence: L={long_score}/8, S={short_score}/8"
+            return "HOLD", max(20, int(best / total_conditions * 40)), \
+                f"Insufficient confluence: L={long_score}/10, S={short_score}/10"
 
     # ─── Layer 2: OpenAI Verification ─────────────────────────────────
 
@@ -312,6 +417,10 @@ class ScalpingEngine:
             f"15m HTF Trend: {indicators.get('htf_trend', 'NEUTRAL')}",
             f"Choppy Market: {indicators.get('is_choppy', False)}",
             f"Spread: {indicators.get('spread_pct', 0)}%",
+            f"MACD Crossover: {indicators.get('macd_crossover', 'NONE')}",
+            f"BB Position: {indicators.get('bb_position', 'MID')}",
+            f"Pullback Entry: {indicators.get('is_pullback', False)}",
+            f"Chase Warning: {indicators.get('is_chase', False)}",
         ]
 
         if orderbook:
@@ -331,18 +440,34 @@ class ScalpingEngine:
 
         return "\n".join(parts)
 
+    # ─── V3: Setup Grade ──────────────────────────────────────────────
+
+    @staticmethod
+    def determine_setup_grade(conditions_passed: int, volume_spike: bool) -> str:
+        """
+        A = Elite (8+/10 conditions, volume spike present)
+        B = Strong (7/10 or 8+/10 without volume spike)
+        C = Standard (6/10)
+        """
+        if conditions_passed >= 8 and volume_spike:
+            return "A"
+        elif conditions_passed >= 7:
+            return "B"
+        else:
+            return "C"
+
     # ─── Main Analysis ────────────────────────────────────────────────
 
     async def analyze(self, symbol: str, spread_pct: float = 0.0, orderbook_data: Optional[dict] = None) -> AIDecision:
         """
-        Full scalping analysis:
+        V3 Full scalping analysis:
         1. Fetch 5m candles + 15m HTF trend
-        2. Compute all indicators
-        3. Layer 1: Technical confluence scoring
+        2. Compute all indicators (including MACD, BB, pullback/chase)
+        3. Layer 1: 10-condition technical confluence scoring
         4. Layer 2: OpenAI verification (optional)
-        5. Combine results
+        5. Combine results with setup grade
         """
-        logger.info(f"🤖 V2 scalping analysis for {symbol}...")
+        logger.info(f"🤖 V3 scalping analysis for {symbol}...")
 
         try:
             # Fetch candles and HTF in parallel
@@ -400,7 +525,35 @@ class ScalpingEngine:
             else:
                 trend = "NEUTRAL"
 
-            # ── Layer 1: Technical Confluence ─────────────────────────
+            # V3: MACD crossover
+            macd_line, signal_line, histogram = self.calc_macd(closes)
+            if len(histogram) >= 2:
+                if histogram[-2] < 0 and histogram[-1] > 0:
+                    macd_crossover = "BULLISH"
+                elif histogram[-2] > 0 and histogram[-1] < 0:
+                    macd_crossover = "BEARISH"
+                else:
+                    macd_crossover = "NONE"
+            else:
+                macd_crossover = "NONE"
+
+            # V3: Bollinger Band position
+            bb_upper, bb_mid, bb_lower = self.calc_bollinger(closes)
+            if current_price >= bb_upper * 0.998:
+                bb_position = "UPPER"
+            elif current_price <= bb_lower * 1.002:
+                bb_position = "LOWER"
+            else:
+                bb_position = "MID"
+
+            # V3: Pullback / rejection detection
+            is_pullback = self.detect_pullback(closes, ema_9, ema_21)
+            is_rejection = self.detect_rejection(closes, highs, ema_9, ema_21)
+
+            # V3: Chase detection
+            is_chase = self.detect_chase(body, atr)
+
+            # ── Layer 1: V3 Technical Confluence (10 conditions) ──────
             tech_action, tech_confidence, tech_reason = self._evaluate_confluence(
                 rsi=rsi,
                 ema_fast=ema_fast_val,
@@ -413,9 +566,34 @@ class ScalpingEngine:
                 candle_type=candle_type,
                 htf_trend=htf_trend,
                 is_choppy=is_choppy,
+                macd_crossover=macd_crossover,
+                bb_position=bb_position,
+                is_pullback=is_pullback,
+                is_rejection=is_rejection,
+                is_chase=is_chase,
             )
 
-            logger.info(f"  Layer1: {tech_action} conf={tech_confidence} | {tech_reason}")
+            # V3: Count conditions for setup grade
+            if tech_action == "BUY":
+                conditions_passed = tech_confidence  # Will recalculate
+                # Re-derive from reason
+                try:
+                    parts = tech_reason.split("/10")[0].split()
+                    conditions_passed = int(parts[-1]) if parts else 6
+                except Exception:
+                    conditions_passed = 6
+            elif tech_action == "SELL":
+                try:
+                    parts = tech_reason.split("/10")[0].split()
+                    conditions_passed = int(parts[-1]) if parts else 6
+                except Exception:
+                    conditions_passed = 6
+            else:
+                conditions_passed = 0
+
+            setup_grade = self.determine_setup_grade(conditions_passed, volume_spike)
+
+            logger.info(f"  Layer1: {tech_action} conf={tech_confidence} grade={setup_grade} | {tech_reason}")
 
             # Build decision
             decision = AIDecision(
@@ -434,6 +612,12 @@ class ScalpingEngine:
                 volume_spike=volume_spike,
                 candle_type=candle_type,
                 is_choppy=is_choppy,
+                setup_grade=setup_grade,
+                macd_crossover=macd_crossover,
+                bb_position=bb_position,
+                is_pullback=is_pullback,
+                is_chase=is_chase,
+                conditions_passed=conditions_passed,
             )
 
             # ── Layer 2: OpenAI Verification (only if Layer 1 produced a signal) ──
@@ -452,6 +636,10 @@ class ScalpingEngine:
                     "htf_trend": htf_trend,
                     "is_choppy": is_choppy,
                     "spread_pct": spread_pct,
+                    "macd_crossover": macd_crossover,
+                    "bb_position": bb_position,
+                    "is_pullback": is_pullback,
+                    "is_chase": is_chase,
                 }
 
                 ai_result = await self._openai_verify(symbol, indicators_for_ai, orderbook_data)
@@ -487,7 +675,7 @@ class ScalpingEngine:
                     logger.info("  Layer2: OpenAI unavailable — using technical rules only")
 
             logger.info(
-                f"  Final: {decision.action} conf={decision.confidence} | "
+                f"  Final: {decision.action} conf={decision.confidence} grade={decision.setup_grade} | "
                 f"AI={decision.ai_called} fallback={decision.ai_fallback}"
             )
             return decision
@@ -514,6 +702,15 @@ class ScalpingEngine:
             "volume_spike": decision.volume_spike,
             "candle_type": decision.candle_type,
             "is_choppy": decision.is_choppy,
+            # V3
+            "setup_grade": decision.setup_grade,
+            "macd_crossover": decision.macd_crossover,
+            "bb_position": decision.bb_position,
+            "is_pullback": decision.is_pullback,
+            "is_chase": decision.is_chase,
+            "conditions_passed": decision.conditions_passed,
+            "conditions_total": decision.conditions_total,
+            # AI
             "ai_called": decision.ai_called,
             "ai_tokens_used": decision.ai_tokens_used,
             "ai_model": decision.ai_model,
