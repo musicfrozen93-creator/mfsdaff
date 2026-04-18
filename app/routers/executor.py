@@ -1,17 +1,21 @@
 """
-V3 Executor API — Multi-Account Trade Execution with Daily Guard
+V4 Executor API — Multi-Account Trade Execution with Daily Guard
 
 Endpoints:
   POST /execute       — Single-account backward-compatible execution
   POST /execute-full  — Single-account with risk engine + SL/TP
   POST /execute-multi — Multi-account execution for all connected accounts
 
-V3 Changes:
-  - Per-account daily guard (profit target, loss limit, consecutive loss)
-  - Pre-entry quality checks (spread, chase, fee impact)
-  - Size multiplier from daily guard
-  - Enhanced logging per trade
-  - Setup grade + TP/SL % pass-through to Telegram
+V4 Changes:
+  - Removed global state_manager.check_daily_limits(0) with balance=0 (was causing false blocks)
+  - Per-account daily guard is the ONLY P&L limiter (no more duplicate global checks)
+  - Pre-entry check runs ONCE per signal, not per account
+  - ONE Telegram message per signal (no per-account spam)
+  - NEVER expose account names/labels/IDs in Telegram
+  - If all accounts blocked → send nothing (or compact no-execution message)
+  - Each account failure is caught independently — never stops the loop
+  - Comprehensive per-account logging to file (never to Telegram)
+  - LIMIT→MARKET fallback via executor module
 """
 
 import asyncio
@@ -89,13 +93,8 @@ async def execute_trade(req: SimpleExecuteRequest):
     if not symbol.endswith("USDT"):
         return {"status": "error", "message": f"Invalid symbol '{symbol}'"}
 
-    # Daily risk control
-    try:
-        balance = await binance.get_account_balance()
-    except Exception:
-        balance = 20.0
-
-    daily_check = state_manager.check_daily_limits(balance)
+    # Daily trade count limit
+    daily_check = state_manager.check_daily_limits(0)
     if not daily_check["allowed"]:
         await telegram.trading_paused(daily_check["reason"])
         return {"status": "error", "message": f"Trading paused: {daily_check['reason']}"}
@@ -150,17 +149,12 @@ async def execute_trade(req: SimpleExecuteRequest):
 
 @router.post("/execute-full")
 async def execute_trade_full(req: FullExecuteRequest):
-    """Full single-account execution with V3 risk engine + SL/TP."""
+    """Full single-account execution with V4 risk engine + SL/TP."""
     telegram = TelegramNotifier()
     binance = BinanceExecutor()
 
-    # Daily limits
-    try:
-        balance = await binance.get_account_balance()
-    except Exception:
-        balance = 20.0
-
-    daily_check = state_manager.check_daily_limits(balance)
+    # Daily trade count limit
+    daily_check = state_manager.check_daily_limits(0)
     if not daily_check["allowed"]:
         await telegram.trading_paused(daily_check["reason"])
         return {"status": "trading_paused", "reason": daily_check["reason"]}
@@ -186,6 +180,11 @@ async def execute_trade_full(req: FullExecuteRequest):
 
     if req.atr_pct > settings.MAX_VOLATILITY_PCT:
         return {"status": "skipped", "reason": f"ATR%={req.atr_pct:.2f}% > max {settings.MAX_VOLATILITY_PCT}%"}
+
+    try:
+        balance = await binance.get_account_balance()
+    except Exception:
+        balance = 20.0
 
     try:
         if await binance.has_open_position(req.symbol):
@@ -247,17 +246,20 @@ async def execute_trade_full(req: FullExecuteRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# V3 MULTI-ACCOUNT EXECUTE — with daily guard + pre-entry checks
+# V4 MULTI-ACCOUNT EXECUTE — Hardened account loop, single Telegram msg
 # ═══════════════════════════════════════════════════════════════════════
 
 @router.post("/execute-multi")
 async def execute_multi_account(req: MultiExecuteRequest):
     """
-    V3 Multi-account execution flow:
-    1. Save signal to DB
+    V4 Multi-account execution flow:
+    1. Validate signal + save to DB
     2. Load all active accounts
-    3. For each: daily guard → pre-entry check → validate → calculate risk → execute → log
-    4. Send Telegram summary
+    3. Run pre-entry check ONCE (symbol-level, not per-account)
+    4. For each account: daily guard → validate → calculate risk → execute → log
+    5. Collect ALL results first
+    6. Send ONE Telegram message at the end
+    7. If nobody traded → send nothing (or compact no-execution message)
     """
     telegram = TelegramNotifier()
 
@@ -269,18 +271,15 @@ async def execute_multi_account(req: MultiExecuteRequest):
     if req.confidence < settings.MIN_CONFIDENCE:
         return {"status": "skipped", "reason": f"Confidence {req.confidence} < {settings.MIN_CONFIDENCE}"}
 
-    # Global rate limits
+    # ── Global rate limits (trade count + cooldowns only) ────────────
     hourly_limited, _ = state_manager.is_hourly_limit_reached()
     if hourly_limited:
         return {"status": "skipped", "reason": "Hourly trade limit reached"}
 
+    # V4: check_daily_limits only checks trade COUNT now (not P&L — that's per-account)
     daily_check = state_manager.check_daily_limits(0)
     if not daily_check["allowed"]:
         return {"status": "trading_paused", "reason": daily_check["reason"]}
-
-    loss_cd, _ = state_manager.is_loss_cooldown_active()
-    if loss_cd:
-        return {"status": "skipped", "reason": "Loss cooldown active"}
 
     on_cooldown, _ = state_manager.is_coin_on_cooldown(symbol)
     if on_cooldown:
@@ -335,25 +334,86 @@ async def execute_multi_account(req: MultiExecuteRequest):
         else:
             return {"status": "error", "message": "No active accounts found"}
 
-    # ── Extract setup grade from indicators ──────────────────────────
+    # ── V4: Pre-entry check ONCE (symbol-level, not per account) ─────
+    risk_engine = RiskEngine()
     setup_grade = req.indicators.get("setup_grade", "C")
     volume_spike = req.indicators.get("volume_spike", False)
 
-    # ── Execute for each account ─────────────────────────────────────
-    risk_engine = RiskEngine()
+    # Create a scanner executor for pre-entry (uses master/first account)
+    if accounts_data[0]["api_key_enc"]:
+        try:
+            scanner_api_key = decrypt_api_key(accounts_data[0]["api_key_enc"])
+            scanner_api_secret = decrypt_api_key(accounts_data[0]["api_secret_enc"])
+            scanner_executor = BinanceExecutor(api_key=scanner_api_key, secret_key=scanner_api_secret)
+        except Exception:
+            scanner_executor = BinanceExecutor()
+    else:
+        scanner_executor = BinanceExecutor()
+
+    # Get entry price ONCE
+    entry_price = req.current_price
+    if entry_price <= 0:
+        try:
+            entry_price = await scanner_executor.get_market_price(symbol)
+        except Exception as e:
+            logger.error(f"Failed to get market price for {symbol}: {e}")
+            return {"status": "error", "message": f"Cannot get price for {symbol}"}
+
+    # Pre-entry quality check (ONCE for the signal)
+    tp_pct_decimal, _ = risk_engine.get_tp_sl_pct(req.confidence, req.atr_pct)
+    tp_pct_for_check = tp_pct_decimal * 100
+
+    pre_check = await scanner_executor.pre_entry_check(
+        symbol=symbol, side=side,
+        tp_pct=tp_pct_for_check,
+        atr=req.indicators.get("atr", 0),
+        entry_price=entry_price,
+    )
+    if not pre_check.passed:
+        logger.info(f"  Pre-entry check FAILED (signal-level): {pre_check.reason}")
+        # V4: Don't send Telegram for pre-entry failures — not actionable
+        return {
+            "status": "skipped",
+            "reason": f"Pre-entry check failed: {pre_check.reason}",
+        }
+
+    logger.info(
+        f"  Pre-entry PASSED: spread={pre_check.spread_pct:.4f}% "
+        f"slippage_est={pre_check.slippage_estimate:.4f}% "
+        f"fee_impact={pre_check.fee_impact_pct:.1f}%"
+    )
+
+    # ── Execute for each account (hardened loop) ─────────────────────
     executed = []
     skipped = []
     skip_reasons_map = {}
 
+    # V4: Track best trade result for the single Telegram message
+    best_fill_price = 0.0
+    best_leverage = 0
+    best_tp = 0.0
+    best_sl = 0.0
+    best_tp_pct = 0.0
+    best_sl_pct = 0.0
+    best_grade = "C"
+    all_sl_attached = True
+    all_tp_attached = True
+    best_order_method = "MARKET"
+
     semaphore = asyncio.Semaphore(5)  # Max 5 concurrent account executions
 
     async def execute_for_account(acc_data: dict):
+        nonlocal best_fill_price, best_leverage, best_tp, best_sl
+        nonlocal best_tp_pct, best_sl_pct, best_grade
+        nonlocal all_sl_attached, all_tp_attached, best_order_method
+
         async with semaphore:
             acc_id = acc_data["id"]
-            label = acc_data["label"]
+            # V4: Use generic label for internal logging (never sent to Telegram)
+            internal_label = f"account_{acc_id}"
 
             try:
-                # Create executor with account's credentials
+                # ── 1. Create executor with account's credentials ─────
                 if acc_data["api_key_enc"]:
                     api_key = decrypt_api_key(acc_data["api_key_enc"])
                     api_secret = decrypt_api_key(acc_data["api_secret_enc"])
@@ -361,60 +421,57 @@ async def execute_multi_account(req: MultiExecuteRequest):
                 else:
                     executor = BinanceExecutor()
 
-                # Get balance
-                balance = await executor.get_account_balance()
+                # ── 2. Get balance ───────────────────────────────────
+                try:
+                    balance = await executor.get_account_balance()
+                except Exception as be:
+                    logger.error(f"  [{internal_label}] Balance fetch failed: {be}")
+                    return _skip(acc_id, "API Error", f"Balance fetch failed: {str(be)[:80]}")
 
                 if balance < 5:
-                    return _skip(acc_id, label, "Low Balance", f"Balance ${balance:.2f} too low")
+                    logger.info(f"  [{internal_label}] Balance ${balance:.2f} too low → SKIP")
+                    return _skip(acc_id, "Insufficient Balance", f"Balance ${balance:.2f} below $5 minimum")
 
-                # ── V3: Per-account daily guard check ────────────────
+                # ── 3. Per-account daily guard check ─────────────────
                 guard_result = daily_guard.check_allowed(acc_id, balance, req.confidence)
+
+                # V4: Log full guard state (private, never Telegram)
+                guard_log = daily_guard.get_guard_log(acc_id, balance)
+                logger.info(
+                    f"  [{internal_label}] GUARD: "
+                    f"pnl=${guard_log['pnl_today']} ({guard_log['pnl_pct']:+.1f}%) | "
+                    f"trades={guard_log['trades_today']} | "
+                    f"stopped={guard_log['is_stopped']} | "
+                    f"decision={'PASS' if guard_result['allowed'] else 'BLOCKED'}"
+                )
+
                 if not guard_result["allowed"]:
                     guard_reason = guard_result["reason"]
-                    logger.info(f"  Account {label}: daily guard blocked — {guard_reason}")
-
-                    # Send appropriate Telegram alert
-                    daily_pnl_pct = daily_guard.get_daily_pnl_pct(acc_id, balance)
-                    if "profit target" in guard_reason.lower() or "safe mode" in guard_reason.lower():
-                        await telegram.daily_target_hit(label, daily_pnl_pct,
-                            mode="stop" if "stopped" in guard_reason.lower() else "safe")
-                    elif "loss limit" in guard_reason.lower():
-                        await telegram.daily_loss_hit(label, daily_pnl_pct,
-                            mode="stop" if "stopped" in guard_reason.lower() else "reduce")
-
-                    return _skip(acc_id, label, "Daily Guard", guard_reason)
+                    # V4: NO Telegram per-account daily guard messages
+                    # Categorize for aggregated skip reasons
+                    if "profit" in guard_reason.lower() or "safe mode" in guard_reason.lower():
+                        return _skip(acc_id, "Daily Target Reached", guard_reason)
+                    elif "loss" in guard_reason.lower():
+                        return _skip(acc_id, "Daily Loss Limit", guard_reason)
+                    elif "pause" in guard_reason.lower():
+                        return _skip(acc_id, "Loss Cooldown", guard_reason)
+                    else:
+                        return _skip(acc_id, "Daily Guard", guard_reason)
 
                 size_multiplier = guard_result["size_multiplier"]
 
-                # Check open position
+                # ── 4. Check open position ───────────────────────────
                 try:
                     if await executor.has_open_position(symbol):
-                        return _skip(acc_id, label, "Existing Position", f"Already has {symbol} position")
-                except Exception:
-                    pass
+                        logger.info(f"  [{internal_label}] Already has {symbol} position → SKIP")
+                        return _skip(acc_id, "Existing Position", f"Already has {symbol} position")
+                except Exception as pe:
+                    logger.warning(f"  [{internal_label}] Position check failed: {pe}")
+                    # Don't skip on position check failure — try to trade
 
-                # Get entry price
-                entry_price = req.current_price if req.current_price > 0 else await executor.get_market_price(symbol)
-
-                # ── V3: Pre-entry quality check ──────────────────────
-                # Calculate expected TP% for fee impact check
-                tp_pct_decimal, _ = risk_engine.get_tp_sl_pct(req.confidence, req.atr_pct)
-                tp_pct_for_check = tp_pct_decimal * 100
-
-                pre_check = await executor.pre_entry_check(
-                    symbol=symbol, side=side,
-                    tp_pct=tp_pct_for_check,
-                    atr=req.indicators.get("atr", 0),
-                    entry_price=entry_price,
-                )
-                if not pre_check.passed:
-                    logger.info(f"  Account {label}: pre-entry check failed — {pre_check.reason}")
-                    return _skip(acc_id, label, "Pre-Entry Check", pre_check.reason)
-
-                # Get precision
+                # ── 5. Calculate risk parameters ─────────────────────
                 precision = await executor.get_precision(symbol)
 
-                # Calculate risk (V3: with size_multiplier)
                 trade_params = risk_engine.calculate(
                     symbol=symbol, side=side, confidence=req.confidence,
                     entry_price=entry_price, atr_pct=req.atr_pct,
@@ -428,24 +485,36 @@ async def execute_multi_account(req: MultiExecuteRequest):
                 )
 
                 if not trade_params.approved:
-                    category = "Min Notional" if "notional" in trade_params.reject_reason.lower() else "Risk Limit"
-                    return _skip(acc_id, label, category, trade_params.reject_reason)
+                    # Categorize reject reason
+                    reason_lower = trade_params.reject_reason.lower()
+                    if "notional" in reason_lower or "margin" in reason_lower:
+                        category = "Insufficient Margin"
+                    elif "quantity" in reason_lower or "min" in reason_lower:
+                        category = "Min Quantity Invalid"
+                    elif "confidence" in reason_lower:
+                        category = "Low Confidence"
+                    else:
+                        category = "Risk Limit"
+                    logger.info(f"  [{internal_label}] Risk rejected: {trade_params.reject_reason}")
+                    return _skip(acc_id, category, trade_params.reject_reason)
 
-                # ── V3: Comprehensive trade logging ──────────────────
+                # ── 6. Comprehensive trade log (private) ─────────────
                 logger.info(
-                    f"  📋 TRADE LOG [{label}]: "
+                    f"  📋 TRADE LOG [{internal_label}]: "
                     f"symbol={symbol} side={side} | "
                     f"balance=${balance:.2f} pos_size=${trade_params.position_size_usdt:.2f} | "
                     f"leverage={trade_params.leverage}x qty={trade_params.quantity} | "
-                    f"spread={pre_check.spread_pct:.4f}% slippage_est={pre_check.slippage_estimate:.4f}% | "
+                    f"spread={pre_check.spread_pct:.4f}% | "
                     f"confidence={req.confidence} grade={trade_params.setup_grade} | "
                     f"entry={entry_price} TP={trade_params.take_profit} SL={trade_params.stop_loss} | "
                     f"TP%={trade_params.tp_pct} SL%={trade_params.sl_pct} RR={trade_params.risk_reward} | "
                     f"size_mult={size_multiplier}"
                 )
 
-                # Execute trade (V3: with telegram for TP/SL failure alerts)
-                result = await executor.execute_trade(trade_params, telegram_notifier=telegram)
+                # ── 7. Execute trade (LIMIT→MARKET fallback in executor) ──
+                result = await executor.execute_trade(trade_params, telegram_notifier=None)
+                # V4: telegram_notifier=None — TP/SL failures logged but
+                # not sent per-account. Will be in the final message.
 
                 if result.success:
                     # Save trade to DB
@@ -469,31 +538,34 @@ async def execute_multi_account(req: MultiExecuteRequest):
                             )
                             session.add(trade)
                             await session.commit()
-                    except Exception as e:
-                        logger.warning(f"Failed to save trade to DB: {e}")
+                    except Exception as dbe:
+                        logger.warning(f"  [{internal_label}] Failed to save trade to DB: {dbe}")
 
-                    # V3: Send enhanced Telegram notification
-                    daily_pnl_pct = daily_guard.get_daily_pnl_pct(acc_id, balance)
-                    await telegram.trade_opened(
-                        symbol=symbol, side=side,
-                        entry_price=result.fill_price or entry_price,
-                        leverage=trade_params.leverage,
-                        position_size=trade_params.position_size_usdt,
-                        take_profit=trade_params.take_profit,
-                        stop_loss=trade_params.stop_loss,
-                        confidence=req.confidence,
-                        account_label=label,
-                        tp_pct=trade_params.tp_pct,
-                        sl_pct=trade_params.sl_pct,
-                        setup_grade=trade_params.setup_grade,
-                        daily_pnl_pct=daily_pnl_pct,
+                    # Track best result for Telegram message
+                    if result.fill_price > 0:
+                        best_fill_price = result.fill_price
+                    best_leverage = trade_params.leverage
+                    best_tp = trade_params.take_profit
+                    best_sl = trade_params.stop_loss
+                    best_tp_pct = trade_params.tp_pct
+                    best_sl_pct = trade_params.sl_pct
+                    best_grade = trade_params.setup_grade
+                    best_order_method = getattr(result, 'order_method', 'MARKET')
+                    if not result.sl_attached:
+                        all_sl_attached = False
+                    if not result.tp_attached:
+                        all_tp_attached = False
+
+                    logger.info(
+                        f"  ✅ [{internal_label}] EXECUTED: "
+                        f"order=#{result.order_id} fill={result.fill_price} "
+                        f"method={best_order_method} "
+                        f"SL_ok={result.sl_attached} TP_ok={result.tp_attached}"
                     )
 
                     return {
                         "status": "executed",
                         "account_id": acc_id,
-                        "label": label,
-                        "balance": balance,
                         "leverage": trade_params.leverage,
                         "position_size": trade_params.position_size_usdt,
                         "quantity": trade_params.quantity,
@@ -505,32 +577,35 @@ async def execute_multi_account(req: MultiExecuteRequest):
                         "fill_price": result.fill_price,
                         "sl_attached": result.sl_attached,
                         "tp_attached": result.tp_attached,
+                        "order_method": best_order_method,
                     }
                 else:
-                    logger.error(f"  Account {label}: execution error — {result.error}")
-                    return _skip(acc_id, label, "Execution Error", result.error or "Unknown")
+                    logger.error(f"  ❌ [{internal_label}] Execution error: {result.error}")
+                    return _skip(acc_id, "Exchange Rejected", result.error or "Unknown execution error")
 
             except Exception as e:
-                logger.error(f"Account {label} execution failed: {e}")
-                return _skip(acc_id, label, "Error", str(e)[:100])
+                logger.error(f"  ❌ [{internal_label}] Account failed: {e}", exc_info=True)
+                return _skip(acc_id, "System Error", str(e)[:100])
 
-    def _skip(acc_id, label, category, reason):
-        """Helper to build a skip result."""
+    def _skip(acc_id, category, reason):
+        """Helper to build a skip result. V4: No label exposed."""
         return {
             "status": "skipped",
             "account_id": acc_id,
-            "label": label,
             "category": category,
             "reason": reason,
         }
 
-    # Execute all accounts
+    # ── Execute all accounts ─────────────────────────────────────────
     tasks = [execute_for_account(acc) for acc in accounts_data]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     for r in results:
         if isinstance(r, Exception):
-            skipped.append({"status": "skipped", "category": "Error", "reason": str(r)})
+            logger.error(f"  Account task exception: {r}")
+            skipped.append({"status": "skipped", "category": "System Error", "reason": str(r)[:100]})
+            continue
+        if r is None:
             continue
         if r.get("status") == "executed":
             executed.append(r)
@@ -562,16 +637,52 @@ async def execute_multi_account(req: MultiExecuteRequest):
     except Exception as e:
         logger.warning(f"Failed to save skips to DB: {e}")
 
-    # Send Telegram summary
-    await telegram.signal_summary(
-        symbol=symbol, side=side, confidence=req.confidence,
-        executed_count=len(executed), skipped_count=len(skipped),
-        skip_reasons=skip_reasons_map, total_accounts=len(accounts_data),
-    )
+    # ═════════════════════════════════════════════════════════════════
+    # V4: ONE TELEGRAM MESSAGE (or nothing)
+    # ═════════════════════════════════════════════════════════════════
+
+    executed_count = len(executed)
+    skipped_count = len(skipped)
+
+    if executed_count > 0:
+        # At least one account traded → send execution result
+        display_fill = best_fill_price if best_fill_price > 0 else entry_price
+
+        await telegram.send_execution_result(
+            symbol=symbol,
+            side=side,
+            confidence=req.confidence,
+            executed_count=executed_count,
+            skipped_count=skipped_count,
+            skip_reasons=skip_reasons_map,
+            entry_price=entry_price,
+            fill_price=display_fill,
+            leverage=best_leverage,
+            take_profit=best_tp,
+            stop_loss=best_sl,
+            tp_pct=best_tp_pct,
+            sl_pct=best_sl_pct,
+            reason=req.reason,
+            setup_grade=best_grade,
+            sl_attached=all_sl_attached,
+            tp_attached=all_tp_attached,
+            order_method=best_order_method,
+        )
+    elif skipped_count > 0:
+        # V4: All accounts skipped — send compact no-execution message
+        # Only if there were real accounts to try
+        await telegram.send_no_execution(
+            symbol=symbol,
+            side=side,
+            confidence=req.confidence,
+            skipped_count=skipped_count,
+            skip_reasons=skip_reasons_map,
+        )
+    # else: No accounts at all — don't send anything
 
     logger.info(
-        f"📊 Multi-account result: {len(executed)} executed, {len(skipped)} skipped "
-        f"out of {len(accounts_data)} accounts"
+        f"📊 Multi-account result: {executed_count} executed, {skipped_count} skipped "
+        f"out of {len(accounts_data)} accounts | Skip reasons: {skip_reasons_map}"
     )
 
     return {
@@ -580,8 +691,8 @@ async def execute_multi_account(req: MultiExecuteRequest):
         "side": side,
         "confidence": req.confidence,
         "total_accounts": len(accounts_data),
-        "executed_count": len(executed),
-        "skipped_count": len(skipped),
+        "executed_count": executed_count,
+        "skipped_count": skipped_count,
         "executed": executed,
         "skipped": skipped,
         "skip_reasons": skip_reasons_map,

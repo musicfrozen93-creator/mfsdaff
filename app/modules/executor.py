@@ -1,5 +1,5 @@
 """
-V3 Binance Futures Execution Module
+V4 Binance Futures Execution Module
 Handles order placement, precision handling, leverage setting,
 multi-account execution, exchange filter caching, TP/SL with retry,
 and pre-entry quality checks.
@@ -10,6 +10,13 @@ V3 Changes:
   - Pre-entry spread/chase/fee checks
   - Get actual fill price from order response
   - Limit order support for better fills
+
+V4 Changes:
+  - LIMIT → MARKET fallback: try limit first, wait, fallback to market
+  - Position verification before TP/SL attachment
+  - Order status check + cancel for unfilled limits
+  - Actual fill price from position data as last resort
+  - Better error handling — never swallow exceptions silently
 """
 
 import asyncio
@@ -61,6 +68,7 @@ class OrderResult:
     sl_attached: bool = False          # V3: tracking
     tp_attached: bool = False          # V3: tracking
     error: Optional[str] = None
+    order_method: str = "MARKET"       # V4: LIMIT or MARKET
 
 
 @dataclass
@@ -75,8 +83,9 @@ class PreEntryCheck:
 
 class BinanceExecutor:
     """
-    V3 Executor — supports per-account API credentials.
-    Caches exchange info, retries TP/SL placement, pre-entry checks.
+    V4 Executor — supports per-account API credentials.
+    Caches exchange info, retries TP/SL placement, pre-entry checks,
+    LIMIT→MARKET fallback, position verification.
     """
 
     def __init__(self, api_key: str = None, secret_key: str = None, testnet: bool = None):
@@ -293,6 +302,14 @@ class BinanceExecutor:
         positions = await self.get_open_positions()
         return any(p["symbol"] == symbol for p in positions)
 
+    async def get_position_for_symbol(self, symbol: str) -> Optional[dict]:
+        """V4: Get the specific open position for a symbol (if any)."""
+        positions = await self.get_open_positions()
+        for p in positions:
+            if p["symbol"] == symbol:
+                return p
+        return None
+
     async def get_account_balance(self) -> float:
         """Returns available USDT balance."""
         data = await self._signed_request("GET", "/fapi/v2/balance")
@@ -353,6 +370,22 @@ class BinanceExecutor:
             "timeInForce": "GTC",
         }
         return await self._signed_request("POST", "/fapi/v1/order", params)
+
+    # ─── V4: Order Status Check + Cancel ──────────────────────────────
+
+    async def get_order_status(self, symbol: str, order_id: int) -> dict:
+        """V4: Check status of an order."""
+        return await self._signed_request(
+            "GET", "/fapi/v1/order",
+            {"symbol": symbol, "orderId": order_id},
+        )
+
+    async def cancel_order(self, symbol: str, order_id: int) -> dict:
+        """V4: Cancel an unfilled order."""
+        return await self._signed_request(
+            "DELETE", "/fapi/v1/order",
+            {"symbol": symbol, "orderId": order_id},
+        )
 
     # ─── V3: TP/SL with closePosition + Retry ────────────────────────
 
@@ -424,19 +457,47 @@ class BinanceExecutor:
             return price
         return 0.0
 
-    # ─── V3: Full Trade Flow (with SL/TP Retry) ──────────────────────
+    # ─── V4: Verify Position Opened ───────────────────────────────────
+
+    async def _verify_position(self, symbol: str, max_retries: int = 2, delay: float = 1.0) -> Optional[dict]:
+        """
+        V4: Verify position exists before attaching TP/SL.
+        Retries a few times in case of propagation delay.
+        """
+        for attempt in range(1, max_retries + 1):
+            try:
+                position = await self.get_position_for_symbol(symbol)
+                if position:
+                    entry = float(position.get("entryPrice", 0))
+                    amt = float(position.get("positionAmt", 0))
+                    logger.info(
+                        f"  ✅ Position verified (attempt {attempt}): "
+                        f"{symbol} entry={entry} amt={amt}"
+                    )
+                    return position
+            except Exception as e:
+                logger.warning(f"  Position verify attempt {attempt} failed: {e}")
+
+            if attempt < max_retries:
+                await asyncio.sleep(delay)
+
+        logger.warning(f"  ⚠️ Position NOT verified for {symbol} after {max_retries} attempts")
+        return None
+
+    # ─── V4: Full Trade Flow (LIMIT→MARKET Fallback + Position Verify) ──
 
     async def execute_trade(self, params, telegram_notifier=None) -> OrderResult:
         """
-        V3 Full trade execution flow:
+        V4 Full trade execution flow:
         1. Get precision
         2. Validate notional + min qty
         3. Set leverage + margin type
-        4. Place market order
-        5. Get actual fill price
-        6. Recalculate TP/SL from fill price
-        7. Place SL + TP with retry (closePosition=true)
-        8. Alert on failure
+        4. Try LIMIT order → wait → fallback to MARKET if unfilled
+        5. Verify position opened
+        6. Get actual fill price (from position data if needed)
+        7. Recalculate TP/SL from fill price
+        8. Place SL + TP with retry (closePosition=true)
+        9. Alert on failure
         """
         symbol = params.symbol
         logger.info(f"⚡ Executing {params.side} on {symbol} (lev={params.leverage}x qty={params.quantity})...")
@@ -455,17 +516,84 @@ class BinanceExecutor:
             await self.set_margin_type(symbol, "ISOLATED")
             await self.set_leverage(symbol, params.leverage)
 
-            # Market order
-            order = await self.place_market_order(symbol, params.side, params.quantity, precision)
+            # ── V4: LIMIT → MARKET fallback ──────────────────────────
+            order = None
+            order_method = "MARKET"
+            fill_price = 0.0
+
+            if settings.ENABLE_LIMIT_FALLBACK:
+                try:
+                    # Get best price for limit order
+                    book = await self.get_book_ticker(symbol)
+                    if params.side == "BUY":
+                        limit_price = book["ask"]  # Match the ask for immediate-ish fill
+                    else:
+                        limit_price = book["bid"]  # Match the bid
+
+                    if limit_price > 0:
+                        logger.info(f"  📝 Trying LIMIT order at {limit_price}...")
+                        order = await self.place_limit_order(
+                            symbol, params.side, params.quantity, limit_price, precision
+                        )
+                        limit_order_id = order["orderId"]
+                        logger.info(f"  📝 LIMIT order placed: #{limit_order_id}")
+
+                        # Wait for fill
+                        await asyncio.sleep(settings.LIMIT_ORDER_WAIT_SECONDS)
+
+                        # Check if filled
+                        order_status = await self.get_order_status(symbol, limit_order_id)
+                        status = order_status.get("status", "")
+
+                        if status == "FILLED":
+                            order_method = "LIMIT"
+                            fill_price = self._get_fill_price(order_status)
+                            logger.info(f"  ✅ LIMIT order FILLED: fill_price={fill_price}")
+                        else:
+                            # Not filled — cancel and go MARKET
+                            logger.info(f"  ⏳ LIMIT order status={status} — cancelling, switching to MARKET")
+                            try:
+                                await self.cancel_order(symbol, limit_order_id)
+                                logger.info(f"  ✅ LIMIT order cancelled")
+                            except Exception as ce:
+                                logger.warning(f"  Cancel failed (may be partially filled): {ce}")
+                                # Check if it partially filled
+                                recheck = await self.get_order_status(symbol, limit_order_id)
+                                if recheck.get("status") == "FILLED":
+                                    order_method = "LIMIT"
+                                    fill_price = self._get_fill_price(recheck)
+                                    order = recheck
+                                    logger.info(f"  ✅ LIMIT actually filled during cancel: {fill_price}")
+
+                            if order_method != "LIMIT":
+                                order = None  # Reset — will use MARKET below
+
+                except Exception as le:
+                    logger.warning(f"  LIMIT order attempt failed: {le} — falling back to MARKET")
+                    order = None
+
+            # MARKET order (primary or fallback)
+            if order is None or order_method == "MARKET":
+                order = await self.place_market_order(symbol, params.side, params.quantity, precision)
+                order_method = "MARKET"
+                fill_price = self._get_fill_price(order)
+                logger.info(f"  ✅ MARKET order: #{order['orderId']} fill={fill_price}")
+
             order_id = order["orderId"]
-            logger.info(f"  ✅ Market order: #{order_id}")
 
-            # V3: Get actual fill price
-            fill_price = self._get_fill_price(order)
+            # ── V4: Verify position before TP/SL ─────────────────────
+            position_data = await self._verify_position(symbol)
+            if position_data:
+                # Use position entry price (most accurate)
+                pos_entry = float(position_data.get("entryPrice", 0))
+                if pos_entry > 0:
+                    fill_price = pos_entry
+
             if fill_price <= 0:
-                fill_price = params.entry_price  # Fallback to estimated price
+                fill_price = params.entry_price  # Last resort fallback
+                logger.warning(f"  ⚠️ Could not determine fill price, using estimate: {fill_price}")
 
-            # V3: Recalculate TP/SL from actual fill price
+            # ── Recalculate TP/SL from actual fill price ─────────────
             if hasattr(params, 'tp_pct') and params.tp_pct > 0:
                 tp_pct_decimal = params.tp_pct / 100.0
                 sl_pct_decimal = params.sl_pct / 100.0
@@ -481,19 +609,19 @@ class BinanceExecutor:
 
             close_side = "SELL" if params.side == "BUY" else "BUY"
 
-            # V3: SL with retry
+            # ── SL with retry ────────────────────────────────────────
             sl_order, sl_error = await self._place_with_retry(
                 self.place_stop_loss, "STOP_LOSS",
                 symbol, close_side, actual_sl, precision,
             )
 
-            # V3: TP with retry
+            # ── TP with retry ────────────────────────────────────────
             tp_order, tp_error = await self._place_with_retry(
                 self.place_take_profit, "TAKE_PROFIT",
                 symbol, close_side, actual_tp, precision,
             )
 
-            # V3: Alert on TP/SL failure via Telegram
+            # ── Alert on TP/SL failure via Telegram ──────────────────
             sl_attached = sl_order is not None
             tp_attached = tp_order is not None
 
@@ -514,7 +642,8 @@ class BinanceExecutor:
                     )
 
             logger.info(
-                f"  📊 Trade summary: fill={fill_price} TP={actual_tp} SL={actual_sl} "
+                f"  📊 Trade summary: method={order_method} fill={fill_price} "
+                f"TP={actual_tp} SL={actual_sl} "
                 f"SL_ok={sl_attached} TP_ok={tp_attached}"
             )
 
@@ -530,6 +659,7 @@ class BinanceExecutor:
                 take_profit_order_id=tp_order.get("orderId") if tp_order else None,
                 sl_attached=sl_attached,
                 tp_attached=tp_attached,
+                order_method=order_method,
             )
 
         except Exception as e:

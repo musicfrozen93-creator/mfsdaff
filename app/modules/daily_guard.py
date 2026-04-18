@@ -1,5 +1,5 @@
 """
-V3 Per-Account Daily Guard — Daily Profit/Loss Limits + Consecutive Loss Control
+V4 Per-Account Daily Guard — Daily Profit/Loss Limits + Consecutive Loss Control
 
 Per-account tracking (NOT global):
   +5% daily profit → SAFE MODE (91%+ only, 50% size, max 1 more trade)
@@ -9,6 +9,14 @@ Per-account tracking (NOT global):
   2 consecutive losses → 30% size reduction
   4 consecutive losses → 1 hour pause
 
+V4 Fixes:
+  - PnL=0 + no trades today → ALWAYS allow (never false block)
+  - Null / zero starting_balance → auto-fix from current balance
+  - Detailed decision logging at every check
+  - Timezone-safe UTC reset
+  - force_reset() for manual recovery
+  - get_guard_log() for structured internal logging
+
 Resets at UTC midnight.
 """
 
@@ -16,7 +24,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Dict, Optional
 
 from app.config import settings
 
@@ -43,7 +51,7 @@ class AccountDayState:
 
 class DailyGuard:
     """
-    Per-account daily limit manager.
+    V4 Per-account daily limit manager.
     In-memory tracking, resets at UTC midnight.
     """
 
@@ -63,18 +71,26 @@ class DailyGuard:
             if state and state.date_str != today:
                 logger.info(
                     f"📅 Daily reset for account #{account_id}: "
-                    f"prev day P&L: ${state.current_pnl:.2f}"
+                    f"prev day P&L: ${state.current_pnl:.2f} | "
+                    f"trades: {state.trades_today} W/L: {state.wins_today}/{state.losses_today}"
                 )
             state = AccountDayState(
                 account_id=account_id,
                 date_str=today,
-                starting_balance=balance,
+                starting_balance=balance if balance > 0 else 0.0,
             )
             self._accounts[account_id] = state
+            logger.info(
+                f"  GUARD RESET: account #{account_id} | new day={today} | "
+                f"starting_balance=${balance:.2f}"
+            )
 
-        # Update starting balance if not set
+        # V4: Fix missing starting_balance — update from current balance
         if state.starting_balance <= 0 and balance > 0:
             state.starting_balance = balance
+            logger.info(
+                f"  GUARD: Fixed missing starting_balance for account #{account_id} → ${balance:.2f}"
+            )
 
         return state
 
@@ -98,8 +114,23 @@ class DailyGuard:
         state = self._get_state(account_id, balance)
         now = time.time()
 
+        # ── V4: If no trades today and PnL is 0, ALWAYS allow ────────
+        if state.trades_today == 0 and state.current_pnl == 0:
+            logger.info(
+                f"  GUARD PASS: account #{account_id} | no trades today, PnL=$0 → allowed"
+            )
+            return {
+                "allowed": True,
+                "reason": "",
+                "size_multiplier": 1.0,
+                "safe_mode": False,
+            }
+
         # ── Check if stopped ─────────────────────────────────────────
         if state.is_stopped:
+            logger.info(
+                f"  GUARD BLOCKED: account #{account_id} | stopped → {state.stop_reason}"
+            )
             return {
                 "allowed": False,
                 "reason": state.stop_reason,
@@ -110,9 +141,13 @@ class DailyGuard:
         # ── Check consecutive loss pause ─────────────────────────────
         if state.pause_until > now:
             remaining_min = int((state.pause_until - now) / 60)
+            reason = f"Consecutive loss pause — {remaining_min}m remaining"
+            logger.info(
+                f"  GUARD BLOCKED: account #{account_id} | {reason}"
+            )
             return {
                 "allowed": False,
-                "reason": f"Consecutive loss pause — {remaining_min}m remaining",
+                "reason": reason,
                 "size_multiplier": 0.0,
                 "safe_mode": False,
             }
@@ -121,8 +156,28 @@ class DailyGuard:
         daily_pnl_pct = 0.0
         if state.starting_balance > 0:
             daily_pnl_pct = (state.current_pnl / state.starting_balance) * 100
+        else:
+            # V4: Cannot calculate PnL% without starting balance — allow trading
+            logger.warning(
+                f"  GUARD: account #{account_id} starting_balance=0, cannot calculate PnL% → allowing"
+            )
+            return {
+                "allowed": True,
+                "reason": "",
+                "size_multiplier": 1.0,
+                "safe_mode": False,
+            }
 
         size_multiplier = 1.0
+
+        # Log current state for debugging
+        logger.info(
+            f"  GUARD CHECK: account #{account_id} | "
+            f"pnl=${state.current_pnl:.2f} ({daily_pnl_pct:+.1f}%) | "
+            f"trades={state.trades_today} W/L={state.wins_today}/{state.losses_today} | "
+            f"target=+{settings.DAILY_PROFIT_LIMIT_PCT}% / {settings.DAILY_LOSS_LIMIT_PCT}% | "
+            f"consec_losses={state.consecutive_losses} | balance=${balance:.2f}"
+        )
 
         # ── +7% → FULL STOP ──────────────────────────────────────────
         if daily_pnl_pct >= settings.DAILY_PROFIT_LIMIT_PCT:
@@ -131,6 +186,7 @@ class DailyGuard:
                 f"Daily profit target hit: +{daily_pnl_pct:.1f}% "
                 f"(limit: +{settings.DAILY_PROFIT_LIMIT_PCT}%). Gains locked."
             )
+            logger.info(f"  GUARD STOP: account #{account_id} | {state.stop_reason}")
             return {
                 "allowed": False,
                 "reason": state.stop_reason,
@@ -145,6 +201,7 @@ class DailyGuard:
                 f"Daily loss limit hit: {daily_pnl_pct:.1f}% "
                 f"(limit: {settings.DAILY_LOSS_LIMIT_PCT}%). Account protected."
             )
+            logger.info(f"  GUARD STOP: account #{account_id} | {state.stop_reason}")
             return {
                 "allowed": False,
                 "reason": state.stop_reason,
@@ -165,6 +222,7 @@ class DailyGuard:
             if state.safe_mode_trades_remaining <= 0:
                 state.is_stopped = True
                 state.stop_reason = "Safe mode: max trades reached after +5% daily"
+                logger.info(f"  GUARD STOP: account #{account_id} | {state.stop_reason}")
                 return {
                     "allowed": False,
                     "reason": state.stop_reason,
@@ -174,9 +232,11 @@ class DailyGuard:
 
             # Safe mode: only 91%+ confidence
             if confidence < 91:
+                reason = f"Safe mode active (+{daily_pnl_pct:.1f}%): only 91%+ confidence allowed"
+                logger.info(f"  GUARD BLOCKED: account #{account_id} | {reason}")
                 return {
                     "allowed": False,
-                    "reason": f"Safe mode active (+{daily_pnl_pct:.1f}%): only 91%+ confidence allowed",
+                    "reason": reason,
                     "size_multiplier": 0.5,
                     "safe_mode": True,
                 }
@@ -187,9 +247,11 @@ class DailyGuard:
         if daily_pnl_pct <= -settings.DAILY_LOSS_REDUCE_PCT:
             # Only elite setups allowed
             if confidence < 91:
+                reason = f"Loss reduction active ({daily_pnl_pct:.1f}%): only 91%+ confidence allowed"
+                logger.info(f"  GUARD BLOCKED: account #{account_id} | {reason}")
                 return {
                     "allowed": False,
-                    "reason": f"Loss reduction active ({daily_pnl_pct:.1f}%): only 91%+ confidence allowed",
+                    "reason": reason,
                     "size_multiplier": 0.5,
                     "safe_mode": False,
                 }
@@ -203,6 +265,12 @@ class DailyGuard:
                 f"  Consecutive loss reduction: {state.consecutive_losses} losses → "
                 f"size multiplier={size_multiplier:.2f}"
             )
+
+        logger.info(
+            f"  GUARD PASS: account #{account_id} | "
+            f"pnl={daily_pnl_pct:+.1f}% | multiplier={size_multiplier:.2f} | "
+            f"safe_mode={state.is_safe_mode}"
+        )
 
         return {
             "allowed": True,
@@ -251,6 +319,31 @@ class DailyGuard:
             f"Consec losses: {state.consecutive_losses}"
         )
 
+    # ─── V4: Force Reset (manual or automatic recovery) ──────────────
+
+    def force_reset(self, account_id: int, balance: float = 0.0):
+        """
+        Force-reset an account's daily state.
+        Use for recovery from corrupted state or manual override.
+        """
+        today = self._get_today()
+        old_state = self._accounts.get(account_id)
+        if old_state:
+            logger.warning(
+                f"🔄 FORCE RESET: account #{account_id} | "
+                f"was: stopped={old_state.is_stopped} pnl=${old_state.current_pnl:.2f} "
+                f"trades={old_state.trades_today}"
+            )
+
+        self._accounts[account_id] = AccountDayState(
+            account_id=account_id,
+            date_str=today,
+            starting_balance=balance if balance > 0 else 0.0,
+        )
+        logger.info(
+            f"  FORCE RESET complete: account #{account_id} → clean state, balance=${balance:.2f}"
+        )
+
     # ─── Get Daily Stats ─────────────────────────────────────────────
 
     def get_daily_pnl_pct(self, account_id: int, balance: float = 0.0) -> float:
@@ -284,6 +377,36 @@ class DailyGuard:
             "is_stopped": state.is_stopped,
             "stop_reason": state.stop_reason,
             "is_safe_mode": state.is_safe_mode,
+        }
+
+    # ─── V4: Structured Guard Log (for private internal logging) ─────
+
+    def get_guard_log(self, account_id: int, balance: float = 0.0) -> dict:
+        """
+        Returns structured log dict for internal debugging.
+        Never sent to Telegram.
+        """
+        state = self._get_state(account_id, balance)
+        daily_pnl_pct = 0.0
+        if state.starting_balance > 0:
+            daily_pnl_pct = (state.current_pnl / state.starting_balance) * 100
+
+        return {
+            "account_id": account_id,
+            "date": state.date_str,
+            "starting_balance": state.starting_balance,
+            "current_balance": balance,
+            "pnl_today": round(state.current_pnl, 2),
+            "pnl_pct": round(daily_pnl_pct, 2),
+            "trades_today": state.trades_today,
+            "wins": state.wins_today,
+            "losses": state.losses_today,
+            "consecutive_losses": state.consecutive_losses,
+            "is_stopped": state.is_stopped,
+            "stop_reason": state.stop_reason,
+            "is_safe_mode": state.is_safe_mode,
+            "profit_target": settings.DAILY_PROFIT_LIMIT_PCT,
+            "loss_limit": settings.DAILY_LOSS_LIMIT_PCT,
         }
 
 

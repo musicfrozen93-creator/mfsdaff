@@ -1,14 +1,20 @@
 """
-V2 State Manager — DB-backed with in-memory cache.
-Tracks trade limits, cooldowns, loss streaks, and daily P&L.
+V4 State Manager — DB-backed with in-memory cache.
+Tracks trade limits, cooldowns, and rate limiting.
 Designed for multi-account operation.
+
+V4 Changes:
+  - UTC timezone for daily reset (was local time — caused mismatch with daily_guard)
+  - Removed duplicate daily P&L tracking (per-account daily_guard handles it)
+  - Kept: hourly rate limits, coin cooldowns, trade counts (global, valid)
+  - Simplified check_daily_limits to only check trade count limits
 """
 
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime
-from typing import Dict, List, Optional
+from datetime import datetime, timezone
+from typing import Dict, List
 
 from app.config import settings
 
@@ -17,11 +23,9 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TradeState:
-    # Daily tracking
+    # Daily tracking (UTC timezone)
     daily_date: str = ""
     daily_trades: int = 0
-    daily_pnl: float = 0.0
-    daily_starting_balance: float = 0.0
     trading_paused: bool = False
     pause_reason: str = ""
 
@@ -31,7 +35,7 @@ class TradeState:
     # Hourly rate limit: list of unix timestamps of recent trades
     hourly_trade_timestamps: List[float] = field(default_factory=list)
 
-    # Consecutive loss tracking
+    # Consecutive loss tracking (global — per-account is in daily_guard)
     consecutive_losses: int = 0
     loss_cooldown_until: float = 0.0  # Unix timestamp
 
@@ -40,26 +44,29 @@ class TradeState:
     winning_trades: int = 0
     losing_trades: int = 0
     total_pnl: float = 0.0
+    daily_pnl: float = 0.0
+    daily_starting_balance: float = 0.0
     ai_usage_count: int = 0
     skipped_trades_today: int = 0
 
 
 class StateManager:
     """
-    In-memory state manager with comprehensive trade controls.
-    Designed to work alongside DB persistence (DB is source of truth
-    for historical data; this handles real-time rate limiting).
+    V4 In-memory state manager.
+    Handles rate limiting and global trade counts.
+    Per-account daily P&L and guards are handled by daily_guard module.
     """
 
     def __init__(self):
         self.state = TradeState()
 
-    # ─── Daily Reset ──────────────────────────────────────────────────
+    # ─── Daily Reset (V4: UTC timezone) ──────────────────────────────
 
     def _check_daily_reset(self, balance: float = 0.0):
-        today = date.today().isoformat()
+        # V4: Use UTC to match daily_guard timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self.state.daily_date != today:
-            logger.info(f"📅 New trading day: {today} — resetting daily counters")
+            logger.info(f"📅 New trading day (UTC): {today} — resetting daily counters")
             self.state.daily_date = today
             self.state.daily_trades = 0
             self.state.daily_pnl = 0.0
@@ -73,38 +80,16 @@ class StateManager:
     # ─── Daily Limits Check ───────────────────────────────────────────
 
     def check_daily_limits(self, current_balance: float) -> dict:
-        """Check if daily trading limits are hit. Returns status dict."""
+        """
+        V4: Check global daily trading limits (trade count only).
+        Per-account P&L limits are handled by daily_guard module.
+        """
         self._check_daily_reset(current_balance)
 
         if self.state.trading_paused:
             return {"allowed": False, "reason": self.state.pause_reason}
 
-        starting = self.state.daily_starting_balance
-        if starting <= 0:
-            self.state.daily_starting_balance = current_balance
-            starting = current_balance
-
-        # Check daily profit limit
-        if starting > 0:
-            daily_pnl_pct = (self.state.daily_pnl / starting) * 100
-
-            if daily_pnl_pct >= settings.DAILY_PROFIT_LIMIT_PCT:
-                self.state.trading_paused = True
-                self.state.pause_reason = f"Daily profit limit: {daily_pnl_pct:.1f}% >= {settings.DAILY_PROFIT_LIMIT_PCT}%"
-                return {"allowed": False, "reason": self.state.pause_reason}
-
-            if daily_pnl_pct <= settings.DAILY_LOSS_LIMIT_PCT:
-                self.state.trading_paused = True
-                self.state.pause_reason = f"Daily loss limit: {daily_pnl_pct:.1f}% <= {settings.DAILY_LOSS_LIMIT_PCT}%"
-                return {"allowed": False, "reason": self.state.pause_reason}
-
-            # Drawdown pause
-            if daily_pnl_pct <= settings.DRAWDOWN_PAUSE_PCT:
-                self.state.trading_paused = True
-                self.state.pause_reason = f"Drawdown threshold: {daily_pnl_pct:.1f}% <= {settings.DRAWDOWN_PAUSE_PCT}%"
-                return {"allowed": False, "reason": self.state.pause_reason}
-
-        # Check max daily trades
+        # Check max daily trades (global)
         if self.state.daily_trades >= settings.DAILY_MAX_TRADES:
             self.state.trading_paused = True
             self.state.pause_reason = f"Daily trade limit: {self.state.daily_trades} >= {settings.DAILY_MAX_TRADES}"

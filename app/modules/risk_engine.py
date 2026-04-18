@@ -1,5 +1,5 @@
 """
-V3 Dynamic Risk Engine — Balance-Based Tiers + Confidence Leverage
+V4 Dynamic Risk Engine — Balance-Based Tiers + Confidence Leverage
 
 NO fixed trade sizes. Everything is calculated from live account balance.
 
@@ -247,14 +247,22 @@ class RiskEngine:
         # ── Position size (PRESERVED logic) ──────────────────────────
         position_size_usdt = safe_margin * leverage
 
-        # ── Symbol minimum validation (PRESERVED) ────────────────────
-        if position_size_usdt < min_notional:
+        # ── V4: Apply minimum position floor ─────────────────────────
+        effective_min_notional = max(min_notional, settings.MIN_POSITION_USDT)
+
+        # ── Symbol minimum validation (IMPROVED V4) ──────────────────
+        if position_size_usdt < effective_min_notional:
             # Try bumping to minimum
-            required_margin = min_notional / leverage
-            if required_margin <= max_margin * 1.2:  # Allow 20% over cap for minimums
-                position_size_usdt = min_notional
+            required_margin = effective_min_notional / leverage
+            if required_margin <= max_margin * 1.5:  # V4: Allow 50% over cap (was 20%)
+                old_size = position_size_usdt
+                position_size_usdt = effective_min_notional
                 safe_margin = required_margin
-                logger.info(f"  Bumped to min notional: ${min_notional} (margin=${safe_margin:.2f})")
+                logger.info(
+                    f"  V4 size bump: ${old_size:.2f} -> ${effective_min_notional:.2f} "
+                    f"(min_notional=${min_notional}, floor=${settings.MIN_POSITION_USDT}) "
+                    f"margin=${safe_margin:.2f}"
+                )
             else:
                 return TradeParameters(
                     symbol=symbol, side=side, leverage=leverage,
@@ -263,7 +271,7 @@ class RiskEngine:
                     risk_reward=0, risk_pct=risk_pct, confidence=confidence,
                     approved=False,
                     reject_reason=(
-                        f"Position ${position_size_usdt:.2f} below min notional ${min_notional}. "
+                        f"Position ${position_size_usdt:.2f} below min ${effective_min_notional}. "
                         f"Bumping would exceed safe margin cap ${max_margin:.2f}"
                     ),
                     setup_grade=setup_grade,
@@ -288,17 +296,38 @@ class RiskEngine:
 
         quantity = round(raw_quantity, quantity_precision)
 
+        # V4: If step_size rounding dropped quantity to 0, bump to min_qty
+        if quantity <= 0 and min_qty > 0:
+            quantity = min_qty
+            position_size_usdt = quantity * entry_price
+            logger.info(
+                f"  V4: Quantity was 0 after rounding, bumped to min_qty={min_qty} "
+                f"(notional=${position_size_usdt:.2f})"
+            )
+
         # Validate min qty
         if min_qty > 0 and quantity < min_qty:
-            return TradeParameters(
-                symbol=symbol, side=side, leverage=leverage,
-                position_size_usdt=position_size_usdt, safe_margin=safe_margin, quantity=quantity,
-                entry_price=entry_price, stop_loss=0, take_profit=0,
-                risk_reward=0, risk_pct=risk_pct, confidence=confidence,
-                approved=False,
-                reject_reason=f"Quantity {quantity} below symbol minimum {min_qty}",
-                setup_grade=setup_grade,
-            )
+            # V4: Try bumping to min_qty instead of rejecting
+            bumped_notional = min_qty * entry_price
+            bumped_margin = bumped_notional / leverage if leverage > 0 else bumped_notional
+            if bumped_margin <= max_margin * 1.5:
+                quantity = min_qty
+                position_size_usdt = bumped_notional
+                safe_margin = bumped_margin
+                logger.info(
+                    f"  V4: Bumped quantity to min_qty={min_qty} "
+                    f"(notional=${position_size_usdt:.2f}, margin=${safe_margin:.2f})"
+                )
+            else:
+                return TradeParameters(
+                    symbol=symbol, side=side, leverage=leverage,
+                    position_size_usdt=position_size_usdt, safe_margin=safe_margin, quantity=quantity,
+                    entry_price=entry_price, stop_loss=0, take_profit=0,
+                    risk_reward=0, risk_pct=risk_pct, confidence=confidence,
+                    approved=False,
+                    reject_reason=f"Quantity {quantity} below symbol minimum {min_qty}, bumping exceeds margin cap",
+                    setup_grade=setup_grade,
+                )
 
         # ── V3 TP/SL (Confidence-Based) ─────────────────────────────
         tp_pct, sl_pct = self.get_tp_sl_pct(confidence, atr_pct, is_elite, setup_grade)

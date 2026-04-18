@@ -1,5 +1,5 @@
 """
-V3 Configuration — Multi-Account Scalping Bot
+V4 Configuration — Multi-Account Scalping Bot
 All settings loaded from environment variables with safe defaults.
 """
 
@@ -68,6 +68,11 @@ class Settings:
 
     # ── V3 Pre-entry checks ──────────────────────────────────────────
     MAX_SPREAD_ENTRY_PCT: float = float(os.getenv("MAX_SPREAD_ENTRY_PCT", "0.10"))
+
+    # ── V4 Order execution ───────────────────────────────────────────
+    LIMIT_ORDER_WAIT_SECONDS: int = int(os.getenv("LIMIT_ORDER_WAIT_SECONDS", "3"))
+    MIN_POSITION_USDT: float = float(os.getenv("MIN_POSITION_USDT", "6.0"))
+    ENABLE_LIMIT_FALLBACK: bool = os.getenv("ENABLE_LIMIT_FALLBACK", "true").lower() == "true"
 
     def __post_init__(self):
         self.EXCLUDED_COINS = []
