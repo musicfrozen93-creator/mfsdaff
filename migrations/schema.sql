@@ -157,3 +157,89 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- V5 Multi-Strategy Additions
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- V5: Add strategy tracking to signals
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(30);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS regime VARCHAR(30);
+
+-- V5: Add strategy tracking to trades
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(30);
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS regime VARCHAR(30);
+
+-- ── Swing Watchlist ─────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS swing_watchlist (
+    id SERIAL PRIMARY KEY,
+    symbol VARCHAR(20) NOT NULL,
+    side VARCHAR(10) NOT NULL,
+    setup_type VARCHAR(30) NOT NULL,
+    confidence INTEGER NOT NULL,
+    trigger_price DOUBLE PRECISION NOT NULL,
+    invalidation_price DOUBLE PRECISION NOT NULL,
+    current_price DOUBLE PRECISION,
+    regime_at_creation VARCHAR(30),
+    notes TEXT,
+    status VARCHAR(20) NOT NULL DEFAULT 'watching',
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_swing_symbol ON swing_watchlist(symbol);
+CREATE INDEX IF NOT EXISTS idx_swing_status ON swing_watchlist(status);
+CREATE INDEX IF NOT EXISTS idx_swing_created ON swing_watchlist(created_at);
+
+-- ── Daily Stats ─────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS daily_stats (
+    id SERIAL PRIMARY KEY,
+    account_id INTEGER NOT NULL REFERENCES accounts(id),
+    date VARCHAR(10) NOT NULL,
+    trades_count INTEGER DEFAULT 0,
+    wins INTEGER DEFAULT 0,
+    losses INTEGER DEFAULT 0,
+    total_pnl DOUBLE PRECISION DEFAULT 0.0,
+    total_pnl_pct DOUBLE PRECISION DEFAULT 0.0,
+    best_trade_pnl DOUBLE PRECISION DEFAULT 0.0,
+    worst_trade_pnl DOUBLE PRECISION DEFAULT 0.0,
+    regime_distribution JSONB,
+    strategy_distribution JSONB,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_daily_stats_date ON daily_stats(date);
+CREATE INDEX IF NOT EXISTS idx_daily_stats_account ON daily_stats(account_id);
+
+-- ── Strategy Results ────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS strategy_results (
+    id SERIAL PRIMARY KEY,
+    strategy_type VARCHAR(30) NOT NULL,
+    symbol VARCHAR(20),
+    side VARCHAR(10),
+    confidence INTEGER,
+    regime VARCHAR(30),
+    entry_price DOUBLE PRECISION,
+    exit_price DOUBLE PRECISION,
+    pnl DOUBLE PRECISION,
+    pnl_pct DOUBLE PRECISION,
+    won BOOLEAN,
+    duration_minutes INTEGER,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_results_type ON strategy_results(strategy_type);
+CREATE INDEX IF NOT EXISTS idx_strategy_results_created ON strategy_results(created_at);
+
+-- ── News Events Cache ───────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS news_events_cache (
+    id SERIAL PRIMARY KEY,
+    source VARCHAR(30) NOT NULL,
+    event_id VARCHAR(100) NOT NULL,
+    title TEXT,
+    symbols JSONB,
+    sentiment VARCHAR(20),
+    impact_score DOUBLE PRECISION DEFAULT 0.0,
+    processed BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_news_event_id ON news_events_cache(event_id);
+CREATE INDEX IF NOT EXISTS idx_news_created ON news_events_cache(created_at);
+

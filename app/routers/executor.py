@@ -1,21 +1,16 @@
 """
-V4 Executor API — Multi-Account Trade Execution with Daily Guard
+V5 Executor API — Multi-Account Trade Execution with Strategy Awareness
 
 Endpoints:
   POST /execute       — Single-account backward-compatible execution
   POST /execute-full  — Single-account with risk engine + SL/TP
   POST /execute-multi — Multi-account execution for all connected accounts
 
-V4 Changes:
-  - Removed global state_manager.check_daily_limits(0) with balance=0 (was causing false blocks)
-  - Per-account daily guard is the ONLY P&L limiter (no more duplicate global checks)
-  - Pre-entry check runs ONCE per signal, not per account
-  - ONE Telegram message per signal (no per-account spam)
-  - NEVER expose account names/labels/IDs in Telegram
-  - If all accounts blocked → send nothing (or compact no-execution message)
-  - Each account failure is caught independently — never stops the loop
-  - Comprehensive per-account logging to file (never to Telegram)
-  - LIMIT→MARKET fallback via executor module
+V5 Changes:
+  - strategy_type + regime passed through entire pipeline
+  - Signal and Trade DB records tagged with strategy + regime
+  - Telegram notification shows strategy type
+  - Risk engine uses strategy-based TP/SL
 """
 
 import asyncio
@@ -71,6 +66,9 @@ class MultiExecuteRequest(BaseModel):
     atr_pct: float = 0.0
     spread_pct: float = 0.0
     indicators: dict = {}
+    # V5 additions
+    strategy_type: str = "trend_pullback"
+    regime: str = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -292,6 +290,8 @@ async def execute_multi_account(req: MultiExecuteRequest):
             signal = Signal(
                 symbol=symbol, side=side, confidence=req.confidence,
                 reason=req.reason, indicators_json=req.indicators,
+                strategy_type=req.strategy_type,
+                regime=req.regime,
             )
             session.add(signal)
             await session.commit()
@@ -360,7 +360,9 @@ async def execute_multi_account(req: MultiExecuteRequest):
             return {"status": "error", "message": f"Cannot get price for {symbol}"}
 
     # Pre-entry quality check (ONCE for the signal)
-    tp_pct_decimal, _ = risk_engine.get_tp_sl_pct(req.confidence, req.atr_pct)
+    tp_pct_decimal, _ = risk_engine.get_tp_sl_pct(
+        req.confidence, req.atr_pct, strategy_type=req.strategy_type,
+    )
     tp_pct_for_check = tp_pct_decimal * 100
 
     pre_check = await scanner_executor.pre_entry_check(
@@ -399,6 +401,10 @@ async def execute_multi_account(req: MultiExecuteRequest):
     all_sl_attached = True
     all_tp_attached = True
     best_order_method = "MARKET"
+    # V5.5: Track order IDs for proof + R:R
+    best_sl_order_id = ""
+    best_tp_order_id = ""
+    best_rr = 0.0
 
     semaphore = asyncio.Semaphore(5)  # Max 5 concurrent account executions
 
@@ -406,6 +412,7 @@ async def execute_multi_account(req: MultiExecuteRequest):
         nonlocal best_fill_price, best_leverage, best_tp, best_sl
         nonlocal best_tp_pct, best_sl_pct, best_grade
         nonlocal all_sl_attached, all_tp_attached, best_order_method
+        nonlocal best_sl_order_id, best_tp_order_id, best_rr
 
         async with semaphore:
             acc_id = acc_data["id"]
@@ -482,6 +489,7 @@ async def execute_multi_account(req: MultiExecuteRequest):
                     price_precision=precision.price_precision,
                     volume_spike=volume_spike,
                     size_multiplier=size_multiplier,
+                    strategy_type=req.strategy_type,
                 )
 
                 if not trade_params.approved:
@@ -535,6 +543,8 @@ async def execute_multi_account(req: MultiExecuteRequest):
                                 sl_order_id=str(result.stop_loss_order_id) if result.stop_loss_order_id else None,
                                 tp_order_id=str(result.take_profit_order_id) if result.take_profit_order_id else None,
                                 status="open",
+                                strategy_type=req.strategy_type,
+                                regime=req.regime,
                             )
                             session.add(trade)
                             await session.commit()
@@ -551,6 +561,11 @@ async def execute_multi_account(req: MultiExecuteRequest):
                     best_sl_pct = trade_params.sl_pct
                     best_grade = trade_params.setup_grade
                     best_order_method = getattr(result, 'order_method', 'MARKET')
+                    best_rr = trade_params.risk_reward
+                    if result.stop_loss_order_id:
+                        best_sl_order_id = str(result.stop_loss_order_id)
+                    if result.take_profit_order_id:
+                        best_tp_order_id = str(result.take_profit_order_id)
                     if not result.sl_attached:
                         all_sl_attached = False
                     if not result.tp_attached:
@@ -667,6 +682,11 @@ async def execute_multi_account(req: MultiExecuteRequest):
             sl_attached=all_sl_attached,
             tp_attached=all_tp_attached,
             order_method=best_order_method,
+            strategy_type=req.strategy_type,
+            regime=req.regime,
+            sl_order_id=best_sl_order_id,
+            tp_order_id=best_tp_order_id,
+            risk_reward=best_rr,
         )
     elif skipped_count > 0:
         # V4: All accounts skipped — send compact no-execution message

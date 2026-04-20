@@ -74,6 +74,42 @@ class Settings:
     MIN_POSITION_USDT: float = float(os.getenv("MIN_POSITION_USDT", "6.0"))
     ENABLE_LIMIT_FALLBACK: bool = os.getenv("ENABLE_LIMIT_FALLBACK", "true").lower() == "true"
 
+    # ── V5 Multi-Strategy Settings ───────────────────────────────────
+    MAX_TRADES_PER_CYCLE: int = int(os.getenv("MAX_TRADES_PER_CYCLE", "3"))
+
+    # ── V5 Scalp TP/SL (tighter for scalping) ───────────────────────
+    SCALP_TP_PCT: float = float(os.getenv("SCALP_TP_PCT", "2.0"))
+    SCALP_SL_PCT: float = float(os.getenv("SCALP_SL_PCT", "1.0"))
+
+    # ── V5 Swing TP/SL ──────────────────────────────────────────────
+    SWING_TP_PCT: float = float(os.getenv("SWING_TP_PCT", "8.0"))
+    SWING_SL_PCT: float = float(os.getenv("SWING_SL_PCT", "3.0"))
+    SWING_MIN_CONFIDENCE: int = int(os.getenv("SWING_MIN_CONFIDENCE", "80"))
+    SWING_EXECUTE_CONFIDENCE: int = int(os.getenv("SWING_EXECUTE_CONFIDENCE", "85"))
+    SWING_WATCHLIST_MAX: int = int(os.getenv("SWING_WATCHLIST_MAX", "20"))
+    SWING_EXPIRY_HOURS: int = int(os.getenv("SWING_EXPIRY_HOURS", "72"))
+
+    # ── V5 Sniper TP/SL ─────────────────────────────────────────────
+    SNIPER_TP_PCT: float = float(os.getenv("SNIPER_TP_PCT", "3.0"))
+    SNIPER_SL_PCT: float = float(os.getenv("SNIPER_SL_PCT", "1.5"))
+    SNIPER_ENABLED: bool = os.getenv("SNIPER_ENABLED", "true").lower() == "true"
+
+    # ── V5.5 Partial Take Profit ─────────────────────────────────────
+    PARTIAL_TP_ENABLED: bool = os.getenv("PARTIAL_TP_ENABLED", "true").lower() == "true"
+    PARTIAL_TP1_PCT: float = float(os.getenv("PARTIAL_TP1_PCT", "0.40"))   # 40% of position at TP1
+    PARTIAL_TP2_PCT: float = float(os.getenv("PARTIAL_TP2_PCT", "0.30"))   # 30% of position at TP2
+    PARTIAL_TRAIL_PCT: float = float(os.getenv("PARTIAL_TRAIL_PCT", "0.30"))  # 30% trails
+    PARTIAL_TP1_DISTANCE: float = float(os.getenv("PARTIAL_TP1_DISTANCE", "0.50"))  # TP1 at 50% of full TP distance
+    PARTIAL_TP_MIN_CONFIDENCE: int = int(os.getenv("PARTIAL_TP_MIN_CONFIDENCE", "85"))  # Only for strong setups
+
+    # ── V5.5 Break-Even Stop ─────────────────────────────────────────
+    BREAK_EVEN_ENABLED: bool = os.getenv("BREAK_EVEN_ENABLED", "true").lower() == "true"
+    BREAK_EVEN_TRIGGER_PCT: float = float(os.getenv("BREAK_EVEN_TRIGGER_PCT", "3.0"))  # Move SL to BE at +3% ROI
+    BREAK_EVEN_BUFFER_PCT: float = float(os.getenv("BREAK_EVEN_BUFFER_PCT", "0.1"))   # Small buffer above entry
+
+    # ── V5 External APIs (free) ──────────────────────────────────────
+    CRYPTOPANIC_API_KEY: str = os.getenv("CRYPTOPANIC_API_KEY", "")
+
     def __post_init__(self):
         self.EXCLUDED_COINS = []
 

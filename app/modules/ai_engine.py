@@ -1,28 +1,19 @@
 """
-V3 AI Decision Engine — Layered Confluence + OpenAI Verification
+V5 AI Decision Engine — Multi-Strategy Scalping + Regime Awareness
 
-Layer 1: Technical Rules Engine (confluence logic)
-  - 10 conditions must align for BUY/SELL signal (V3: up from 8)
-  - Min 6/10 for a signal
-  - Confidence scored by number of passing conditions
-  - Pullback-to-EMA detection for LONG entries
-  - Rejection bounce detection for SHORT entries
-  - Candle chase filter reduces confidence
+3 Scalp Sub-Strategies:
+  1. Trend Pullback  — EMA trend + pullback to support (original V3 confluence)
+  2. Breakout Momentum — resistance break + volume spike + strong close
+  3. Range Reversal  — support bounce / resistance rejection at extremes
 
+Layer 1: Technical Rules Engine (10-condition confluence per strategy)
 Layer 2: OpenAI Verification (optional)
-  - Sends indicator + orderbook summary
-  - Expects strict JSON response
-  - Adjusts confidence by averaging with technical score
-  - Falls back to Layer 1 if OpenAI fails
 
-V3 Changes:
-  - Added MACD crossover condition (#9)
-  - Added Bollinger Band position condition (#10)
-  - Pullback-to-EMA and rejection bounce detection
-  - Candle chase filter (large candle = reduced confidence)
-  - Setup grade output (A/B/C)
-  - Tightened spread block from 0.15% to 0.10%
-  - Volume spike required for A-grade setups
+V5 Changes:
+  - 3 independent scalp strategies scored separately
+  - Best strategy selected per coin
+  - strategy_type + regime fields for tracking
+  - Regime-based confidence adjustment
 """
 
 import json
@@ -73,6 +64,9 @@ class AIDecision:
     is_chase: bool = False
     conditions_passed: int = 0
     conditions_total: int = 10
+    # V5: Strategy + regime tracking
+    strategy_type: str = "trend_pullback"  # trend_pullback | breakout_momentum | range_reversal
+    regime: str = ""                        # TRENDING_BULL | SIDEWAYS_RANGE | etc.
     # AI logging
     ai_called: bool = False
     ai_tokens_used: int = 0
@@ -83,7 +77,7 @@ class AIDecision:
 
 class ScalpingEngine:
     """
-    V3 Scalping Decision Engine with 10-condition confluence + optional OpenAI.
+    V5 Multi-Strategy Scalping Engine with 3 sub-strategies + regime awareness.
     """
 
     def __init__(self):
@@ -456,18 +450,25 @@ class ScalpingEngine:
         else:
             return "C"
 
-    # ─── Main Analysis ────────────────────────────────────────────────
-
-    async def analyze(self, symbol: str, spread_pct: float = 0.0, orderbook_data: Optional[dict] = None) -> AIDecision:
+    async def analyze(
+        self, symbol: str, spread_pct: float = 0.0,
+        orderbook_data: Optional[dict] = None,
+        regime: str = "", regime_weights: Optional[dict] = None,
+    ) -> AIDecision:
         """
-        V3 Full scalping analysis:
+        V5 Multi-strategy scalping analysis:
         1. Fetch 5m candles + 15m HTF trend
-        2. Compute all indicators (including MACD, BB, pullback/chase)
-        3. Layer 1: 10-condition technical confluence scoring
-        4. Layer 2: OpenAI verification (optional)
-        5. Combine results with setup grade
+        2. Compute all indicators
+        3. Run 3 sub-strategies: trend pullback, breakout momentum, range reversal
+        4. Select best strategy adjusted by regime weights
+        5. Layer 2: OpenAI verification (optional)
         """
-        logger.info(f"🤖 V3 scalping analysis for {symbol}...")
+        logger.info(f"🤖 V5 multi-strategy analysis for {symbol}...")
+        weights = regime_weights or {
+            "scalp_trend_pullback": 1.0,
+            "scalp_breakout": 1.0,
+            "scalp_range_reversal": 1.0,
+        }
 
         try:
             # Fetch candles and HTF in parallel
@@ -525,7 +526,7 @@ class ScalpingEngine:
             else:
                 trend = "NEUTRAL"
 
-            # V3: MACD crossover
+            # MACD crossover
             macd_line, signal_line, histogram = self.calc_macd(closes)
             if len(histogram) >= 2:
                 if histogram[-2] < 0 and histogram[-1] > 0:
@@ -537,7 +538,7 @@ class ScalpingEngine:
             else:
                 macd_crossover = "NONE"
 
-            # V3: Bollinger Band position
+            # Bollinger Band position
             bb_upper, bb_mid, bb_lower = self.calc_bollinger(closes)
             if current_price >= bb_upper * 0.998:
                 bb_position = "UPPER"
@@ -546,45 +547,55 @@ class ScalpingEngine:
             else:
                 bb_position = "MID"
 
-            # V3: Pullback / rejection detection
+            # Pullback / rejection detection
             is_pullback = self.detect_pullback(closes, ema_9, ema_21)
             is_rejection = self.detect_rejection(closes, highs, ema_9, ema_21)
-
-            # V3: Chase detection
             is_chase = self.detect_chase(body, atr)
 
-            # ── Layer 1: V3 Technical Confluence (10 conditions) ──────
-            tech_action, tech_confidence, tech_reason = self._evaluate_confluence(
-                rsi=rsi,
-                ema_fast=ema_fast_val,
-                ema_slow=ema_slow_val,
-                price=current_price,
-                vwap=vwap,
-                volume_spike=volume_spike,
-                spread_pct=spread_pct,
-                atr_pct=atr_pct,
-                candle_type=candle_type,
-                htf_trend=htf_trend,
-                is_choppy=is_choppy,
-                macd_crossover=macd_crossover,
-                bb_position=bb_position,
-                is_pullback=is_pullback,
-                is_rejection=is_rejection,
-                is_chase=is_chase,
+            # ══ V5: Run all 3 sub-strategies ══════════════════════════
+
+            # Strategy 1: Trend Pullback (original V3 confluence)
+            trend_result = self._evaluate_confluence(
+                rsi=rsi, ema_fast=ema_fast_val, ema_slow=ema_slow_val,
+                price=current_price, vwap=vwap, volume_spike=volume_spike,
+                spread_pct=spread_pct, atr_pct=atr_pct, candle_type=candle_type,
+                htf_trend=htf_trend, is_choppy=is_choppy,
+                macd_crossover=macd_crossover, bb_position=bb_position,
+                is_pullback=is_pullback, is_rejection=is_rejection, is_chase=is_chase,
             )
 
-            # V3: Count conditions for setup grade
-            if tech_action == "BUY":
-                conditions_passed = tech_confidence  # Will recalculate
-                # Re-derive from reason
+            # Strategy 2: Breakout Momentum
+            breakout_result = self._score_breakout_momentum(
+                price=current_price, highs=highs, closes=closes,
+                volume_spike=volume_spike, volume_ratio=volume_ratio,
+                macd_crossover=macd_crossover, bb_position=bb_position,
+                htf_trend=htf_trend, spread_pct=spread_pct, atr_pct=atr_pct,
+            )
+
+            # Strategy 3: Range Reversal
+            reversal_result = self._score_range_reversal(
+                price=current_price, rsi=rsi, bb_position=bb_position,
+                bb_upper=bb_upper, bb_lower=bb_lower, vwap=vwap,
+                volume_spike=volume_spike, candle_type=candle_type,
+                spread_pct=spread_pct, atr_pct=atr_pct,
+            )
+
+            # Select best strategy with regime weighting
+            best_action, best_conf, best_reason, strategy_type = self._select_best_strategy(
+                trend_result, breakout_result, reversal_result, weights,
+            )
+
+            # If no strategy triggered, fall back to trend pullback result
+            if best_action == "HOLD":
+                tech_action, tech_confidence, tech_reason = trend_result
+                strategy_type = "trend_pullback"
+            else:
+                tech_action, tech_confidence, tech_reason = best_action, best_conf, best_reason
+
+            # Count conditions for setup grade (from trend pullback)
+            if tech_action in ("BUY", "SELL"):
                 try:
-                    parts = tech_reason.split("/10")[0].split()
-                    conditions_passed = int(parts[-1]) if parts else 6
-                except Exception:
-                    conditions_passed = 6
-            elif tech_action == "SELL":
-                try:
-                    parts = tech_reason.split("/10")[0].split()
+                    parts = trend_result[2].split("/10")[0].split()
                     conditions_passed = int(parts[-1]) if parts else 6
                 except Exception:
                     conditions_passed = 6
@@ -593,7 +604,12 @@ class ScalpingEngine:
 
             setup_grade = self.determine_setup_grade(conditions_passed, volume_spike)
 
-            logger.info(f"  Layer1: {tech_action} conf={tech_confidence} grade={setup_grade} | {tech_reason}")
+            logger.info(
+                f"  V5 Strategies: trend={trend_result[0]}/{trend_result[1]} "
+                f"breakout={breakout_result[0]}/{breakout_result[1]} "
+                f"reversal={reversal_result[0]}/{reversal_result[1]} "
+                f"→ best={strategy_type} {tech_action}/{tech_confidence} grade={setup_grade}"
+            )
 
             # Build decision
             decision = AIDecision(
@@ -618,6 +634,8 @@ class ScalpingEngine:
                 is_pullback=is_pullback,
                 is_chase=is_chase,
                 conditions_passed=conditions_passed,
+                strategy_type=strategy_type,
+                regime=regime,
             )
 
             # ── Layer 2: OpenAI Verification (only if Layer 1 produced a signal) ──
@@ -640,6 +658,7 @@ class ScalpingEngine:
                     "bb_position": bb_position,
                     "is_pullback": is_pullback,
                     "is_chase": is_chase,
+                    "strategy_type": strategy_type,
                 }
 
                 ai_result = await self._openai_verify(symbol, indicators_for_ai, orderbook_data)
@@ -654,28 +673,25 @@ class ScalpingEngine:
                     ai_confidence = ai_result.get("confidence", 50)
                     ai_reason = ai_result.get("reason", "")
 
-                    # Combine: if AI agrees, boost confidence. If disagrees, reduce.
                     if ai_action == tech_action:
                         combined_confidence = int((tech_confidence * 0.6) + (ai_confidence * 0.4))
                         decision.confidence = min(combined_confidence, 98)
                         decision.reason = f"{tech_reason} | AI confirms: {ai_reason}"
                     elif ai_action == "HOLD":
-                        # AI says hold but tech says trade — reduce confidence
                         decision.confidence = max(tech_confidence - 15, 50)
                         decision.reason = f"{tech_reason} | AI cautious: {ai_reason}"
                     else:
-                        # AI disagrees on direction — big penalty
                         decision.confidence = max(tech_confidence - 25, 40)
                         decision.reason = f"{tech_reason} | AI disagrees ({ai_action}): {ai_reason}"
                         if decision.confidence < settings.MIN_CONFIDENCE:
                             decision.action = "HOLD"
                 else:
-                    # OpenAI failed — fallback to technical only
                     decision.ai_fallback = True
                     logger.info("  Layer2: OpenAI unavailable — using technical rules only")
 
             logger.info(
-                f"  Final: {decision.action} conf={decision.confidence} grade={decision.setup_grade} | "
+                f"  Final: {decision.action} conf={decision.confidence} "
+                f"strategy={decision.strategy_type} grade={decision.setup_grade} regime={regime} | "
                 f"AI={decision.ai_called} fallback={decision.ai_fallback}"
             )
             return decision
@@ -686,6 +702,148 @@ class ScalpingEngine:
                 action="HOLD", confidence=0,
                 reason=f"Analysis error: {str(e)[:100]}"
             )
+
+    # ─── V5: Breakout Momentum Sub-Strategy ─────────────────────────
+
+    def _score_breakout_momentum(
+        self, price: float, highs: np.ndarray, closes: np.ndarray,
+        volume_spike: bool, volume_ratio: float, macd_crossover: str,
+        bb_position: str, htf_trend: str, spread_pct: float, atr_pct: float,
+    ) -> tuple[str, int, str]:
+        """
+        V5 Breakout momentum strategy — detects resistance breaks with volume.
+        Best in BREAKOUT_EXPANSION regime.
+        """
+        if spread_pct > settings.MAX_SPREAD_ENTRY_PCT or atr_pct > settings.MAX_VOLATILITY_PCT:
+            return "HOLD", 0, "Spread/volatility too high for breakout"
+
+        # Find recent resistance (highest high in last 20 candles, excluding last 2)
+        if len(highs) < 22:
+            return "HOLD", 0, "Insufficient data for breakout"
+
+        recent_resistance = float(np.max(highs[-22:-2]))
+        recent_support = float(np.min(closes[-22:-2]))
+
+        score = 0
+        # LONG breakout: price above recent resistance
+        if price > recent_resistance:
+            score = 40
+            if volume_spike:
+                score += 15
+            if volume_ratio > 2.0:
+                score += 10
+            if macd_crossover == "BULLISH":
+                score += 10
+            if htf_trend == "BULLISH":
+                score += 10
+            if closes[-1] > closes[-2] > closes[-3]:  # 3 green candles
+                score += 10
+            if bb_position == "UPPER":  # Breaking above BB = strong
+                score += 5
+
+            if score >= 65:
+                return "BUY", min(score, 98), f"Breakout above {recent_resistance:.4f} | vol={volume_ratio:.1f}x"
+
+        # SHORT breakout: price below recent support
+        elif price < recent_support:
+            score = 40
+            if volume_spike:
+                score += 15
+            if volume_ratio > 2.0:
+                score += 10
+            if macd_crossover == "BEARISH":
+                score += 10
+            if htf_trend == "BEARISH":
+                score += 10
+            if closes[-1] < closes[-2] < closes[-3]:
+                score += 10
+            if bb_position == "LOWER":
+                score += 5
+
+            if score >= 65:
+                return "SELL", min(score, 98), f"Breakdown below {recent_support:.4f} | vol={volume_ratio:.1f}x"
+
+        return "HOLD", 0, "No breakout detected"
+
+    # ─── V5: Range Reversal Sub-Strategy ───────────────────────────
+
+    def _score_range_reversal(
+        self, price: float, rsi: float, bb_position: str,
+        bb_upper: float, bb_lower: float, vwap: float,
+        volume_spike: bool, candle_type: str, spread_pct: float, atr_pct: float,
+    ) -> tuple[str, int, str]:
+        """
+        V5 Range reversal strategy — buys support, sells resistance.
+        Best in SIDEWAYS_RANGE regime.
+        """
+        if spread_pct > settings.MAX_SPREAD_ENTRY_PCT or atr_pct > settings.MAX_VOLATILITY_PCT:
+            return "HOLD", 0, "Spread/volatility too high for reversal"
+
+        # LONG reversal at lower BB / oversold
+        if bb_position == "LOWER" and rsi < 35:
+            score = 45
+            if rsi < 25:
+                score += 15
+            elif rsi < 30:
+                score += 10
+            if candle_type == "BULLISH":  # Reversal candle
+                score += 15
+            if volume_spike:
+                score += 10
+            if price < vwap:
+                score += 5
+
+            if score >= 65:
+                return "BUY", min(score, 98), f"Range reversal at lower BB | RSI={rsi:.0f}"
+
+        # SHORT reversal at upper BB / overbought
+        if bb_position == "UPPER" and rsi > 65:
+            score = 45
+            if rsi > 75:
+                score += 15
+            elif rsi > 70:
+                score += 10
+            if candle_type == "BEARISH":
+                score += 15
+            if volume_spike:
+                score += 10
+            if price > vwap:
+                score += 5
+
+            if score >= 65:
+                return "SELL", min(score, 98), f"Range reversal at upper BB | RSI={rsi:.0f}"
+
+        return "HOLD", 0, "No reversal setup"
+
+    # ─── V5: Multi-Strategy Best Selection ─────────────────────────
+
+    def _select_best_strategy(
+        self,
+        trend_result: tuple, breakout_result: tuple, reversal_result: tuple,
+        regime_weights: dict,
+    ) -> tuple[str, int, str, str]:
+        """
+        Pick the best scoring strategy, apply regime weight adjustment.
+        Returns (action, confidence, reason, strategy_type).
+        """
+        strategies = [
+            ("trend_pullback", trend_result, regime_weights.get("scalp_trend_pullback", 1.0)),
+            ("breakout_momentum", breakout_result, regime_weights.get("scalp_breakout", 1.0)),
+            ("range_reversal", reversal_result, regime_weights.get("scalp_range_reversal", 1.0)),
+        ]
+
+        best = None
+        for name, (action, conf, reason), weight in strategies:
+            if action == "HOLD" or conf < 60:
+                continue
+            adjusted_conf = int(conf * weight)
+            adjusted_conf = max(50, min(adjusted_conf, 98))
+            if best is None or adjusted_conf > best[1]:
+                best = (action, adjusted_conf, f"[{name}] {reason}", name)
+
+        if best:
+            return best
+        return "HOLD", 0, "No strategy met minimum threshold", "none"
 
     def to_dict(self, decision: AIDecision) -> dict:
         raw = {
@@ -710,6 +868,9 @@ class ScalpingEngine:
             "is_chase": decision.is_chase,
             "conditions_passed": decision.conditions_passed,
             "conditions_total": decision.conditions_total,
+            # V5
+            "strategy_type": decision.strategy_type,
+            "regime": decision.regime,
             # AI
             "ai_called": decision.ai_called,
             "ai_tokens_used": decision.ai_tokens_used,

@@ -1,24 +1,16 @@
 """
-V4 Telegram Notification Module — Privacy-Safe Group Channel Output
+V5.5 Telegram Notification Module — Privacy-Safe Group Channel Output
 
-V4 Design Rules:
+V5.5 Design Rules:
   - NEVER expose account names, labels, emails, IDs, or balances
   - ONE message per signal (not per account)
   - Aggregated skip reasons only (counts, not names)
   - No scan spam, no per-account alerts
   - Only actionable output goes to Telegram
-
-Kept from V3:
-  - TP/SL failure alerts (critical safety)
-  - Error alerts (critical)
-  - Daily report (aggregated)
-
-Removed from public channel:
-  - Per-account trade_opened
-  - Per-account trade_skipped
-  - Per-account daily_target_hit / daily_loss_hit
-  - scan_complete / no_signals (spam)
-  - signal_summary (replaced by unified messages)
+  - Shows strategy type (Scalping / Swing / Sniper)
+  - Shows market regime when relevant
+  - Shows TP/SL verification status with order IDs
+  - Shows R:R ratio
 """
 
 import logging
@@ -82,6 +74,17 @@ class TelegramNotifier:
         sl_attached: bool = True,
         tp_attached: bool = True,
         order_method: str = "MARKET",
+        # V5 additions
+        strategy_type: str = "",
+        regime: str = "",
+        # V5.5 additions
+        sl_order_id: str = "",
+        tp_order_id: str = "",
+        risk_reward: float = 0.0,
+        # V5.5 Partial TP
+        partial_tp_enabled: bool = False,
+        tp1_price: float = 0.0,
+        tp2_price: float = 0.0,
     ):
         """
         V4: Single clean Telegram message for executed trades.
@@ -125,22 +128,80 @@ class TelegramNotifier:
         tp_pct_str = f" (+{tp_pct:.1f}%)" if tp_pct > 0 else ""
         sl_pct_str = f" (-{sl_pct:.1f}%)" if sl_pct > 0 else ""
 
+        # V5: Strategy type display
+        strategy_display = ""
+        if strategy_type:
+            if strategy_type.startswith("swing"):
+                strategy_display = "🌊 Swing"
+            elif strategy_type.startswith("sniper"):
+                strategy_display = "🎯 Sniper"
+            else:
+                strategy_display = "⚡ Scalping"
+
+        # V5: Regime display
+        regime_display = ""
+        if regime:
+            regime_map = {
+                "TRENDING_BULL": "🟢 Trending Bull",
+                "TRENDING_BEAR": "🔴 Trending Bear",
+                "SIDEWAYS_RANGE": "↔️ Sideways",
+                "BREAKOUT_EXPANSION": "💥 Breakout",
+                "HIGH_VOLATILITY": "⚠️ High Volatility",
+                "DEAD_MARKET": "💤 Dead Market",
+            }
+            regime_display = regime_map.get(regime, regime)
+
+        strategy_line = f"\nType: <b>{strategy_display}</b>" if strategy_display else ""
+        regime_line = f"\nRegime: <b>{regime_display}</b>" if regime_display else ""
+
+        # V5.5: TP/SL proof line with order IDs
+        proof_line = ""
+        if sl_order_id or tp_order_id:
+            proof_parts = []
+            if sl_order_id:
+                proof_parts.append(f"SL=#{sl_order_id}")
+            if tp_order_id:
+                proof_parts.append(f"TP=#{tp_order_id}")
+            proof_line = f"\nOrders: <code>{' | '.join(proof_parts)}</code>"
+
+        # V5.5: Risk/Reward display
+        rr_line = ""
+        if risk_reward > 0:
+            rr_line = f"\nR:R = <b>1:{risk_reward:.1f}</b>"
+
+        # V5.5: Partial TP display
+        if partial_tp_enabled and tp1_price > 0:
+            tp_block = (
+                f"TP Mode: <b>📊 Partial (40/30/30)</b>\n"
+                f"TP1: <b>${tp1_price:,.6f}</b> (close 40%)\n"
+                f"TP2: <b>${tp2_price:,.6f}</b> (close 30%)\n"
+                f"Trail: <b>30%</b> with BE stop\n"
+                f"SL: <b>${stop_loss:,.6f}</b>{sl_pct_str}"
+            )
+        else:
+            tp_block = (
+                f"TP: <b>${take_profit:,.6f}</b>{tp_pct_str}\n"
+                f"SL: <b>${stop_loss:,.6f}</b>{sl_pct_str}"
+            )
+
         msg = (
             f"🚀 <b>TRADE EXECUTED</b>\n\n"
             f"Coin: <b>{symbol}</b>\n"
             f"Side: <b>{direction}</b>\n"
             f"Confidence: <b>{confidence}%</b>"
-            f"{grade_line}\n\n"
+            f"{grade_line}"
+            f"{strategy_line}"
+            f"{regime_line}\n\n"
             f"Executed Accounts: <b>{executed_count}</b>\n"
             f"Skipped Accounts: <b>{skipped_count}</b>\n\n"
             f"Entry: <b>${display_price:,.6f}</b>\n"
             f"Leverage: <b>{leverage}x</b>\n"
-            f"Size: <b>Dynamic</b>\n"
             f"Method: <b>{order_method}</b>\n\n"
-            f"TP: <b>${take_profit:,.6f}</b>{tp_pct_str}\n"
-            f"SL: <b>${stop_loss:,.6f}</b>{sl_pct_str}"
+            f"{tp_block}"
+            f"{rr_line}"
             f"{reason_block}\n\n"
             f"<b>Status:</b>\n{tp_sl_status}"
+            f"{proof_line}"
             f"{skip_block}"
         )
         await self.send(msg)
@@ -327,5 +388,52 @@ class TelegramNotifier:
             f"🔴 <b>LOSS COOLDOWN ACTIVATED</b>\n\n"
             f"Consecutive losses: <b>{consecutive_losses}</b>\n"
             f"Pausing for: <b>{cooldown_minutes} minutes</b>"
+        )
+        await self.send(msg)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # V5.5: Break-Even & Partial TP Notifications
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def break_even_moved(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        be_price: float,
+        roi_pct: float,
+    ):
+        """V5.5: Notify when SL is moved to break-even to protect profits."""
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        msg = (
+            f"🛡️ <b>BREAK-EVEN STOP ACTIVATED</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Entry: <b>${entry_price:,.6f}</b>\n"
+            f"New SL: <b>${be_price:,.6f}</b>\n"
+            f"Current ROI: <b>+{roi_pct:.1f}%</b>\n\n"
+            f"✅ <i>Position now risk-free — profits protected</i>"
+        )
+        await self.send(msg)
+
+    async def partial_tp_hit(
+        self,
+        symbol: str,
+        side: str,
+        tp_level: str,
+        close_pct: int,
+        price: float,
+        remaining_pct: int,
+    ):
+        """V5.5: Notify when a partial TP level is hit."""
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        msg = (
+            f"💰 <b>PARTIAL TP HIT — {tp_level}</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Closed: <b>{close_pct}%</b> of position\n"
+            f"At Price: <b>${price:,.6f}</b>\n"
+            f"Remaining: <b>{remaining_pct}%</b> trailing\n\n"
+            f"<i>Position scaling out — locking profits</i>"
         )
         await self.send(msg)

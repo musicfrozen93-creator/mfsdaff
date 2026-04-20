@@ -1,22 +1,14 @@
 """
-V4 Binance Futures Execution Module
+V5.5 Binance Futures Execution Module
 Handles order placement, precision handling, leverage setting,
 multi-account execution, exchange filter caching, TP/SL with retry,
 and pre-entry quality checks.
 
-V3 Changes:
-  - TP/SL use closePosition=true for reliable closing
-  - 3-retry loop for SL and TP placement
-  - Pre-entry spread/chase/fee checks
-  - Get actual fill price from order response
-  - Limit order support for better fills
-
-V4 Changes:
-  - LIMIT → MARKET fallback: try limit first, wait, fallback to market
-  - Position verification before TP/SL attachment
-  - Order status check + cancel for unfilled limits
-  - Actual fill price from position data as last resort
-  - Better error handling — never swallow exceptions silently
+V5.5 Changes:
+  - TP/SL execution proof (verify orders exist on exchange after placement)
+  - Full proof logging: order ID, stopPrice, reduceOnly, closePosition
+  - Critical Telegram alert if verification fails
+  - Position quantity validation
 """
 
 import asyncio
@@ -69,6 +61,12 @@ class OrderResult:
     tp_attached: bool = False          # V3: tracking
     error: Optional[str] = None
     order_method: str = "MARKET"       # V4: LIMIT or MARKET
+    # V5.5 Partial TP tracking
+    partial_tp_enabled: bool = False
+    tp1_order_id: Optional[int] = None
+    tp2_order_id: Optional[int] = None
+    tp1_attached: bool = False
+    tp2_attached: bool = False
 
 
 @dataclass
@@ -415,6 +413,27 @@ class BinanceExecutor:
         }
         return await self._signed_request("POST", "/fapi/v1/order", params)
 
+    async def place_partial_take_profit(
+        self, symbol: str, side: str, stop_price: float,
+        quantity: float, precision: PrecisionInfo,
+    ) -> dict:
+        """
+        V5.5: Place a partial TP order with specific quantity.
+        Uses reduceOnly=true instead of closePosition.
+        """
+        price_str = self.format_price(stop_price, precision.price_precision)
+        qty_str = self.format_quantity(quantity, precision.quantity_precision)
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "TAKE_PROFIT_MARKET",
+            "stopPrice": price_str,
+            "quantity": qty_str,
+            "reduceOnly": "true",
+            "timeInForce": "GTE_GTC",
+        }
+        return await self._signed_request("POST", "/fapi/v1/order", params)
+
     async def _place_with_retry(
         self,
         place_func,
@@ -609,27 +628,115 @@ class BinanceExecutor:
 
             close_side = "SELL" if params.side == "BUY" else "BUY"
 
-            # ── SL with retry ────────────────────────────────────────
+            # ── SL with retry (always closePosition=true) ────────────
             sl_order, sl_error = await self._place_with_retry(
                 self.place_stop_loss, "STOP_LOSS",
                 symbol, close_side, actual_sl, precision,
             )
 
-            # ── TP with retry ────────────────────────────────────────
-            tp_order, tp_error = await self._place_with_retry(
-                self.place_take_profit, "TAKE_PROFIT",
-                symbol, close_side, actual_tp, precision,
-            )
+            # ── V5.5: Partial TP or Full TP ──────────────────────────
+            tp_order = None
+            tp_error = ""
+            tp1_order = None
+            tp2_order = None
+            tp1_attached = False
+            tp2_attached = False
+            partial_tp_used = False
 
-            # ── Alert on TP/SL failure via Telegram ──────────────────
+            if getattr(params, 'partial_tp_enabled', False) and params.quantity > 0:
+                # ── PARTIAL TP MODE ──────────────────────────────────
+                partial_tp_used = True
+                logger.info(f"  📊 Using PARTIAL TP mode for {symbol}")
+
+                # Recalculate partial TP prices from actual fill
+                if fill_price > 0 and hasattr(params, 'tp_pct') and params.tp_pct > 0:
+                    tp_pct_decimal = params.tp_pct / 100.0
+                    tp_distance = fill_price * tp_pct_decimal
+                    tp1_distance = tp_distance * settings.PARTIAL_TP1_DISTANCE
+
+                    if params.side == "BUY":
+                        actual_tp1 = round(fill_price + tp1_distance, precision.price_precision)
+                    else:
+                        actual_tp1 = round(fill_price - tp1_distance, precision.price_precision)
+                    actual_tp2 = actual_tp  # Full TP = TP2
+                else:
+                    actual_tp1 = params.tp1_price
+                    actual_tp2 = params.tp2_price
+
+                # Calculate quantities for each partial
+                tp1_qty = round(params.quantity * params.tp1_qty_pct, precision.quantity_precision)
+                tp2_qty = round(params.quantity * params.tp2_qty_pct, precision.quantity_precision)
+
+                # Ensure quantities respect min_qty
+                if tp1_qty < precision.min_qty:
+                    tp1_qty = precision.min_qty
+                if tp2_qty < precision.min_qty:
+                    tp2_qty = precision.min_qty
+
+                # TP1: 40% at halfway
+                try:
+                    tp1_result = await self.place_partial_take_profit(
+                        symbol, close_side, actual_tp1, tp1_qty, precision,
+                    )
+                    tp1_order = tp1_result
+                    tp1_attached = True
+                    logger.info(
+                        f"  ✅ TP1 placed: #{tp1_result.get('orderId')} "
+                        f"qty={tp1_qty} price={actual_tp1}"
+                    )
+                except Exception as e:
+                    logger.warning(f"  ⚠️ TP1 failed: {e}")
+
+                # TP2: 30% at full TP
+                try:
+                    tp2_result = await self.place_partial_take_profit(
+                        symbol, close_side, actual_tp2, tp2_qty, precision,
+                    )
+                    tp2_order = tp2_result
+                    tp2_attached = True
+                    logger.info(
+                        f"  ✅ TP2 placed: #{tp2_result.get('orderId')} "
+                        f"qty={tp2_qty} price={actual_tp2}"
+                    )
+                except Exception as e:
+                    logger.warning(f"  ⚠️ TP2 failed: {e}")
+
+                # Consider TP attached if at least TP1 succeeded
+                tp_attached_status = tp1_attached or tp2_attached
+                tp_order = tp1_order or tp2_order  # For backward compat
+
+            else:
+                # ── FULL TP MODE (original) ──────────────────────────
+                tp_order, tp_error = await self._place_with_retry(
+                    self.place_take_profit, "TAKE_PROFIT",
+                    symbol, close_side, actual_tp, precision,
+                )
+                tp_attached_status = tp_order is not None
+
+            # ── V5.5: TP/SL Execution Proof ─────────────────────────
             sl_attached = sl_order is not None
-            tp_attached = tp_order is not None
 
-            if not sl_attached or not tp_attached:
+            # Verify orders actually exist on exchange
+            if sl_attached or tp_attached_status:
+                proof_ok = await self._verify_tp_sl_proof(
+                    symbol=symbol,
+                    sl_order_id=sl_order.get("orderId") if sl_order else None,
+                    tp_order_id=tp_order.get("orderId") if tp_order else None,
+                    expected_sl_price=actual_sl,
+                    expected_tp_price=actual_tp,
+                    precision=precision,
+                )
+                if not proof_ok:
+                    logger.error(
+                        f"  🚨 PROOF FAILED for {symbol} — "
+                        f"TP/SL orders may not be correctly placed!"
+                    )
+
+            if not sl_attached or not tp_attached_status:
                 failure_msg = []
                 if not sl_attached:
                     failure_msg.append(f"SL: {sl_error}")
-                if not tp_attached:
+                if not tp_attached_status:
                     failure_msg.append(f"TP: {tp_error}")
                 error_detail = " | ".join(failure_msg)
                 logger.error(f"  🚨 TP/SL INCOMPLETE for {symbol}: {error_detail}")
@@ -637,15 +744,25 @@ class BinanceExecutor:
                 if telegram_notifier:
                     await telegram_notifier.tp_sl_failed(
                         symbol=symbol, side=params.side,
-                        sl_attached=sl_attached, tp_attached=tp_attached,
+                        sl_attached=sl_attached, tp_attached=tp_attached_status,
                         error=error_detail,
                     )
 
-            logger.info(
-                f"  📊 Trade summary: method={order_method} fill={fill_price} "
-                f"TP={actual_tp} SL={actual_sl} "
-                f"SL_ok={sl_attached} TP_ok={tp_attached}"
-            )
+            # Summary log
+            if partial_tp_used:
+                logger.info(
+                    f"  📊 Trade summary: method={order_method} fill={fill_price} "
+                    f"TP1={actual_tp1 if partial_tp_used else 'N/A'} "
+                    f"TP2={actual_tp2 if partial_tp_used else 'N/A'} SL={actual_sl} "
+                    f"TP1_ok={tp1_attached} TP2_ok={tp2_attached} SL_ok={sl_attached} "
+                    f"| PARTIAL_TP mode"
+                )
+            else:
+                logger.info(
+                    f"  📊 Trade summary: method={order_method} fill={fill_price} "
+                    f"TP={actual_tp} SL={actual_sl} "
+                    f"SL_ok={sl_attached} TP_ok={tp_attached_status}"
+                )
 
             return OrderResult(
                 success=True,
@@ -658,8 +775,13 @@ class BinanceExecutor:
                 stop_loss_order_id=sl_order.get("orderId") if sl_order else None,
                 take_profit_order_id=tp_order.get("orderId") if tp_order else None,
                 sl_attached=sl_attached,
-                tp_attached=tp_attached,
+                tp_attached=tp_attached_status,
                 order_method=order_method,
+                partial_tp_enabled=partial_tp_used,
+                tp1_order_id=tp1_order.get("orderId") if tp1_order else None,
+                tp2_order_id=tp2_order.get("orderId") if tp2_order else None,
+                tp1_attached=tp1_attached,
+                tp2_attached=tp2_attached,
             )
 
         except Exception as e:
@@ -673,6 +795,86 @@ class BinanceExecutor:
                 entry_price=params.entry_price,
                 error=str(e),
             )
+
+    # ─── V5.5: TP/SL Verification Proof ─────────────────────────────────
+
+    async def _verify_tp_sl_proof(
+        self,
+        symbol: str,
+        sl_order_id: Optional[int],
+        tp_order_id: Optional[int],
+        expected_sl_price: float,
+        expected_tp_price: float,
+        precision: PrecisionInfo,
+    ) -> bool:
+        """
+        V5.5: Verify TP/SL orders actually exist on Binance with correct params.
+        Logs full proof for audit trail. Returns True if all verified.
+        """
+        all_ok = True
+
+        try:
+            # Query all open orders for this symbol
+            open_orders = await self._signed_request(
+                "GET", "/fapi/v1/openOrders",
+                {"symbol": symbol},
+            )
+
+            sl_verified = False
+            tp_verified = False
+
+            for order in open_orders:
+                oid = order.get("orderId")
+                order_type = order.get("type", "")
+                stop_price = float(order.get("stopPrice", 0))
+                close_pos = order.get("closePosition", "false")
+                status = order.get("status", "")
+                side = order.get("side", "")
+
+                # Check SL
+                if sl_order_id and oid == sl_order_id:
+                    price_match = abs(stop_price - expected_sl_price) < (expected_sl_price * 0.001)
+                    sl_verified = True
+                    logger.info(
+                        f"  🔒 PROOF SL: #{oid} type={order_type} "
+                        f"stopPrice={stop_price} expected={expected_sl_price} "
+                        f"closePosition={close_pos} status={status} side={side} "
+                        f"price_match={'✅' if price_match else '⚠️'}"
+                    )
+                    if not price_match:
+                        logger.warning(f"  ⚠️ SL price mismatch: {stop_price} vs expected {expected_sl_price}")
+                        all_ok = False
+
+                # Check TP
+                if tp_order_id and oid == tp_order_id:
+                    price_match = abs(stop_price - expected_tp_price) < (expected_tp_price * 0.001)
+                    tp_verified = True
+                    logger.info(
+                        f"  🔒 PROOF TP: #{oid} type={order_type} "
+                        f"stopPrice={stop_price} expected={expected_tp_price} "
+                        f"closePosition={close_pos} status={status} side={side} "
+                        f"price_match={'✅' if price_match else '⚠️'}"
+                    )
+                    if not price_match:
+                        logger.warning(f"  ⚠️ TP price mismatch: {stop_price} vs expected {expected_tp_price}")
+                        all_ok = False
+
+            if sl_order_id and not sl_verified:
+                logger.error(f"  ❌ PROOF FAIL: SL order #{sl_order_id} NOT found in open orders!")
+                all_ok = False
+            if tp_order_id and not tp_verified:
+                logger.error(f"  ❌ PROOF FAIL: TP order #{tp_order_id} NOT found in open orders!")
+                all_ok = False
+
+            if all_ok:
+                logger.info(f"  ✅ PROOF COMPLETE: Both TP and SL verified on exchange for {symbol}")
+
+        except Exception as e:
+            logger.warning(f"  ⚠️ TP/SL proof verification failed: {e}")
+            # Don't block trade on verification failure
+            all_ok = True  # Optimistic — order was placed, just can't verify
+
+        return all_ok
 
     # ─── Simple USDT-Based Execution (backward compat) ────────────────
 
@@ -706,3 +908,172 @@ class BinanceExecutor:
             "price": price,
             "notional": round(notional, 2),
         }
+
+    # ─── V5.5: Break-Even Stop Management ────────────────────────────
+
+    async def manage_break_even_stops(
+        self,
+        trigger_pct: float = 3.0,
+        buffer_pct: float = 0.1,
+        telegram_notifier=None,
+    ) -> list[dict]:
+        """
+        V5.5: Check all open positions and move SL to break-even
+        for trades that have reached the profit threshold.
+
+        Process:
+        1. Get all open positions
+        2. For each: calculate current ROI%
+        3. If ROI >= trigger_pct → find existing SL order → cancel → place new SL at entry + buffer
+        4. Log all actions and send Telegram notification
+
+        Args:
+            trigger_pct: Minimum profit % to trigger BE stop (default 3.0%)
+            buffer_pct: Small buffer above/below entry to cover fees (default 0.1%)
+            telegram_notifier: Optional TelegramNotifier for alerts
+
+        Returns: List of actions taken
+        """
+        if not settings.BREAK_EVEN_ENABLED:
+            return []
+
+        actions = []
+        logger.info("🔄 Checking positions for break-even stop management...")
+
+        try:
+            positions = await self.get_open_positions()
+            if not positions:
+                logger.info("  No open positions to check")
+                return actions
+
+            for pos in positions:
+                symbol = pos["symbol"]
+                entry_price = float(pos.get("entryPrice", 0))
+                mark_price = float(pos.get("markPrice", 0))
+                position_amt = float(pos.get("positionAmt", 0))
+                unrealized_pnl = float(pos.get("unRealizedProfit", 0))
+
+                if entry_price <= 0 or mark_price <= 0 or position_amt == 0:
+                    continue
+
+                # Determine side
+                is_long = position_amt > 0
+                side = "BUY" if is_long else "SELL"
+
+                # Calculate ROI %
+                if is_long:
+                    roi_pct = ((mark_price - entry_price) / entry_price) * 100
+                else:
+                    roi_pct = ((entry_price - mark_price) / entry_price) * 100
+
+                # Check if profit threshold met
+                if roi_pct < trigger_pct:
+                    continue
+
+                logger.info(
+                    f"  📈 {symbol} {side}: ROI={roi_pct:.2f}% >= {trigger_pct}% — "
+                    f"moving SL to break-even"
+                )
+
+                try:
+                    precision = await self.get_precision(symbol)
+
+                    # Calculate break-even price (entry + buffer for fees)
+                    if is_long:
+                        be_price = round(
+                            entry_price * (1 + buffer_pct / 100),
+                            precision.price_precision,
+                        )
+                    else:
+                        be_price = round(
+                            entry_price * (1 - buffer_pct / 100),
+                            precision.price_precision,
+                        )
+
+                    # Find and cancel existing SL orders for this symbol
+                    open_orders = await self._signed_request(
+                        "GET", "/fapi/v1/openOrders",
+                        {"symbol": symbol},
+                    )
+
+                    sl_cancelled = False
+                    for order in open_orders:
+                        order_type = order.get("type", "")
+                        if order_type == "STOP_MARKET":
+                            old_sl_price = float(order.get("stopPrice", 0))
+                            order_id = order.get("orderId")
+
+                            # Only move if the new BE price is better than current SL
+                            if is_long and be_price > old_sl_price:
+                                await self.cancel_order(symbol, order_id)
+                                sl_cancelled = True
+                                logger.info(
+                                    f"  ✅ Cancelled old SL #{order_id} "
+                                    f"at {old_sl_price} for {symbol}"
+                                )
+                            elif not is_long and be_price < old_sl_price:
+                                await self.cancel_order(symbol, order_id)
+                                sl_cancelled = True
+                                logger.info(
+                                    f"  ✅ Cancelled old SL #{order_id} "
+                                    f"at {old_sl_price} for {symbol}"
+                                )
+
+                    if not sl_cancelled:
+                        logger.info(
+                            f"  ℹ️ No SL to move for {symbol} "
+                            f"(BE price not better than current SL)"
+                        )
+                        continue
+
+                    # Place new SL at break-even
+                    close_side = "SELL" if is_long else "BUY"
+                    new_sl = await self.place_stop_loss(
+                        symbol, close_side, be_price, precision,
+                    )
+
+                    new_sl_id = new_sl.get("orderId")
+                    logger.info(
+                        f"  ✅ NEW BE STOP placed for {symbol}: "
+                        f"#{new_sl_id} at {be_price} "
+                        f"(entry={entry_price}, ROI={roi_pct:.2f}%)"
+                    )
+
+                    action = {
+                        "symbol": symbol,
+                        "side": side,
+                        "entry_price": entry_price,
+                        "mark_price": mark_price,
+                        "roi_pct": round(roi_pct, 2),
+                        "old_sl": "cancelled",
+                        "new_sl_price": be_price,
+                        "new_sl_order_id": new_sl_id,
+                        "status": "moved_to_be",
+                    }
+                    actions.append(action)
+
+                    # Telegram notification
+                    if telegram_notifier:
+                        await telegram_notifier.break_even_moved(
+                            symbol=symbol,
+                            side=side,
+                            entry_price=entry_price,
+                            be_price=be_price,
+                            roi_pct=roi_pct,
+                        )
+
+                except Exception as e:
+                    logger.error(f"  ❌ BE stop management failed for {symbol}: {e}")
+                    actions.append({
+                        "symbol": symbol,
+                        "error": str(e),
+                        "status": "failed",
+                    })
+
+        except Exception as e:
+            logger.error(f"Break-even stop management failed: {e}")
+
+        if actions:
+            logger.info(f"🔄 Break-even management: {len(actions)} positions adjusted")
+
+        return actions

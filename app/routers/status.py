@@ -1,5 +1,5 @@
 """
-V2 Status Dashboard API — comprehensive trading statistics
+V5 Status Dashboard API — comprehensive trading + strategy statistics
 """
 
 import logging
@@ -12,6 +12,8 @@ from app.database import async_session
 from app.models.trading import Trade, Signal, TradeSkip
 from app.models.user import Account
 from app.modules.executor import BinanceExecutor
+from app.modules.strategy_tracker import strategy_tracker
+from app.modules.market_regime import MarketRegimeRouter
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -140,14 +142,176 @@ async def get_status():
     minutes, _ = divmod(rem, 60)
     uptime_str = f"{days}d {hours}h {minutes}m"
 
+    # ── V5: Strategy performance stats ───────────────────────────────
+    strategy_stats = {}
+    try:
+        strategy_stats = await strategy_tracker.get_strategy_stats(days=30)
+    except Exception as e:
+        logger.warning(f"Strategy stats failed: {e}")
+
+    # ── V5: Current regime ────────────────────────────────────────
+    current_regime = {}
+    try:
+        regime_router = MarketRegimeRouter()
+        regime = await regime_router.detect_regime()
+        current_regime = regime_router.to_dict(regime)
+    except Exception as e:
+        logger.warning(f"Regime fetch failed: {e}")
+
     return {
         "status": "ok",
-        "version": "2.0.0",
+        "version": "5.5.0",
         # In-memory stats
         **stats,
         # DB stats
         **db_stats,
+        # V5: Strategy performance
+        "strategy_performance": strategy_stats,
+        "current_regime": current_regime,
         # Live data
         "open_positions": open_positions,
         "system_uptime": uptime_str,
     }
+
+
+@router.get("/strategy-report")
+async def get_strategy_report():
+    """
+    V5.5: Comprehensive per-engine strategy report.
+    Shows win rate, profit factor, R multiple, drawdown by strategy and regime.
+    """
+    try:
+        report = await strategy_tracker.get_strategy_report(days=30)
+
+        # Get current regime
+        current_regime = {}
+        try:
+            regime_router = MarketRegimeRouter()
+            regime = await regime_router.detect_regime()
+            current_regime = regime_router.to_dict(regime)
+        except Exception:
+            pass
+
+        # Get weight adjustments
+        weights = {}
+        try:
+            weights = await strategy_tracker.get_strategy_weight_adjustments(days=14)
+        except Exception:
+            pass
+
+        return {
+            "status": "ok",
+            "report": report,
+            "current_regime": current_regime,
+            "weight_adjustments": weights,
+            "period_days": 30,
+        }
+    except Exception as e:
+        logger.error(f"Strategy report failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@router.post("/manage-breakeven")
+async def manage_break_even():
+    """
+    V5.5: Check all open positions and move SL to break-even
+    for those that have reached the profit threshold.
+
+    Call this endpoint periodically (e.g., every 5 minutes via n8n)
+    to protect winning positions automatically.
+    """
+    from app.modules.telegram import TelegramNotifier
+    from app.config import settings
+
+    telegram = TelegramNotifier()
+    executor = BinanceExecutor()
+
+    try:
+        actions = await executor.manage_break_even_stops(
+            trigger_pct=settings.BREAK_EVEN_TRIGGER_PCT,
+            buffer_pct=settings.BREAK_EVEN_BUFFER_PCT,
+            telegram_notifier=telegram,
+        )
+
+        return {
+            "status": "ok",
+            "positions_adjusted": len(actions),
+            "actions": actions,
+            "trigger_pct": settings.BREAK_EVEN_TRIGGER_PCT,
+            "buffer_pct": settings.BREAK_EVEN_BUFFER_PCT,
+        }
+    except Exception as e:
+        logger.error(f"Break-even management failed: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@router.get("/strategy-report-full")
+async def get_strategy_report_full():
+    """
+    V5.5: Enhanced strategy report with TP/SL success rates,
+    partial TP stats, and break-even stop effectiveness.
+    """
+    try:
+        report = await strategy_tracker.get_strategy_report(days=30)
+
+        # Get current regime
+        current_regime = {}
+        try:
+            regime_router = MarketRegimeRouter()
+            regime = await regime_router.detect_regime()
+            current_regime = regime_router.to_dict(regime)
+        except Exception:
+            pass
+
+        # Get weight adjustments
+        weights = {}
+        try:
+            weights = await strategy_tracker.get_strategy_weight_adjustments(days=14)
+        except Exception:
+            pass
+
+        # TP/SL success metrics from trades
+        tp_sl_stats = {}
+        try:
+            async with async_session() as session:
+                today = date.today()
+                month_ago = today - timedelta(days=30)
+
+                # Total trades with TP/SL data
+                all_trades = await session.execute(
+                    select(Trade).where(
+                        Trade.created_at >= datetime.combine(month_ago, datetime.min.time())
+                    )
+                )
+                trades = all_trades.scalars().all()
+
+                total = len(trades)
+                tp_hit = sum(1 for t in trades if t.close_reason == "tp_hit")
+                sl_hit = sum(1 for t in trades if t.close_reason == "sl_hit")
+                manual = sum(1 for t in trades if t.close_reason == "manual")
+                still_open = sum(1 for t in trades if t.status == "open")
+
+                tp_sl_stats = {
+                    "total_trades_30d": total,
+                    "tp_hit_count": tp_hit,
+                    "sl_hit_count": sl_hit,
+                    "manual_close_count": manual,
+                    "still_open": still_open,
+                    "tp_hit_rate": round(tp_hit / total * 100, 1) if total > 0 else 0,
+                    "sl_hit_rate": round(sl_hit / total * 100, 1) if total > 0 else 0,
+                }
+        except Exception as e:
+            logger.warning(f"TP/SL stats query failed: {e}")
+
+        return {
+            "status": "ok",
+            "report": report,
+            "current_regime": current_regime,
+            "weight_adjustments": weights,
+            "tp_sl_success": tp_sl_stats,
+            "period_days": 30,
+            "version": "5.5.0",
+        }
+    except Exception as e:
+        logger.error(f"Full strategy report failed: {e}")
+        return {"status": "error", "message": str(e)}

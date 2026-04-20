@@ -1,5 +1,5 @@
 """
-V4 Dynamic Risk Engine — Balance-Based Tiers + Confidence Leverage
+V5.5 Dynamic Risk Engine — Optimized TP/SL + ATR-Adaptive Stops
 
 NO fixed trade sizes. Everything is calculated from live account balance.
 
@@ -9,18 +9,15 @@ Balance Risk Tiers (PRESERVED from V2):
   $301-$1000 → 4% risk
   $1000+     → 2% risk
 
-V3 Leverage by Confidence:
-  70-80  → 5x
-  81-90  → 6x
-  91+    → 8x
-  Elite  → 10x (confidence 95+ with full confluence)
-  <70    → NO TRADE
+V5.5 Leverage (10x REMOVED — max 8x elite scalp only):
+  Scalp:  4x / 5x / 6x / 8x-elite
+  Swing:  2x / 3x / 4x / 5x-elite
+  Sniper: 3x / 3x / 4x / 4x-max
 
-V3 TP/SL by Confidence (NOT leverage):
-  70-80   → TP 5%, SL 2%
-  81-90   → TP 7%, SL 3%
-  91+     → TP 9%, SL 4%
-  Elite   → TP 12%
+V5.5 TP/SL (wider TP, ATR-dynamic SL):
+  Scalp:  TP 2.5-6%, SL max(1-2%, 0.8-1.5×ATR)
+  Swing:  TP 5-12%, SL 2-4%
+  Sniper: TP 2-5%, SL 1-2%
 """
 
 import logging
@@ -52,12 +49,19 @@ class TradeParameters:
     tp_pct: float = 0.0       # TP percentage for display
     sl_pct: float = 0.0       # SL percentage for display
     is_elite: bool = False     # Elite momentum setup
+    # V5.5 Partial TP additions
+    partial_tp_enabled: bool = False
+    tp1_price: float = 0.0     # First partial TP price
+    tp2_price: float = 0.0     # Second partial TP price (= full TP)
+    tp1_qty_pct: float = 0.40  # 40% of position at TP1
+    tp2_qty_pct: float = 0.30  # 30% of position at TP2
+    trail_qty_pct: float = 0.30  # 30% trails with BE stop
 
 
 class RiskEngine:
     """
-    V3 Dynamic Risk Management — deterministic, balance-based, no randomness.
-    Position sizing PRESERVED from V2. TP/SL and leverage updated for V3.
+    V5.5 Dynamic Risk Management — ATR-adaptive, strategy-aware, balance-based.
+    Position sizing PRESERVED from V2. TP/SL and leverage optimized for V5.5.
     """
 
     # ─── Balance Risk Tiers (PRESERVED — DO NOT CHANGE) ──────────────
@@ -97,26 +101,52 @@ class RiskEngine:
         else:
             return min(balance * 0.02, 100.0)
 
-    # ─── V3 Leverage by Confidence ───────────────────────────────────
+    # ─── V5.5 Leverage by Strategy + Confidence ────────────────────────
 
     @staticmethod
-    def get_leverage(confidence: int, is_elite: bool = False, max_leverage: int = 10) -> int:
+    def get_leverage(
+        confidence: int, is_elite: bool = False,
+        max_leverage: int = 8, strategy_type: str = "trend_pullback",
+    ) -> int:
         """
-        V3 Deterministic leverage based on confidence level.
-        More conservative than V2 — protects small accounts.
+        V5.5 Deterministic leverage — 10x REMOVED, max 8x elite scalp.
+        Scalp: 4/5/6/8. Swing: 2/3/4/5. Sniper: 3/3/4/4.
         """
         if confidence < 70:
             return 0  # NO TRADE
-        elif confidence <= 80:
-            return min(5, max_leverage)
-        elif confidence <= 90:
-            return min(6, max_leverage)
-        elif is_elite and confidence >= 95:
-            return min(10, max_leverage)  # Elite only
-        else:
-            return min(8, max_leverage)
 
-    # ─── V3 TP/SL Percentages (Confidence-Based) ────────────────────
+        # Strategy-specific leverage tiers
+        if strategy_type.startswith("swing"):
+            if is_elite and confidence >= 95:
+                return min(5, max_leverage)
+            elif confidence >= 91:
+                return min(4, max_leverage)
+            elif confidence >= 81:
+                return min(3, max_leverage)
+            else:
+                return min(2, max_leverage)
+
+        elif strategy_type.startswith("sniper"):
+            # Sniper: capped at 4x always
+            if confidence >= 91:
+                return min(4, max_leverage)
+            elif confidence >= 81:
+                return min(4, max_leverage)
+            else:
+                return min(3, max_leverage)
+
+        else:
+            # Scalp: 8x max for elite only, no 10x ever
+            if is_elite and confidence >= 95:
+                return min(8, max_leverage)
+            elif confidence >= 91:
+                return min(6, max_leverage)
+            elif confidence >= 81:
+                return min(5, max_leverage)
+            else:
+                return min(4, max_leverage)
+
+    # ─── V5.5 TP/SL — Wider TP + ATR-Dynamic SL ──────────────────────
 
     @staticmethod
     def get_tp_sl_pct(
@@ -124,29 +154,66 @@ class RiskEngine:
         atr_pct: float = 0.0,
         is_elite: bool = False,
         setup_grade: str = "C",
+        strategy_type: str = "trend_pullback",
     ) -> tuple[float, float]:
         """
-        V3: Returns (tp_pct, sl_pct) as decimals based on confidence + ATR.
-        NOT leverage-based. Uses confidence + setup quality + market condition.
+        V5.5: Wider scalp TP (2.5-6%), ATR-adaptive SL (min 1% floor).
+        SL = max(base_sl, atr_pct × multiplier) — prevents wick stop-outs.
         """
-        if confidence >= 91:
-            tp_pct = 0.09   # 9%
-            sl_pct = 0.04   # 4%
-        elif confidence >= 81:
-            tp_pct = 0.07   # 7%
-            sl_pct = 0.03   # 3%
+        if strategy_type.startswith("swing"):
+            # Swing: unchanged — wider targets for bigger moves
+            if confidence >= 91:
+                tp_pct = 0.12   # 12%
+                sl_pct = 0.04   # 4%
+            elif confidence >= 81:
+                tp_pct = 0.08   # 8%
+                sl_pct = 0.03   # 3%
+            else:
+                tp_pct = 0.05   # 5%
+                sl_pct = 0.02   # 2%
+
+        elif strategy_type.startswith("sniper"):
+            # Sniper: unchanged — medium targets
+            if confidence >= 91:
+                tp_pct = 0.05   # 5%
+                sl_pct = 0.02   # 2%
+            elif confidence >= 81:
+                tp_pct = 0.03   # 3%
+                sl_pct = 0.015  # 1.5%
+            else:
+                tp_pct = 0.02   # 2%
+                sl_pct = 0.01   # 1%
+
         else:
-            tp_pct = 0.05   # 5%
-            sl_pct = 0.02   # 2%
+            # Scalp: V5.5 WIDER TP to capture real profit after fees
+            if is_elite and confidence >= 95:
+                tp_pct = 0.06   # 6% (was 2.5%)
+                base_sl = 0.02  # 2% base
+                atr_mult = 1.5
+            elif confidence >= 91:
+                tp_pct = 0.045  # 4.5% (was 2%)
+                base_sl = 0.018 # 1.8% base
+                atr_mult = 1.2
+            elif confidence >= 81:
+                tp_pct = 0.035  # 3.5% (was 1.5%)
+                base_sl = 0.015 # 1.5% base
+                atr_mult = 1.0
+            else:
+                tp_pct = 0.025  # 2.5% (was 1%)
+                base_sl = 0.012 # 1.2% base
+                atr_mult = 0.8
 
-        # Elite momentum setups get extended TP
-        if is_elite and confidence >= 95:
-            tp_pct = 0.12   # 12%
+            # V5.5 ATR-dynamic SL: max(base, atr × multiplier, 1% floor)
+            atr_sl = (atr_pct / 100.0) * atr_mult if atr_pct > 0 else 0.0
+            sl_pct = max(base_sl, atr_sl, 0.01)  # 1% absolute floor
+            # Cap SL so it never exceeds 50% of TP (maintain R:R ≥ 2)
+            sl_pct = min(sl_pct, tp_pct * 0.5)
+            return tp_pct, sl_pct
 
-        # ATR adjustment: widen SL slightly for volatile coins
+        # Swing/Sniper: standard ATR widening (unchanged)
         if atr_pct > 1.0:
             volatility_factor = 1 + (atr_pct * 0.1)
-            sl_pct *= min(volatility_factor, 1.5)  # Cap at 1.5x widening
+            sl_pct *= min(volatility_factor, 1.5)
 
         return tp_pct, sl_pct
 
@@ -186,20 +253,22 @@ class RiskEngine:
         # V3 params
         volume_spike: bool = False,
         size_multiplier: float = 1.0,  # For daily guard reductions
+        # V5 params
+        strategy_type: str = "trend_pullback",
     ) -> TradeParameters:
         """
-        Compute full trade parameters with V3 dynamic risk management.
+        Compute full trade parameters with V5 strategy-aware risk management.
 
         Flow:
         1. Check minimum confidence
         2. Get risk % from balance tier (PRESERVED)
         3. Calculate safe_margin = balance * risk_pct
         4. Apply margin cap (PRESERVED)
-        5. Get leverage from confidence (V3 tiers)
+        5. Get leverage from strategy + confidence (V5 tiers)
         6. Calculate position_size = safe_margin * leverage
         7. Apply size_multiplier (daily guard / consecutive loss reduction)
         8. Validate symbol minimums
-        9. Calculate TP/SL (V3 confidence-based)
+        9. Calculate TP/SL (V5 strategy-based)
         """
 
         # ── Determine setup grade + elite status ─────────────────────
@@ -231,8 +300,8 @@ class RiskEngine:
             safe_margin *= size_multiplier
             logger.info(f"  V3 size reduction: multiplier={size_multiplier:.2f} margin=${safe_margin:.2f}")
 
-        # ── Leverage (V3 tiers) ──────────────────────────────────────
-        leverage = self.get_leverage(confidence, is_elite, max_leverage_override)
+        # ── Leverage (V5 strategy tiers) ──────────────────────────────
+        leverage = self.get_leverage(confidence, is_elite, max_leverage_override, strategy_type)
         if leverage == 0:
             return TradeParameters(
                 symbol=symbol, side=side, leverage=0,
@@ -329,8 +398,8 @@ class RiskEngine:
                     setup_grade=setup_grade,
                 )
 
-        # ── V3 TP/SL (Confidence-Based) ─────────────────────────────
-        tp_pct, sl_pct = self.get_tp_sl_pct(confidence, atr_pct, is_elite, setup_grade)
+        # ── V5 TP/SL (Strategy-Based) ─────────────────────────────────
+        tp_pct, sl_pct = self.get_tp_sl_pct(confidence, atr_pct, is_elite, setup_grade, strategy_type)
 
         if side == "BUY":
             take_profit = entry_price * (1 + tp_pct)
@@ -347,11 +416,23 @@ class RiskEngine:
         take_profit = round(take_profit, price_precision)
         stop_loss = round(stop_loss, price_precision)
 
+        # ── V5.5 Partial TP Calculation ─────────────────────────────
+        partial_tp_enabled, tp1_price, tp2_price = self.calculate_partial_tp(
+            entry_price=entry_price,
+            take_profit=take_profit,
+            side=side,
+            confidence=confidence,
+            strategy_type=strategy_type,
+            setup_grade=setup_grade,
+            price_precision=price_precision,
+        )
+
         logger.info(
-            f"  Risk V3: bal=${account_balance:.2f} risk={risk_pct*100:.1f}% "
+            f"  Risk V5: bal=${account_balance:.2f} risk={risk_pct*100:.1f}% "
             f"margin=${safe_margin:.2f} lev={leverage}x pos=${position_size_usdt:.2f} "
             f"qty={quantity} TP={tp_pct*100:.1f}% SL={sl_pct*100:.1f}% RR={rr} "
-            f"grade={setup_grade} elite={is_elite}"
+            f"grade={setup_grade} strategy={strategy_type}"
+            f"{' | PARTIAL_TP' if partial_tp_enabled else ''}"
         )
 
         return TradeParameters(
@@ -372,4 +453,66 @@ class RiskEngine:
             tp_pct=round(tp_pct * 100, 1),
             sl_pct=round(sl_pct * 100, 1),
             is_elite=is_elite,
+            partial_tp_enabled=partial_tp_enabled,
+            tp1_price=tp1_price,
+            tp2_price=tp2_price,
+            tp1_qty_pct=settings.PARTIAL_TP1_PCT,
+            tp2_qty_pct=settings.PARTIAL_TP2_PCT,
+            trail_qty_pct=settings.PARTIAL_TRAIL_PCT,
         )
+
+    # ─── V5.5: Partial Take Profit Calculation ───────────────────────
+
+    @staticmethod
+    def calculate_partial_tp(
+        entry_price: float,
+        take_profit: float,
+        side: str,
+        confidence: int,
+        strategy_type: str,
+        setup_grade: str,
+        price_precision: int = 4,
+    ) -> tuple[bool, float, float]:
+        """
+        V5.5: Determine if partial TP should be used and calculate levels.
+
+        Partial TP activates for:
+          - Swing trades (any grade)
+          - Breakout scalps with Grade A or B
+          - Any strategy with confidence >= 85 and Grade A or B
+
+        TP1 = 50% of the distance to full TP (close 40% of position)
+        TP2 = full TP level (close 30% of position)
+        Remaining 30% trails via break-even stop.
+
+        Returns: (enabled, tp1_price, tp2_price)
+        """
+        if not settings.PARTIAL_TP_ENABLED:
+            return False, 0.0, 0.0
+
+        # Determine eligibility
+        is_swing = strategy_type.startswith("swing")
+        is_breakout = "breakout" in strategy_type
+        is_strong_setup = setup_grade in ("A", "B") and confidence >= settings.PARTIAL_TP_MIN_CONFIDENCE
+
+        if not (is_swing or is_breakout or is_strong_setup):
+            return False, 0.0, 0.0
+
+        # Calculate TP1 at halfway to full TP
+        tp_distance = abs(take_profit - entry_price)
+        tp1_distance = tp_distance * settings.PARTIAL_TP1_DISTANCE
+
+        if side == "BUY":
+            tp1_price = round(entry_price + tp1_distance, price_precision)
+        else:
+            tp1_price = round(entry_price - tp1_distance, price_precision)
+
+        # TP2 = the full TP level
+        tp2_price = take_profit
+
+        logger.info(
+            f"  📊 Partial TP: TP1=${tp1_price} (40% close) | "
+            f"TP2=${tp2_price} (30% close) | Trail 30%"
+        )
+
+        return True, tp1_price, tp2_price

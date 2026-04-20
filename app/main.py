@@ -1,5 +1,5 @@
 """
-V2 AI-Powered Multi-Account Crypto Futures Scalping System
+V5 AI-Powered Multi-Strategy Crypto Futures Trading System
 FastAPI Backend — Main Entry Point
 """
 
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 V2 Multi-Account Crypto Scalping Bot starting up...")
+    logger.info("🚀 V5 Multi-Strategy Crypto Trading Bot starting up...")
     await init_db()
     logger.info("✅ All systems initialized")
     yield
@@ -29,13 +29,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="V2 Multi-Account Crypto Futures Scalping Bot",
+    title="V5 Multi-Strategy Crypto Futures Trading Bot",
     description=(
-        "Professional automated crypto futures scalping system with "
-        "multi-account support, layered confluence signals, AI verification, "
-        "dynamic risk management, and encrypted API key storage."
+        "Professional automated crypto futures trading system with "
+        "multi-strategy engines (Scalp/Swing/Sniper), market regime routing, "
+        "multi-account support, AI verification, and dynamic risk management."
     ),
-    version="2.0.0",
+    version="5.5.0",
     lifespan=lifespan,
 )
 
@@ -59,6 +59,6 @@ app.include_router(accounts.router, prefix="/api/v1", tags=["Accounts"])
 async def health_check():
     return {
         "status": "ok",
-        "service": "crypto-scalping-bot-v2",
-        "version": "2.0.0",
+        "service": "crypto-trading-bot-v5",
+        "version": "5.5.0",
     }
