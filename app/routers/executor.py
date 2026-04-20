@@ -32,6 +32,7 @@ from app.config import settings
 from app.database import async_session
 from app.models.user import Account
 from app.models.trading import Signal, Trade, TradeSkip
+from app.utils.subscription_guard import check_account_eligible
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -420,6 +421,19 @@ async def execute_multi_account(req: MultiExecuteRequest):
             internal_label = f"account_{acc_id}"
 
             try:
+                # ── 0. V6: Subscription + Ban pre-check ─────────────
+                if acc_id > 0:  # Skip for master/fallback account (id=0)
+                    try:
+                        async with async_session() as sub_session:
+                            eligibility = await check_account_eligible(sub_session, acc_id)
+                            if not eligibility["eligible"]:
+                                reason = eligibility["reason"]
+                                logger.info(f"  [{internal_label}] SKIPPED: {reason}")
+                                return _skip(acc_id, reason, reason)
+                    except Exception as sub_err:
+                        logger.warning(f"  [{internal_label}] Subscription check error: {sub_err}")
+                        # On check error, allow trade to proceed
+
                 # ── 1. Create executor with account's credentials ─────
                 if acc_data["api_key_enc"]:
                     api_key = decrypt_api_key(acc_data["api_key_enc"])

@@ -243,3 +243,43 @@ CREATE TABLE IF NOT EXISTS news_events_cache (
 CREATE INDEX IF NOT EXISTS idx_news_event_id ON news_events_cache(event_id);
 CREATE INDEX IF NOT EXISTS idx_news_created ON news_events_cache(created_at);
 
+-- ═══════════════════════════════════════════════════════════════════════
+-- V6 SaaS Foundation — Database Upgrade
+-- Safe: all ADD COLUMN IF NOT EXISTS, CREATE TABLE IF NOT EXISTS
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- V6: Extend users table for auth
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_banned BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login TIMESTAMP;
+
+-- V6: Extend accounts table for bot control
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS bot_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS last_sync TIMESTAMP;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS api_valid BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS last_error TEXT;
+
+-- V6: Extend subscriptions table for SaaS
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS plan_name VARCHAR(100);
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS price DOUBLE PRECISION;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS start_date TIMESTAMP;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS end_date TIMESTAMP;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS added_by_admin BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS notes TEXT;
+
+-- V6: Extend audit_logs table
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS admin_email VARCHAR(255);
+ALTER TABLE audit_logs ADD COLUMN IF NOT EXISTS target_user_id INTEGER;
+
+-- V6: Create payments table
+CREATE TABLE IF NOT EXISTS payments (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    amount DOUBLE PRECISION NOT NULL,
+    verified_by_admin BOOLEAN NOT NULL DEFAULT FALSE,
+    notes TEXT,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id);
+CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_at);

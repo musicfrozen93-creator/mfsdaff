@@ -1,5 +1,7 @@
 """
 System ORM Models — Settings, Subscriptions, Audit Logs
+V6: Extended Subscription (plan_name, price, start_date, end_date, added_by_admin, notes)
+    Extended AuditLog (admin_email, target_user_id)
 """
 
 from datetime import datetime
@@ -31,10 +33,21 @@ class Subscription(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+
+    # Original fields (kept for backward compatibility)
     plan = Column(String(50), default="free", nullable=False)  # free | basic | pro
     status = Column(String(20), default="active", nullable=False)  # active | expired | cancelled
     max_accounts = Column(Integer, default=1, nullable=False)
     expires_at = Column(DateTime, nullable=True)
+
+    # V6: Extended subscription fields
+    plan_name = Column(String(100), nullable=True)     # Human-readable plan name
+    price = Column(Float, nullable=True)               # Subscription price
+    start_date = Column(DateTime, nullable=True)       # When subscription started
+    end_date = Column(DateTime, nullable=True)         # When subscription ends (for expiry check)
+    added_by_admin = Column(Boolean, default=True, nullable=False)  # Admin added manually
+    notes = Column(Text, nullable=True)                # Admin notes
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     # Relationships
@@ -49,6 +62,11 @@ class AuditLog(Base):
     action = Column(String(100), nullable=False)
     details_json = Column(JSON, nullable=True)
     ip_address = Column(String(45), nullable=True)
+
+    # V6: Enhanced audit tracking
+    admin_email = Column(String(255), nullable=True)    # Which admin performed the action
+    target_user_id = Column(Integer, nullable=True)     # Target user of the action
+
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
     # Relationships

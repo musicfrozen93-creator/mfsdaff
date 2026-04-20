@@ -1,5 +1,6 @@
 """
 V5 AI-Powered Multi-Strategy Crypto Futures Trading System
+V6: + Admin Auth, Subscription Guard, Auto-Expiry
 FastAPI Backend — Main Entry Point
 """
 
@@ -9,9 +10,11 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routers import scanner, analyzer, executor, status, accounts
+from app.routers import scanner, analyzer, executor, status, accounts, admin
 from app.utils.logger import setup_logger
 from app.database import init_db, close_db
+from app.utils.seed_admin import seed_admin
+from app.utils.subscription_guard import run_subscription_expiry_check
 
 # Setup logging
 setup_logger()
@@ -22,6 +25,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("🚀 V5 Multi-Strategy Crypto Trading Bot starting up...")
     await init_db()
+    await seed_admin()
+    await run_subscription_expiry_check()
     logger.info("✅ All systems initialized")
     yield
     await close_db()
@@ -35,7 +40,7 @@ app = FastAPI(
         "multi-strategy engines (Scalp/Swing/Sniper), market regime routing, "
         "multi-account support, AI verification, and dynamic risk management."
     ),
-    version="5.5.0",
+    version="6.0.0",
     lifespan=lifespan,
 )
 
@@ -53,12 +58,13 @@ app.include_router(analyzer.router, prefix="/api/v1", tags=["Analyzer"])
 app.include_router(executor.router, prefix="/api/v1", tags=["Executor"])
 app.include_router(status.router,   prefix="/api/v1", tags=["Status"])
 app.include_router(accounts.router, prefix="/api/v1", tags=["Accounts"])
+app.include_router(admin.router,    tags=["Admin"])
 
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "ok",
-        "service": "crypto-trading-bot-v5",
-        "version": "5.5.0",
+        "service": "crypto-trading-bot-v6",
+        "version": "6.0.0",
     }

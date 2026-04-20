@@ -30,6 +30,16 @@ class Settings:
     # ── Encryption ───────────────────────────────────────────────────
     ENCRYPTION_KEY: str = os.getenv("ENCRYPTION_KEY", "")
 
+    # ── Admin Account ────────────────────────────────────────────────
+    ADMIN_EMAIL: str = os.getenv("ADMIN_EMAIL", "")
+    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "")
+
+    # ── JWT Authentication ───────────────────────────────────────────
+    # REQUIRED: No default — must be set in .env for security
+    JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", "")
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))  # 8 hours
+
     # ── Telegram ─────────────────────────────────────────────────────
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
