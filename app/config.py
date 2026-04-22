@@ -63,17 +63,18 @@ class Settings:
 
     # ── Risk controls ────────────────────────────────────────────────
     MAX_VOLATILITY_PCT: float = float(os.getenv("MAX_VOLATILITY_PCT", "5.0"))
-    DAILY_PROFIT_LIMIT_PCT: float = float(os.getenv("DAILY_PROFIT_LIMIT_PCT", "7.0"))
-    DAILY_LOSS_LIMIT_PCT: float = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "-8.0"))
+    # V7: Updated daily PnL limits (user config: +4%/+6%/-3%)
+    DAILY_PROFIT_LIMIT_PCT: float = float(os.getenv("DAILY_PROFIT_LIMIT_PCT", "6.0"))   # V7: hard stop (was 7%)
+    DAILY_LOSS_LIMIT_PCT: float = float(os.getenv("DAILY_LOSS_LIMIT_PCT", "-3.0"))      # V7: max loss (was -8%)
     LOSS_COOLDOWN_COUNT: int = int(os.getenv("LOSS_COOLDOWN_COUNT", "3"))
     LOSS_COOLDOWN_MINUTES: int = int(os.getenv("LOSS_COOLDOWN_MINUTES", "15"))
-    DRAWDOWN_PAUSE_PCT: float = float(os.getenv("DRAWDOWN_PAUSE_PCT", "-10.0"))
+    DRAWDOWN_PAUSE_PCT: float = float(os.getenv("DRAWDOWN_PAUSE_PCT", "-5.0"))          # V7: tighter (was -10%)
 
-    # ── V3 Daily Guard (per-account) ─────────────────────────────────
-    DAILY_SAFE_MODE_PCT: float = float(os.getenv("DAILY_SAFE_MODE_PCT", "5.0"))
-    DAILY_LOSS_REDUCE_PCT: float = float(os.getenv("DAILY_LOSS_REDUCE_PCT", "5.0"))
+    # ── V7 Daily Guard (per-account) ─────────────────────────────────
+    DAILY_SAFE_MODE_PCT: float = float(os.getenv("DAILY_SAFE_MODE_PCT", "4.0"))         # V7: lock at +4% (was +5%)
+    DAILY_LOSS_REDUCE_PCT: float = float(os.getenv("DAILY_LOSS_REDUCE_PCT", "2.0"))     # V7: reduce size at -2%
     CONSECUTIVE_LOSS_REDUCE_THRESHOLD: int = int(os.getenv("CONSECUTIVE_LOSS_REDUCE_THRESHOLD", "2"))
-    CONSECUTIVE_LOSS_PAUSE_THRESHOLD: int = int(os.getenv("CONSECUTIVE_LOSS_PAUSE_THRESHOLD", "4"))
+    CONSECUTIVE_LOSS_PAUSE_THRESHOLD: int = int(os.getenv("CONSECUTIVE_LOSS_PAUSE_THRESHOLD", "3"))  # V7: pause at 3 (was 4)
     CONSECUTIVE_LOSS_PAUSE_MINUTES: int = int(os.getenv("CONSECUTIVE_LOSS_PAUSE_MINUTES", "60"))
 
     # ── V3 Pre-entry checks ──────────────────────────────────────────
@@ -119,6 +120,12 @@ class Settings:
 
     # ── V5 External APIs (free) ──────────────────────────────────────
     CRYPTOPANIC_API_KEY: str = os.getenv("CRYPTOPANIC_API_KEY", "")
+
+    # ── V7 Settings ──────────────────────────────────────────────────
+    V7_MAX_LEVERAGE: int = int(os.getenv("V7_MAX_LEVERAGE", "7"))             # Max leverage cap
+    V7_PER_COIN_COOLDOWN_LOSSES: int = int(os.getenv("V7_PER_COIN_COOLDOWN_LOSSES", "3"))
+    V7_PER_COIN_COOLDOWN_HOURS: int = int(os.getenv("V7_PER_COIN_COOLDOWN_HOURS", "48"))
+    V7_PER_COIN_COOLDOWN_DAYS: int = int(os.getenv("V7_PER_COIN_COOLDOWN_DAYS", "7"))
 
     def __post_init__(self):
         self.EXCLUDED_COINS = []

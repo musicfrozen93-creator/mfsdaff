@@ -179,3 +179,63 @@ class NewsEventCache(Base):
     processed = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# V7 NEW MODELS — Adaptive Learning System
+# ═══════════════════════════════════════════════════════════════════════
+
+class StrategyRegistry(Base):
+    """
+    V7: Strategy catalog with performance tracking and adaptive weights.
+    Contains 9 starter strategies that the learning engine ranks.
+    """
+    __tablename__ = "strategy_registry"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    strategy_id = Column(String(50), unique=True, nullable=False, index=True)  # scalp_trend_pullback
+    method = Column(String(20), nullable=False)                     # scalp | swing | snipe
+    name = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    is_active = Column(Boolean, default=True)
+    weight = Column(Float, default=1.0)                            # Adaptive weight (0.3 - 1.3)
+    total_trades = Column(Integer, default=0)
+    wins = Column(Integer, default=0)
+    losses = Column(Integer, default=0)
+    win_rate = Column(Float, default=0.0)
+    avg_pnl = Column(Float, default=0.0)
+    total_pnl = Column(Float, default=0.0)
+    profit_factor = Column(Float, default=0.0)
+    max_drawdown = Column(Float, default=0.0)
+    best_regime = Column(String(30), nullable=True)                # Best-performing regime
+    best_symbols = Column(JSON, nullable=True)                     # Top 5 symbols
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class TradeMemory(Base):
+    """
+    V7: Extended trade result storage for learning engine.
+    Stores richer data than StrategyResult for advanced analysis.
+    """
+    __tablename__ = "trade_memory"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    strategy_id = Column(String(50), nullable=False, index=True)   # Links to strategy_registry.strategy_id
+    method = Column(String(20), nullable=False)                    # scalp | swing | snipe
+    symbol = Column(String(20), nullable=False, index=True)
+    market_regime = Column(String(30), nullable=True)
+    side = Column(String(10), nullable=False)
+    entry_price = Column(Float, nullable=True)
+    exit_price = Column(Float, nullable=True)
+    tp_result = Column(String(20), nullable=True)                  # hit | missed | partial
+    sl_result = Column(String(20), nullable=True)                  # hit | missed
+    pnl_pct = Column(Float, nullable=True)
+    won = Column(Boolean, nullable=True)
+    duration_minutes = Column(Integer, nullable=True)
+    btc_trend = Column(String(20), nullable=True)
+    confidence = Column(Integer, nullable=True)
+    confidence_breakdown = Column(JSON, nullable=True)             # V7 pillar scores
+    setup_grade = Column(String(5), nullable=True)
+    emergency_closed = Column(Boolean, default=False)              # V7: was it emergency closed?
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+

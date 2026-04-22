@@ -27,6 +27,7 @@ import numpy as np
 
 from app.config import settings
 from app.utils.serialization import clean_json_types
+from app.modules.confidence_engine import confidence_engine, ConfidenceResult
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +218,7 @@ class ScalpingEngine:
             return False
         return body > atr * 2
 
-    # ─── V3 Layer 1: Technical Rules Engine (10-Condition Confluence) ─
+    # ─── V7 Layer 1: Weighted Confidence Engine (replaces 10-point confluence) ─
 
     def _evaluate_confluence(
         self,
@@ -237,99 +238,63 @@ class ScalpingEngine:
         is_pullback: bool,
         is_rejection: bool,
         is_chase: bool,
+        # V7: Additional params for weighted scoring
+        volume_ratio: float = 1.0,
+        body: float = 0.0,
+        atr: float = 0.0,
+        high: float = 0.0,
+        low: float = 0.0,
+        open_price: float = 0.0,
+        close_price: float = 0.0,
+        btc_trend: str = "",
     ) -> tuple[str, int, str]:
         """
-        V3 Layered confluence scoring — 10 conditions.
-        Returns (action, confidence, reason).
+        V7: Weighted confluence scoring using 6-pillar confidence engine.
+        Returns (action, confidence, reason). Score is 0-100, HARD CLAMPED.
         """
-        # ── AVOID conditions (hard blocks) ───────────────────────────
-        if is_choppy:
-            return "HOLD", 0, "Sideways chop detected — EMAs too close"
-        if spread_pct > settings.MAX_SPREAD_ENTRY_PCT:
-            return "HOLD", 0, f"Spread too high: {spread_pct:.3f}% > {settings.MAX_SPREAD_ENTRY_PCT}%"
-        if atr_pct > settings.MAX_VOLATILITY_PCT:
-            return "HOLD", 0, f"Extreme volatility: ATR%={atr_pct:.2f}%"
+        ema_dist_pct = float(
+            abs(ema_fast - ema_slow) / ema_slow * 100
+        ) if ema_slow > 0 else 0.0
 
-        # ── LONG conditions (10 total) ───────────────────────────────
-        long_conditions = {
-            "ema_cross": ema_fast > ema_slow,
-            "above_vwap": price > vwap,
-            "rsi_range": 52 <= rsi <= 68,
-            "volume_spike": volume_spike,
-            "spread_ok": spread_pct < settings.MAX_SPREAD_ENTRY_PCT,
-            "volatility_ok": atr_pct < settings.MAX_VOLATILITY_PCT,
-            "candle_bullish": candle_type == "BULLISH",
-            "htf_bullish": htf_trend == "BULLISH",
-            "macd_bullish": macd_crossover == "BULLISH" or macd_crossover == "NONE",  # Not bearish
-            "bb_favorable": bb_position != "UPPER",  # Not overbought at upper band
-        }
+        # Try both sides and pick the stronger one
+        long_result = confidence_engine.calculate(
+            side="BUY",
+            ema_fast=ema_fast, ema_slow=ema_slow, price=price,
+            ema_dist_pct=ema_dist_pct,
+            volume_ratio=volume_ratio, volume_spike=volume_spike,
+            rsi=rsi, macd_crossover=macd_crossover, candle_type=candle_type,
+            bb_position=bb_position, is_pullback=is_pullback,
+            is_rejection=is_rejection, vwap=vwap,
+            htf_trend=htf_trend, btc_trend=btc_trend,
+            spread_pct=spread_pct,
+            body=body, atr=atr, atr_pct=atr_pct,
+            high=high, low=low, open_price=open_price, close_price=close_price,
+        )
 
-        # ── SHORT conditions (10 total) ──────────────────────────────
-        short_conditions = {
-            "ema_cross": ema_fast < ema_slow,
-            "below_vwap": price < vwap,
-            "rsi_range": 32 <= rsi <= 48,
-            "volume_spike": volume_spike,
-            "spread_ok": spread_pct < settings.MAX_SPREAD_ENTRY_PCT,
-            "volatility_ok": atr_pct < settings.MAX_VOLATILITY_PCT,
-            "candle_bearish": candle_type == "BEARISH",
-            "htf_bearish": htf_trend == "BEARISH",
-            "macd_bearish": macd_crossover == "BEARISH" or macd_crossover == "NONE",
-            "bb_favorable": bb_position != "LOWER",  # Not oversold at lower band
-        }
+        short_result = confidence_engine.calculate(
+            side="SELL",
+            ema_fast=ema_fast, ema_slow=ema_slow, price=price,
+            ema_dist_pct=ema_dist_pct,
+            volume_ratio=volume_ratio, volume_spike=volume_spike,
+            rsi=rsi, macd_crossover=macd_crossover, candle_type=candle_type,
+            bb_position=bb_position, is_pullback=is_pullback,
+            is_rejection=is_rejection, vwap=vwap,
+            htf_trend=htf_trend, btc_trend=btc_trend,
+            spread_pct=spread_pct,
+            body=body, atr=atr, atr_pct=atr_pct,
+            high=high, low=low, open_price=open_price, close_price=close_price,
+        )
 
-        long_score = sum(1 for v in long_conditions.values() if v)
-        short_score = sum(1 for v in short_conditions.values() if v)
-        total_conditions = 10
-
-        # V3: Minimum 6/10 conditions for signal (up from 5/8)
-        min_conditions = 6
-
-        # ── Decision logic ───────────────────────────────────────────
-        if long_score >= min_conditions and long_score > short_score:
-            confidence = int(50 + (long_score / total_conditions) * 50)
-            passed = [k for k, v in long_conditions.items() if v]
-            failed = [k for k, v in long_conditions.items() if not v]
-            reason = f"LONG confluence {long_score}/{total_conditions}: {', '.join(passed)}"
-            if failed:
-                reason += f" | Missing: {', '.join(failed)}"
-
-            # V3: Pullback bonus
-            if is_pullback:
-                confidence = min(confidence + 5, 98)
-                reason += " | ✅ Pullback entry"
-
-            # V3: Chase penalty
-            if is_chase:
-                confidence = max(confidence - 15, 50)
-                reason += " | ⚠️ Chase detected"
-
-            return "BUY", min(confidence, 98), reason
-
-        elif short_score >= min_conditions and short_score > long_score:
-            confidence = int(50 + (short_score / total_conditions) * 50)
-            passed = [k for k, v in short_conditions.items() if v]
-            failed = [k for k, v in short_conditions.items() if not v]
-            reason = f"SHORT confluence {short_score}/{total_conditions}: {', '.join(passed)}"
-            if failed:
-                reason += f" | Missing: {', '.join(failed)}"
-
-            # V3: Rejection bonus
-            if is_rejection:
-                confidence = min(confidence + 5, 98)
-                reason += " | ✅ Rejection entry"
-
-            # V3: Chase penalty
-            if is_chase:
-                confidence = max(confidence - 15, 50)
-                reason += " | ⚠️ Chase detected"
-
-            return "SELL", min(confidence, 98), reason
-
+        # Pick the best side
+        if long_result.score >= short_result.score and long_result.score >= 60:
+            action = "BUY" if not long_result.rejected else "HOLD"
+            return action, long_result.score, long_result.reason
+        elif short_result.score >= 60:
+            action = "SELL" if not short_result.rejected else "HOLD"
+            return action, short_result.score, short_result.reason
         else:
-            best = max(long_score, short_score)
-            return "HOLD", max(20, int(best / total_conditions * 40)), \
-                f"Insufficient confluence: L={long_score}/10, S={short_score}/10"
+            best = max(long_result.score, short_result.score)
+            return "HOLD", best, f"Insufficient confidence: L={long_result.score}, S={short_result.score}"
 
     # ─── Layer 2: OpenAI Verification ─────────────────────────────────
 
@@ -437,18 +402,22 @@ class ScalpingEngine:
     # ─── V3: Setup Grade ──────────────────────────────────────────────
 
     @staticmethod
-    def determine_setup_grade(conditions_passed: int, volume_spike: bool) -> str:
+    def determine_setup_grade(confidence: int, volume_spike: bool = False) -> str:
         """
-        A = Elite (8+/10 conditions, volume spike present)
-        B = Strong (7/10 or 8+/10 without volume spike)
-        C = Standard (6/10)
+        V7: Setup grade based on confidence tiers.
+        A = Elite (90+)
+        B = Strong (80-89) or Tradable with volume spike
+        C = Standard (70-79)
+        D = Weak (60-69)
         """
-        if conditions_passed >= 8 and volume_spike:
+        if confidence >= 90:
             return "A"
-        elif conditions_passed >= 7:
+        elif confidence >= 80 or (confidence >= 75 and volume_spike):
             return "B"
-        else:
+        elif confidence >= 70:
             return "C"
+        else:
+            return "D"
 
     async def analyze(
         self, symbol: str, spread_pct: float = 0.0,
@@ -562,6 +531,10 @@ class ScalpingEngine:
                 htf_trend=htf_trend, is_choppy=is_choppy,
                 macd_crossover=macd_crossover, bb_position=bb_position,
                 is_pullback=is_pullback, is_rejection=is_rejection, is_chase=is_chase,
+                # V7: Additional params for weighted scoring
+                volume_ratio=volume_ratio, body=body, atr=atr,
+                high=h, low=l, open_price=o, close_price=c,
+                btc_trend=regime,  # Use regime as BTC trend context
             )
 
             # Strategy 2: Breakout Momentum
@@ -592,20 +565,12 @@ class ScalpingEngine:
             else:
                 tech_action, tech_confidence, tech_reason = best_action, best_conf, best_reason
 
-            # Count conditions for setup grade (from trend pullback)
-            if tech_action in ("BUY", "SELL"):
-                try:
-                    parts = trend_result[2].split("/10")[0].split()
-                    conditions_passed = int(parts[-1]) if parts else 6
-                except Exception:
-                    conditions_passed = 6
-            else:
-                conditions_passed = 0
-
-            setup_grade = self.determine_setup_grade(conditions_passed, volume_spike)
+            # V7: Setup grade from confidence score (not conditions count)
+            conditions_passed = tech_confidence  # For backward compat in AIDecision
+            setup_grade = self.determine_setup_grade(tech_confidence, volume_spike)
 
             logger.info(
-                f"  V5 Strategies: trend={trend_result[0]}/{trend_result[1]} "
+                f"  V7 Strategies: trend={trend_result[0]}/{trend_result[1]} "
                 f"breakout={breakout_result[0]}/{breakout_result[1]} "
                 f"reversal={reversal_result[0]}/{reversal_result[1]} "
                 f"→ best={strategy_type} {tech_action}/{tech_confidence} grade={setup_grade}"
@@ -675,7 +640,7 @@ class ScalpingEngine:
 
                     if ai_action == tech_action:
                         combined_confidence = int((tech_confidence * 0.6) + (ai_confidence * 0.4))
-                        decision.confidence = min(combined_confidence, 98)
+                        decision.confidence = min(combined_confidence, 100)  # V7: cap at 100
                         decision.reason = f"{tech_reason} | AI confirms: {ai_reason}"
                     elif ai_action == "HOLD":
                         decision.confidence = max(tech_confidence - 15, 50)
@@ -742,7 +707,7 @@ class ScalpingEngine:
                 score += 5
 
             if score >= 65:
-                return "BUY", min(score, 98), f"Breakout above {recent_resistance:.4f} | vol={volume_ratio:.1f}x"
+                return "BUY", min(score, 100), f"Breakout above {recent_resistance:.4f} | vol={volume_ratio:.1f}x"
 
         # SHORT breakout: price below recent support
         elif price < recent_support:
@@ -761,7 +726,7 @@ class ScalpingEngine:
                 score += 5
 
             if score >= 65:
-                return "SELL", min(score, 98), f"Breakdown below {recent_support:.4f} | vol={volume_ratio:.1f}x"
+                return "SELL", min(score, 100), f"Breakdown below {recent_support:.4f} | vol={volume_ratio:.1f}x"
 
         return "HOLD", 0, "No breakout detected"
 
@@ -794,7 +759,7 @@ class ScalpingEngine:
                 score += 5
 
             if score >= 65:
-                return "BUY", min(score, 98), f"Range reversal at lower BB | RSI={rsi:.0f}"
+                return "BUY", min(score, 100), f"Range reversal at lower BB | RSI={rsi:.0f}"
 
         # SHORT reversal at upper BB / overbought
         if bb_position == "UPPER" and rsi > 65:
@@ -811,7 +776,7 @@ class ScalpingEngine:
                 score += 5
 
             if score >= 65:
-                return "SELL", min(score, 98), f"Range reversal at upper BB | RSI={rsi:.0f}"
+                return "SELL", min(score, 100), f"Range reversal at upper BB | RSI={rsi:.0f}"
 
         return "HOLD", 0, "No reversal setup"
 
@@ -837,7 +802,7 @@ class ScalpingEngine:
             if action == "HOLD" or conf < 60:
                 continue
             adjusted_conf = int(conf * weight)
-            adjusted_conf = max(50, min(adjusted_conf, 98))
+            adjusted_conf = max(50, min(adjusted_conf, 100))  # V7: cap at 100
             if best is None or adjusted_conf > best[1]:
                 best = (action, adjusted_conf, f"[{name}] {reason}", name)
 

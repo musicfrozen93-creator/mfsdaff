@@ -244,7 +244,7 @@ class TelegramNotifier:
         await self.send(msg)
 
     # ═══════════════════════════════════════════════════════════════════
-    # CRITICAL ALERTS ONLY (kept from V3)
+    # CRITICAL ALERTS (V7: Atomic TP/SL Protection)
     # ═══════════════════════════════════════════════════════════════════
 
     async def tp_sl_failed(
@@ -255,7 +255,7 @@ class TelegramNotifier:
         tp_attached: bool,
         error: str,
     ):
-        """V3: Alert when TP/SL placement fails after 3 retries."""
+        """V7: Alert when TP/SL fails AND emergency close also failed — CRITICAL."""
         failed_items = []
         if not sl_attached:
             failed_items.append("❌ STOP LOSS")
@@ -263,12 +263,43 @@ class TelegramNotifier:
             failed_items.append("❌ TAKE PROFIT")
 
         msg = (
-            f"🚨 <b>TP/SL ATTACHMENT FAILED</b>\n\n"
+            f"🔥 <b>CRITICAL: UNPROTECTED POSITION</b>\n\n"
             f"Symbol: <b>{symbol}</b>\n"
             f"Side: <b>{side}</b>\n"
             f"Failed: {', '.join(failed_items)}\n"
             f"Error: <code>{error[:200]}</code>\n\n"
-            f"⚠️ <b>UNPROTECTED POSITION — Manual action required!</b>"
+            f"🚨 <b>EMERGENCY CLOSE ALSO FAILED!</b>\n"
+            f"⚠️ <b>MANUAL ACTION REQUIRED IMMEDIATELY!</b>"
+        )
+        await self.send(msg)
+
+    async def send_emergency_close(
+        self,
+        symbol: str,
+        side: str,
+        fill_price: float,
+        sl_attached: bool,
+        tp_attached: bool,
+        error: str,
+    ):
+        """V7: Alert when position was emergency-closed due to TP/SL failure."""
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        failed_items = []
+        if not sl_attached:
+            failed_items.append("❌ STOP LOSS")
+        if not tp_attached:
+            failed_items.append("❌ TAKE PROFIT")
+
+        msg = (
+            f"🚨 <b>POSITION EMERGENCY CLOSED</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Entry: <b>${fill_price:,.6f}</b>\n\n"
+            f"<b>Reason:</b> TP/SL attachment failed after all retries\n"
+            f"Failed: {', '.join(failed_items)}\n"
+            f"Error: <code>{error[:150]}</code>\n\n"
+            f"✅ <b>Position was closed to prevent unprotected exposure.</b>\n"
+            f"<i>V7 Atomic Protection: No naked positions allowed.</i>"
         )
         await self.send(msg)
 

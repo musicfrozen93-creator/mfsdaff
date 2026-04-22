@@ -67,6 +67,9 @@ class OrderResult:
     tp2_order_id: Optional[int] = None
     tp1_attached: bool = False
     tp2_attached: bool = False
+    # V7: TP/SL atomic protection
+    tp_sl_protection_failed: bool = False   # True if TP/SL couldn't be attached
+    emergency_closed: bool = False          # True if position was emergency-closed
 
 
 @dataclass
@@ -444,24 +447,52 @@ class BinanceExecutor:
         precision: PrecisionInfo,
     ) -> tuple[Optional[dict], str]:
         """
-        V3: Retry TP/SL placement up to 3 times.
+        V7: Enhanced retry TP/SL placement up to 3 times + 1 hail-mary.
+        - Recalculates precision on -1111 errors (bad precision)
+        - Adds 2s exchange-lag wait between retries
         Returns (order_result, error_message).
         """
         last_error = ""
+        current_precision = precision
+
         for attempt in range(1, TP_SL_MAX_RETRIES + 1):
             try:
-                result = await place_func(symbol, side, stop_price, precision)
+                result = await place_func(symbol, side, stop_price, current_precision)
                 logger.info(f"  ✅ {order_type} placed on attempt {attempt}: #{result.get('orderId')}")
                 return result, ""
             except Exception as e:
                 last_error = str(e)
+                error_str = str(e)
                 logger.warning(
                     f"  ⚠️ {order_type} attempt {attempt}/{TP_SL_MAX_RETRIES} failed: {e}"
                 )
-                if attempt < TP_SL_MAX_RETRIES:
-                    await asyncio.sleep(TP_SL_RETRY_DELAY)
 
-        logger.error(f"  ❌ {order_type} FAILED after {TP_SL_MAX_RETRIES} retries: {last_error}")
+                # V7: On precision errors (-1111), re-fetch precision from exchange
+                if "-1111" in error_str or "precision" in error_str.lower():
+                    try:
+                        logger.info(f"  🔄 V7: Re-fetching precision for {symbol} after -1111 error")
+                        current_precision = await self.get_precision(symbol)
+                    except Exception as pe:
+                        logger.warning(f"  ⚠️ Precision re-fetch failed: {pe}")
+
+                if attempt < TP_SL_MAX_RETRIES:
+                    # V7: 2s exchange-lag wait (longer than original 1s)
+                    await asyncio.sleep(2.0)
+
+        # V7: Final hail-mary attempt after fresh precision fetch + 3s wait
+        try:
+            logger.info(f"  🔄 V7: Hail-mary {order_type} attempt with fresh precision + 3s wait")
+            await asyncio.sleep(3.0)
+            fresh_precision = await self.get_precision(symbol)
+            result = await place_func(symbol, side, stop_price, fresh_precision)
+            logger.info(f"  ✅ {order_type} placed on hail-mary attempt: #{result.get('orderId')}")
+            return result, ""
+        except Exception as e:
+            last_error = str(e)
+            logger.error(
+                f"  ❌ {order_type} FAILED after {TP_SL_MAX_RETRIES} retries + hail-mary: {last_error}"
+            )
+
         return None, last_error
 
     def _get_fill_price(self, order_response: dict) -> float:
@@ -502,6 +533,88 @@ class BinanceExecutor:
 
         logger.warning(f"  ⚠️ Position NOT verified for {symbol} after {max_retries} attempts")
         return None
+
+    # ─── V7: Emergency Close Position ─────────────────────────────────
+
+    async def _emergency_close_position(
+        self, symbol: str, side: str, telegram_notifier=None,
+    ) -> bool:
+        """
+        V7: Emergency market-close a position when TP/SL attachment fails.
+        This prevents naked (unprotected) positions from remaining open.
+
+        Args:
+            symbol: Trading pair
+            side: Original trade side (BUY/SELL) — close side is opposite
+            telegram_notifier: Optional TelegramNotifier for alerts
+
+        Returns: True if position was successfully closed
+        """
+        close_side = "SELL" if side == "BUY" else "BUY"
+        logger.warning(
+            f"  🚨 V7 EMERGENCY CLOSE: Attempting to close {symbol} "
+            f"position (close_side={close_side}) due to TP/SL failure"
+        )
+
+        for attempt in range(1, 4):  # 3 attempts
+            try:
+                # Get current position to know exact quantity
+                position = await self.get_position_for_symbol(symbol)
+                if not position:
+                    logger.info(
+                        f"  ✅ Emergency close: No position found for {symbol} "
+                        f"(may have already been closed)"
+                    )
+                    return True
+
+                pos_amt = abs(float(position.get("positionAmt", 0)))
+                if pos_amt == 0:
+                    logger.info(f"  ✅ Emergency close: Position amount is 0 for {symbol}")
+                    return True
+
+                precision = await self.get_precision(symbol)
+                qty_str = self.format_quantity(pos_amt, precision.quantity_precision)
+
+                # Place market close order with reduceOnly
+                params = {
+                    "symbol": symbol,
+                    "side": close_side,
+                    "type": "MARKET",
+                    "quantity": qty_str,
+                    "reduceOnly": "true",
+                }
+                result = await self._signed_request("POST", "/fapi/v1/order", params)
+                close_order_id = result.get("orderId")
+
+                logger.warning(
+                    f"  🚨 EMERGENCY CLOSE EXECUTED: {symbol} "
+                    f"qty={pos_amt} order=#{close_order_id} (attempt {attempt})"
+                )
+
+                # Also cancel any remaining open orders for this symbol
+                try:
+                    await self._signed_request(
+                        "DELETE", "/fapi/v1/allOpenOrders",
+                        {"symbol": symbol},
+                    )
+                    logger.info(f"  ✅ Cancelled all open orders for {symbol}")
+                except Exception as ce:
+                    logger.warning(f"  ⚠️ Failed to cancel open orders for {symbol}: {ce}")
+
+                return True
+
+            except Exception as e:
+                logger.error(
+                    f"  ❌ Emergency close attempt {attempt}/3 failed for {symbol}: {e}"
+                )
+                if attempt < 3:
+                    await asyncio.sleep(2.0)  # Wait before retry
+
+        logger.critical(
+            f"  🔥 CRITICAL: Emergency close FAILED for {symbol} after 3 attempts! "
+            f"MANUAL INTERVENTION REQUIRED!"
+        )
+        return False
 
     # ─── V4: Full Trade Flow (LIMIT→MARKET Fallback + Position Verify) ──
 
@@ -741,13 +854,67 @@ class BinanceExecutor:
                 error_detail = " | ".join(failure_msg)
                 logger.error(f"  🚨 TP/SL INCOMPLETE for {symbol}: {error_detail}")
 
-                if telegram_notifier:
-                    await telegram_notifier.tp_sl_failed(
-                        symbol=symbol, side=params.side,
-                        sl_attached=sl_attached, tp_attached=tp_attached_status,
-                        error=error_detail,
-                    )
+                # ═══════════════════════════════════════════════════════
+                # V7: ATOMIC TP/SL PROTECTION — EMERGENCY CLOSE
+                # No position is EVER allowed to exist without both TP + SL.
+                # If either failed after all retries → close position immediately.
+                # ═══════════════════════════════════════════════════════
 
+                logger.warning(
+                    f"  🚨 V7 ATOMIC PROTECTION: TP/SL incomplete for {symbol} — "
+                    f"initiating emergency close to prevent naked position"
+                )
+
+                # Cancel any partial TP/SL orders that DID succeed
+                try:
+                    await self._signed_request(
+                        "DELETE", "/fapi/v1/allOpenOrders",
+                        {"symbol": symbol},
+                    )
+                    logger.info(f"  ✅ Cancelled all open orders for {symbol} before emergency close")
+                except Exception as cancel_err:
+                    logger.warning(f"  ⚠️ Failed to cancel open orders: {cancel_err}")
+
+                # Emergency close the position
+                close_success = await self._emergency_close_position(
+                    symbol=symbol, side=params.side, telegram_notifier=telegram_notifier,
+                )
+
+                if telegram_notifier:
+                    if close_success:
+                        await telegram_notifier.send_emergency_close(
+                            symbol=symbol,
+                            side=params.side,
+                            fill_price=fill_price,
+                            sl_attached=sl_attached,
+                            tp_attached=tp_attached_status,
+                            error=error_detail,
+                        )
+                    else:
+                        # CRITICAL: Position is naked AND couldn't be closed
+                        await telegram_notifier.tp_sl_failed(
+                            symbol=symbol, side=params.side,
+                            sl_attached=sl_attached, tp_attached=tp_attached_status,
+                            error=f"CRITICAL: Emergency close also failed! {error_detail}",
+                        )
+
+                return OrderResult(
+                    success=False,
+                    order_id=order_id,
+                    symbol=symbol,
+                    side=params.side,
+                    quantity=params.quantity,
+                    entry_price=params.entry_price,
+                    fill_price=fill_price,
+                    sl_attached=sl_attached,
+                    tp_attached=tp_attached_status,
+                    order_method=order_method,
+                    error=f"V7_ATOMIC_PROTECTION: TP/SL failed → position emergency closed. {error_detail}",
+                    tp_sl_protection_failed=True,
+                    emergency_closed=close_success,
+                )
+
+            # ── TP/SL SUCCESS — Normal completion ────────────────────
             # Summary log
             if partial_tp_used:
                 logger.info(

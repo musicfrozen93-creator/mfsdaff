@@ -1,21 +1,26 @@
 """
-V4 Per-Account Daily Guard — Daily Profit/Loss Limits + Consecutive Loss Control
+V7 Per-Account Daily Guard — Daily Profit/Loss Limits + Consecutive Loss Control
 
 Per-account tracking (NOT global):
-  +5% daily profit → SAFE MODE (91%+ only, 50% size, max 1 more trade)
-  +7% daily profit → STOP trading that account
-  -5% daily loss   → 50% size reduction, elite only
-  -8% daily loss   → STOP trading that account
+  +4% daily profit → SAFE MODE (91%+ only, 50% size, max 1 more trade)
+  +6% daily profit → STOP trading that account (gains locked)
+  -2% daily loss   → 50% size reduction, elite only
+  -3% daily loss   → STOP trading that account
   2 consecutive losses → 30% size reduction
-  4 consecutive losses → 1 hour pause
+  3 consecutive losses → 1 hour pause
 
-V4 Fixes:
+V7 Changes (from V4):
+  - Tighter profit lock: +4% safe mode (was +5%), +6% hard stop (was +7%)
+  - Tighter loss limit: -3% max loss (was -8%)
+  - 3 consecutive losses to pause (was 4)
+  - -2% triggers size reduction (was -5%)
+
+V4 Fixes (kept):
   - PnL=0 + no trades today → ALWAYS allow (never false block)
   - Null / zero starting_balance → auto-fix from current balance
   - Detailed decision logging at every check
   - Timezone-safe UTC reset
   - force_reset() for manual recovery
-  - get_guard_log() for structured internal logging
 
 Resets at UTC midnight.
 """

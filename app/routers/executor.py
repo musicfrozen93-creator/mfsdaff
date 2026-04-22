@@ -27,6 +27,7 @@ from app.modules.executor import BinanceExecutor
 from app.modules.telegram import TelegramNotifier
 from app.modules.crypto_utils import decrypt_api_key
 from app.modules.daily_guard import daily_guard
+from app.modules.strategy_tracker import strategy_tracker  # V7: per-coin cooldown
 from app.utils.state import state_manager
 from app.config import settings
 from app.database import async_session
@@ -240,8 +241,19 @@ async def execute_trade_full(req: FullExecuteRequest):
             "sl_attached": result.sl_attached, "tp_attached": result.tp_attached,
         }
     else:
-        await telegram.error_alert("Trade Execution", result.error or "Unknown error")
-        raise HTTPException(status_code=500, detail=result.error)
+        # V7: Differentiate TP/SL protection failures
+        if getattr(result, 'tp_sl_protection_failed', False):
+            emergency_status = "closed" if getattr(result, 'emergency_closed', False) else "FAILED"
+            # Telegram alert already sent by executor
+            return {
+                "status": "skipped",
+                "reason": f"V7 Atomic Protection: TP/SL failed → position {emergency_status}",
+                "tp_sl_protection_failed": True,
+                "emergency_closed": getattr(result, 'emergency_closed', False),
+            }
+        else:
+            await telegram.error_alert("Trade Execution", result.error or "Unknown error")
+            raise HTTPException(status_code=500, detail=result.error)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -490,6 +502,21 @@ async def execute_multi_account(req: MultiExecuteRequest):
                     logger.warning(f"  [{internal_label}] Position check failed: {pe}")
                     # Don't skip on position check failure — try to trade
 
+                # ── 4.5 V7: Per-coin cooldown check ──────────────────
+                try:
+                    is_cooled, cooldown_reason = await strategy_tracker.check_per_coin_cooldown(
+                        symbol=symbol,
+                        strategy_type=req.strategy_type,
+                        max_losses=settings.V7_PER_COIN_COOLDOWN_LOSSES,
+                        lookback_days=settings.V7_PER_COIN_COOLDOWN_DAYS,
+                        cooldown_hours=settings.V7_PER_COIN_COOLDOWN_HOURS,
+                    )
+                    if is_cooled:
+                        logger.info(f"  [{internal_label}] {cooldown_reason}")
+                        return _skip(acc_id, "Coin Cooldown", cooldown_reason)
+                except Exception as cd_err:
+                    logger.warning(f"  [{internal_label}] Cooldown check failed: {cd_err}")
+
                 # ── 5. Calculate risk parameters ─────────────────────
                 precision = await executor.get_precision(symbol)
 
@@ -505,6 +532,14 @@ async def execute_multi_account(req: MultiExecuteRequest):
                     size_multiplier=size_multiplier,
                     strategy_type=req.strategy_type,
                 )
+
+                # ── 5.5 V7: Enforce max leverage cap ─────────────────
+                if trade_params.leverage > settings.V7_MAX_LEVERAGE:
+                    logger.info(
+                        f"  [{internal_label}] V7: Capping leverage "
+                        f"{trade_params.leverage}x → {settings.V7_MAX_LEVERAGE}x"
+                    )
+                    trade_params.leverage = settings.V7_MAX_LEVERAGE
 
                 if not trade_params.approved:
                     # Categorize reject reason
@@ -534,9 +569,9 @@ async def execute_multi_account(req: MultiExecuteRequest):
                 )
 
                 # ── 7. Execute trade (LIMIT→MARKET fallback in executor) ──
-                result = await executor.execute_trade(trade_params, telegram_notifier=None)
-                # V4: telegram_notifier=None — TP/SL failures logged but
-                # not sent per-account. Will be in the final message.
+                # V7: Pass telegram_notifier so atomic protection can send
+                # emergency close alerts directly from the executor
+                result = await executor.execute_trade(trade_params, telegram_notifier=telegram)
 
                 if result.success:
                     # Save trade to DB
@@ -609,8 +644,21 @@ async def execute_multi_account(req: MultiExecuteRequest):
                         "order_method": best_order_method,
                     }
                 else:
-                    logger.error(f"  ❌ [{internal_label}] Execution error: {result.error}")
-                    return _skip(acc_id, "Exchange Rejected", result.error or "Unknown execution error")
+                    # V7: Differentiate TP/SL protection failures from exchange rejections
+                    if getattr(result, 'tp_sl_protection_failed', False):
+                        emergency_status = "closed" if getattr(result, 'emergency_closed', False) else "FAILED"
+                        logger.error(
+                            f"  🚨 [{internal_label}] V7 ATOMIC PROTECTION: "
+                            f"TP/SL failed → position {emergency_status}"
+                        )
+                        return _skip(
+                            acc_id,
+                            "TP/SL Protection Failed",
+                            f"Position emergency {emergency_status}: {result.error or 'TP/SL attach failed'}",
+                        )
+                    else:
+                        logger.error(f"  ❌ [{internal_label}] Execution error: {result.error}")
+                        return _skip(acc_id, "Exchange Rejected", result.error or "Unknown execution error")
 
             except Exception as e:
                 logger.error(f"  ❌ [{internal_label}] Account failed: {e}", exc_info=True)

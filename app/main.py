@@ -1,6 +1,6 @@
 """
-V5 AI-Powered Multi-Strategy Crypto Futures Trading System
-V6: + Admin Auth, Subscription Guard, Auto-Expiry
+V7 AI-Powered Adaptive Crypto Futures Trading System
+V7: + Confidence Engine, Adaptive Learning, Atomic TP/SL, Risk Guardrails
 FastAPI Backend — Main Entry Point
 """
 
@@ -15,6 +15,7 @@ from app.utils.logger import setup_logger
 from app.database import init_db, close_db
 from app.utils.seed_admin import seed_admin
 from app.utils.subscription_guard import run_subscription_expiry_check
+from app.modules.learning_engine import learning_engine  # V7: Adaptive strategy system
 
 # Setup logging
 setup_logger()
@@ -23,24 +24,26 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 V5 Multi-Strategy Crypto Trading Bot starting up...")
+    logger.info("🚀 V7 Adaptive Crypto Trading Bot starting up...")
     await init_db()
     await seed_admin()
     await run_subscription_expiry_check()
-    logger.info("✅ All systems initialized")
+    # V7: Seed the 9 starter strategies into DB
+    await learning_engine.seed_strategy_registry()
+    logger.info("✅ All V7 systems initialized")
     yield
     await close_db()
-    logger.info("🛑 Crypto Trading Bot shutting down...")
+    logger.info("🛑 V7 Crypto Trading Bot shutting down...")
 
 
 app = FastAPI(
-    title="V5 Multi-Strategy Crypto Futures Trading Bot",
+    title="V7 Adaptive Crypto Futures Trading Bot",
     description=(
-        "Professional automated crypto futures trading system with "
-        "multi-strategy engines (Scalp/Swing/Sniper), market regime routing, "
-        "multi-account support, AI verification, and dynamic risk management."
+        "Production-grade automated crypto futures trading system with "
+        "V7 confidence engine, adaptive strategy learning, atomic TP/SL protection, "
+        "multi-account support, AI verification, and configurable risk guardrails."
     ),
-    version="6.0.0",
+    version="7.0.0",
     lifespan=lifespan,
 )
 
@@ -65,6 +68,6 @@ app.include_router(admin.router,    tags=["Admin"])
 async def health_check():
     return {
         "status": "ok",
-        "service": "crypto-trading-bot-v6",
-        "version": "6.0.0",
+        "service": "crypto-trading-bot-v7",
+        "version": "7.0.0",
     }

@@ -376,6 +376,208 @@ class StrategyTracker:
         except Exception as e:
             logger.warning(f"Failed to update daily stats: {e}")
 
+    # ═══════════════════════════════════════════════════════════════════
+    # V7: Rolling Score + Best Coin Pairings + Enhanced Cooldown
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def get_rolling_score(
+        self, strategy_type: str, window: int = 20,
+    ) -> dict:
+        """
+        V7: Calculate rolling performance score for a strategy
+        over the last N trades. Used by learning engine for ranking.
+        
+        Returns: {score, win_rate, avg_pnl, trades, profit_factor}
+        """
+        try:
+            async with async_session() as session:
+                result = await session.execute(
+                    select(StrategyResult).where(
+                        StrategyResult.strategy_type == strategy_type
+                    ).order_by(StrategyResult.created_at.desc()).limit(window)
+                )
+                entries = list(result.scalars().all())
+
+                if not entries:
+                    return {
+                        "score": 50.0, "win_rate": 0, "avg_pnl": 0,
+                        "trades": 0, "profit_factor": 0,
+                    }
+
+                total = len(entries)
+                wins = sum(1 for e in entries if e.won)
+                pnls = [e.pnl or 0 for e in entries]
+                gross_profit = sum(p for p in pnls if p > 0)
+                gross_loss = sum(abs(p) for p in pnls if p < 0)
+
+                win_rate = round(wins / total * 100, 1) if total > 0 else 0
+                avg_pnl = round(sum(pnls) / total, 4) if total > 0 else 0
+                profit_factor = round(
+                    gross_profit / gross_loss, 2
+                ) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0)
+
+                # Composite score: (win_rate * 0.4) + (pf_score * 0.4) + (consistency * 0.2)
+                wr_score = min(win_rate, 100)
+                pf_score = min(profit_factor * 30, 100)  # PF of 3.3+ = 100
+                # Consistency: fewer max drawdown runs = better
+                max_dd = self._calc_max_drawdown(pnls)
+                dd_score = max(0, 100 - max_dd * 20)  # 5% DD = 0
+
+                composite = round(
+                    (wr_score * 0.4) + (pf_score * 0.4) + (dd_score * 0.2), 1
+                )
+
+                return {
+                    "score": composite,
+                    "win_rate": win_rate,
+                    "avg_pnl": avg_pnl,
+                    "trades": total,
+                    "profit_factor": profit_factor,
+                    "max_drawdown": round(max_dd, 4),
+                }
+
+        except Exception as e:
+            logger.warning(f"Failed to get rolling score for {strategy_type}: {e}")
+            return {"score": 50.0, "win_rate": 0, "avg_pnl": 0, "trades": 0, "profit_factor": 0}
+
+    async def get_best_coin_pairings(
+        self, strategy_type: str, top_n: int = 5,
+    ) -> list[dict]:
+        """
+        V7: Get the best-performing coin pairings for a strategy.
+        Returns top N symbols sorted by win rate + avg PnL.
+        """
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+            async with async_session() as session:
+                result = await session.execute(
+                    select(StrategyResult).where(
+                        and_(
+                            StrategyResult.strategy_type == strategy_type,
+                            StrategyResult.created_at >= cutoff,
+                        )
+                    )
+                )
+                entries = result.scalars().all()
+
+                # Group by symbol
+                symbol_stats = {}
+                for e in entries:
+                    sym = e.symbol or "UNKNOWN"
+                    if sym not in symbol_stats:
+                        symbol_stats[sym] = {"wins": 0, "losses": 0, "total_pnl": 0.0}
+                    symbol_stats[sym]["total_pnl"] += (e.pnl or 0)
+                    if e.won:
+                        symbol_stats[sym]["wins"] += 1
+                    else:
+                        symbol_stats[sym]["losses"] += 1
+
+                # Score and sort
+                ranked = []
+                for sym, data in symbol_stats.items():
+                    total = data["wins"] + data["losses"]
+                    if total < 2:
+                        continue  # Need at least 2 trades
+                    wr = data["wins"] / total * 100
+                    avg_pnl = data["total_pnl"] / total
+                    # Score: win_rate * 0.6 + (avg_pnl normalized) * 0.4
+                    score = wr * 0.6 + min(avg_pnl * 100, 50) * 0.4
+                    ranked.append({
+                        "symbol": sym,
+                        "trades": total,
+                        "win_rate": round(wr, 1),
+                        "avg_pnl": round(avg_pnl, 4),
+                        "total_pnl": round(data["total_pnl"], 4),
+                        "score": round(score, 1),
+                    })
+
+                ranked.sort(key=lambda x: x["score"], reverse=True)
+                return ranked[:top_n]
+
+        except Exception as e:
+            logger.warning(f"Failed to get best coin pairings: {e}")
+            return []
+
+    async def check_per_coin_cooldown(
+        self, symbol: str, strategy_type: str = "",
+        max_losses: int = 3, lookback_days: int = 7,
+        cooldown_hours: int = 48,
+    ) -> tuple[bool, str]:
+        """
+        V7: Enhanced per-coin cooldown — checks consecutive losses
+        for a specific symbol, optionally filtered by strategy.
+        
+        Returns: (is_cooled_down, reason)
+        """
+        try:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+            async with async_session() as session:
+                query = select(Trade).where(
+                    and_(
+                        Trade.symbol == symbol,
+                        Trade.created_at >= cutoff,
+                        Trade.status == "closed",
+                    )
+                )
+                if strategy_type:
+                    query = query.where(Trade.strategy_type == strategy_type)
+
+                result = await session.execute(
+                    query.order_by(Trade.created_at.desc())
+                )
+                trades = result.scalars().all()
+
+                if not trades:
+                    return False, ""
+
+                # Count recent losses
+                recent_losses = [t for t in trades if (t.pnl or 0) < 0]
+
+                # Check total losses in window
+                if len(recent_losses) >= max_losses:
+                    last_loss = recent_losses[0]
+                    cooldown_end = last_loss.created_at + timedelta(hours=cooldown_hours)
+                    now = datetime.now(timezone.utc)
+
+                    if now < cooldown_end:
+                        remaining = cooldown_end - now
+                        hours = int(remaining.total_seconds() / 3600)
+                        reason = (
+                            f"🧊 {symbol} cooldown: {len(recent_losses)} losses "
+                            f"in {lookback_days}d. {hours}h remaining"
+                        )
+                        logger.info(f"  {reason}")
+                        return True, reason
+
+                # V7: Also check consecutive losses (even if < max_losses)
+                consecutive = 0
+                for t in trades:
+                    if (t.pnl or 0) < 0:
+                        consecutive += 1
+                    else:
+                        break  # Stop at first win
+
+                if consecutive >= max_losses:
+                    last_loss = trades[0]
+                    cooldown_end = last_loss.created_at + timedelta(hours=cooldown_hours)
+                    now = datetime.now(timezone.utc)
+
+                    if now < cooldown_end:
+                        remaining = cooldown_end - now
+                        hours = int(remaining.total_seconds() / 3600)
+                        reason = (
+                            f"🧊 {symbol} streak cooldown: {consecutive} consecutive "
+                            f"losses. {hours}h remaining"
+                        )
+                        logger.info(f"  {reason}")
+                        return True, reason
+
+        except Exception as e:
+            logger.warning(f"Per-coin cooldown check failed for {symbol}: {e}")
+
+        return False, ""
+
 
 # Singleton
 strategy_tracker = StrategyTracker()
+
