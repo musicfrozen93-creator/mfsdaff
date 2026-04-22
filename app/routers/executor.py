@@ -28,6 +28,7 @@ from app.modules.telegram import TelegramNotifier
 from app.modules.crypto_utils import decrypt_api_key
 from app.modules.daily_guard import daily_guard
 from app.modules.strategy_tracker import strategy_tracker  # V7: per-coin cooldown
+from app.modules.learning_engine import learning_engine      # V7: adaptive learning
 from app.utils.state import state_manager
 from app.config import settings
 from app.database import async_session
@@ -575,6 +576,7 @@ async def execute_multi_account(req: MultiExecuteRequest):
 
                 if result.success:
                     # Save trade to DB
+                    trade_db_id = None
                     try:
                         async with async_session() as session:
                             trade = Trade(
@@ -597,8 +599,31 @@ async def execute_multi_account(req: MultiExecuteRequest):
                             )
                             session.add(trade)
                             await session.commit()
+                            await session.refresh(trade)
+                            trade_db_id = trade.id
                     except Exception as dbe:
                         logger.warning(f"  [{internal_label}] Failed to save trade to DB: {dbe}")
+
+                    # V7: Notify learning engine — trade opened
+                    try:
+                        await learning_engine.record_trade(
+                            strategy_id=req.strategy_type,
+                            method="scalp" if "scalp" in req.strategy_type else (
+                                "swing" if "swing" in req.strategy_type else "snipe"
+                            ),
+                            symbol=symbol,
+                            side=side,
+                            market_regime=req.regime,
+                            entry_price=result.fill_price or entry_price,
+                            exit_price=None,           # Not closed yet
+                            pnl_pct=None,              # Not closed yet
+                            won=None,                  # Not closed yet
+                            confidence=req.confidence,
+                            btc_trend=req.regime,
+                            setup_grade=trade_params.setup_grade,
+                        )
+                    except Exception as le:
+                        logger.debug(f"  [{internal_label}] Learning engine record failed: {le}")
 
                     # Track best result for Telegram message
                     if result.fill_price > 0:

@@ -239,3 +239,32 @@ class TradeMemory(Base):
     emergency_closed = Column(Boolean, default=False)              # V7: was it emergency closed?
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
+
+class DailyPnlLog(Base):
+    """
+    V7: Daily P&L log per account.
+    Persists daily_guard state to DB for historical tracking and restart recovery.
+    """
+    __tablename__ = "daily_pnl_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    account_id = Column(Integer, nullable=False, index=True)
+    date = Column(String(10), nullable=False, index=True)          # YYYY-MM-DD
+    starting_balance = Column(Float, default=0.0)
+    ending_balance = Column(Float, default=0.0)
+    total_pnl = Column(Float, default=0.0)
+    total_pnl_pct = Column(Float, default=0.0)
+    trades_count = Column(Integer, default=0)
+    wins = Column(Integer, default=0)
+    losses = Column(Integer, default=0)
+    best_trade_pnl = Column(Float, default=0.0)
+    worst_trade_pnl = Column(Float, default=0.0)
+    max_consecutive_losses = Column(Integer, default=0)
+    was_stopped = Column(Boolean, default=False)
+    stop_reason = Column(String(200), nullable=True)
+    was_safe_mode = Column(Boolean, default=False)
+    regime_distribution = Column(JSON, nullable=True)              # {"TRENDING_BULL": 3, ...}
+    strategy_distribution = Column(JSON, nullable=True)            # {"scalp_trend_pullback": 5, ...}
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+

@@ -14,6 +14,7 @@ V7 Changes (from V4):
   - Tighter loss limit: -3% max loss (was -8%)
   - 3 consecutive losses to pause (was 4)
   - -2% triggers size reduction (was -5%)
+  - DB persistence via DailyPnlLog (survives restarts)
 
 V4 Fixes (kept):
   - PnL=0 + no trades today → ALWAYS allow (never false block)
@@ -25,6 +26,7 @@ V4 Fixes (kept):
 Resets at UTC midnight.
 """
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -286,8 +288,9 @@ class DailyGuard:
 
     # ─── Record Trade Result ─────────────────────────────────────────
 
-    def record_trade(self, account_id: int, pnl: float, balance: float = 0.0):
-        """Record a trade result for daily tracking."""
+    def record_trade(self, account_id: int, pnl: float, balance: float = 0.0,
+                     regime: str = "", strategy_type: str = ""):
+        """Record a trade result for daily tracking + persist to DB."""
         state = self._get_state(account_id, balance)
         state.current_pnl += pnl
         state.trades_today += 1
@@ -323,6 +326,82 @@ class DailyGuard:
             f"W/L: {state.wins_today}/{state.losses_today} | "
             f"Consec losses: {state.consecutive_losses}"
         )
+
+        # V7: Persist to DB asynchronously (fire-and-forget)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(
+                    self._persist_to_db(account_id, state, balance, regime, strategy_type)
+                )
+        except Exception:
+            pass  # Never let DB errors block the trading path
+
+    async def _persist_to_db(
+        self, account_id: int, state, balance: float,
+        regime: str = "", strategy_type: str = "",
+    ):
+        """V7: Persist daily state to DailyPnlLog table."""
+        try:
+            from app.database import async_session
+            from app.models.trading import DailyPnlLog
+            from sqlalchemy import select, and_
+
+            daily_pnl_pct = 0.0
+            if state.starting_balance > 0:
+                daily_pnl_pct = (state.current_pnl / state.starting_balance) * 100
+
+            async with async_session() as session:
+                result = await session.execute(
+                    select(DailyPnlLog).where(
+                        and_(
+                            DailyPnlLog.account_id == account_id,
+                            DailyPnlLog.date == state.date_str,
+                        )
+                    )
+                )
+                log_entry = result.scalar_one_or_none()
+
+                if not log_entry:
+                    log_entry = DailyPnlLog(
+                        account_id=account_id,
+                        date=state.date_str,
+                        starting_balance=state.starting_balance,
+                        regime_distribution={},
+                        strategy_distribution={},
+                    )
+                    session.add(log_entry)
+
+                log_entry.ending_balance = balance
+                log_entry.total_pnl = round(state.current_pnl, 4)
+                log_entry.total_pnl_pct = round(daily_pnl_pct, 2)
+                log_entry.trades_count = state.trades_today
+                log_entry.wins = state.wins_today
+                log_entry.losses = state.losses_today
+                log_entry.max_consecutive_losses = max(
+                    log_entry.max_consecutive_losses or 0,
+                    state.consecutive_losses,
+                )
+                log_entry.was_stopped = state.is_stopped
+                log_entry.stop_reason = state.stop_reason or None
+                log_entry.was_safe_mode = state.is_safe_mode
+
+                # Update distributions
+                if regime:
+                    rd = log_entry.regime_distribution or {}
+                    rd[regime] = rd.get(regime, 0) + 1
+                    log_entry.regime_distribution = rd
+                if strategy_type:
+                    sd = log_entry.strategy_distribution or {}
+                    sd[strategy_type] = sd.get(strategy_type, 0) + 1
+                    log_entry.strategy_distribution = sd
+
+                await session.commit()
+
+        except Exception as e:
+            logger.debug(f"DailyPnlLog persist failed (non-critical): {e}")
+
+
 
     # ─── V4: Force Reset (manual or automatic recovery) ──────────────
 

@@ -28,6 +28,7 @@ from app.modules.market_regime import MarketRegimeRouter
 from app.modules.swing_engine import SwingEngine
 from app.modules.sniper_engine import SniperEngine
 from app.modules.strategy_tracker import strategy_tracker
+from app.modules.telegram import TelegramNotifier
 from app.config import settings
 from app.utils.serialization import clean_json_types
 
@@ -221,6 +222,22 @@ async def analyze_batch(req: BatchAnalyzeRequest):
         if new_setups:
             await swing_engine.save_to_watchlist(new_setups)
             logger.info(f"  🔭 {len(new_setups)} new swing setups saved to watchlist")
+
+            # V7: Telegram alerts for new watchlist entries (best 3 only)
+            try:
+                telegram = TelegramNotifier()
+                for setup in new_setups[:3]:
+                    await telegram.send_watchlisted(
+                        symbol=setup.symbol,
+                        side=setup.side,
+                        setup_type=setup.setup_type,
+                        confidence=setup.confidence,
+                        trigger_price=setup.trigger_price,
+                        current_price=setup.current_price,
+                        reason=setup.reason,
+                    )
+            except Exception as tw_err:
+                logger.debug(f"  Watchlist telegram failed (non-critical): {tw_err}")
 
         # Cleanup old entries
         await swing_engine.cleanup_old()

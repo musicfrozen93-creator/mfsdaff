@@ -126,6 +126,15 @@ class Settings:
     V7_PER_COIN_COOLDOWN_LOSSES: int = int(os.getenv("V7_PER_COIN_COOLDOWN_LOSSES", "3"))
     V7_PER_COIN_COOLDOWN_HOURS: int = int(os.getenv("V7_PER_COIN_COOLDOWN_HOURS", "48"))
     V7_PER_COIN_COOLDOWN_DAYS: int = int(os.getenv("V7_PER_COIN_COOLDOWN_DAYS", "7"))
+    # V7: Confidence thresholds
+    V7_MIN_CONFIDENCE: int = int(os.getenv("V7_MIN_CONFIDENCE", "60"))        # Minimum to trade (weighted score)
+    V7_CONFIDENCE_ELITE_THRESHOLD: int = int(os.getenv("V7_CONFIDENCE_ELITE_THRESHOLD", "90"))  # Elite tier
+    # V7: Dynamic leverage tiers (mapped to confidence)
+    V7_LEVERAGE_LOW: int = int(os.getenv("V7_LEVERAGE_LOW", "3"))             # Confidence 60-69 → 3x
+    V7_LEVERAGE_MID: int = int(os.getenv("V7_LEVERAGE_MID", "5"))             # Confidence 70-84 → 5x
+    V7_LEVERAGE_HIGH: int = int(os.getenv("V7_LEVERAGE_HIGH", "7"))           # Confidence 85+ → 7x
+    # V7: Daily profit lock
+    DAILY_PROFIT_LOCK_PCT: float = float(os.getenv("DAILY_PROFIT_LOCK_PCT", "3.0"))  # Lock gains at +3%
 
     def __post_init__(self):
         self.EXCLUDED_COINS = []

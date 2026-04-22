@@ -5,7 +5,7 @@ from app.models.trading import (
     Signal, Trade, Position, TradeSkip,
     SwingWatchlist, DailyStats, StrategyResult, NewsEventCache,
     # V7: Adaptive Learning
-    StrategyRegistry, TradeMemory,
+    StrategyRegistry, TradeMemory, DailyPnlLog,
 )
 from app.models.system import Setting, Subscription, AuditLog
 from app.models.payment import Payment
@@ -15,7 +15,7 @@ __all__ = [
     "Signal", "Trade", "Position", "TradeSkip",
     "SwingWatchlist", "DailyStats", "StrategyResult", "NewsEventCache",
     # V7
-    "StrategyRegistry", "TradeMemory",
+    "StrategyRegistry", "TradeMemory", "DailyPnlLog",
     "Setting", "Subscription", "AuditLog",
     "Payment",
 ]

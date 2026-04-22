@@ -303,6 +303,79 @@ class TelegramNotifier:
         )
         await self.send(msg)
 
+    # ═══════════════════════════════════════════════════════════════════
+    # V7: Categorized Skip & Watchlist Notifications
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def send_skipped(
+        self,
+        symbol: str,
+        side: str,
+        confidence: int,
+        category: str,
+        reason: str,
+        strategy_type: str = "",
+    ):
+        """
+        V7: Send a categorized skip notification.
+        Categories: Low Confidence, Cooldown, Daily Guard, TP/SL Failed,
+                    Subscription, Insufficient Balance, etc.
+        """
+        category_emojis = {
+            "Low Confidence": "📉",
+            "Cooldown": "🧊",
+            "Coin Cooldown": "🧊",
+            "Daily Guard": "🛡️",
+            "Daily Target Reached": "🎯",
+            "Daily Loss Limit": "🔴",
+            "Loss Cooldown": "⏸️",
+            "TP/SL Protection Failed": "🔥",
+            "Subscription": "🔒",
+            "Insufficient Balance": "💰",
+            "Existing Position": "📌",
+            "Risk Limit": "⚖️",
+            "Exchange Rejected": "❌",
+        }
+        emoji = category_emojis.get(category, "⏭️")
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        strategy_line = f"\nStrategy: <b>{strategy_type}</b>" if strategy_type else ""
+
+        msg = (
+            f"{emoji} <b>SKIPPED — {category}</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Confidence: <b>{confidence}%</b>"
+            f"{strategy_line}\n\n"
+            f"Reason: <i>{reason[:200]}</i>"
+        )
+        await self.send(msg)
+
+    async def send_watchlisted(
+        self,
+        symbol: str,
+        side: str,
+        setup_type: str,
+        confidence: int,
+        trigger_price: float,
+        current_price: float,
+        reason: str = "",
+    ):
+        """V7: Notify when a new swing setup is added to the watchlist."""
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        msg = (
+            f"🔭 <b>WATCHLISTED — Swing Setup</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Type: <b>{setup_type}</b>\n"
+            f"Confidence: <b>{confidence}%</b>\n"
+            f"Current: <b>${current_price:,.6f}</b>\n"
+            f"Trigger: <b>${trigger_price:,.6f}</b>\n\n"
+            f"<i>{reason[:150]}</i>\n"
+            f"<i>Will execute when trigger price is hit + confidence ≥ "
+            f"{confidence}%</i>"
+        )
+        await self.send(msg)
+
     # ─── Error Alert ──────────────────────────────────────────────────
 
     async def error_alert(self, context: str, error: str):
