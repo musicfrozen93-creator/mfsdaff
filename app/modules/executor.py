@@ -1,14 +1,12 @@
 """
-V5.5 Binance Futures Execution Module
-Handles order placement, precision handling, leverage setting,
-multi-account execution, exchange filter caching, TP/SL with retry,
-and pre-entry quality checks.
+V8 Binance Futures Execution Module
 
-V5.5 Changes:
-  - TP/SL execution proof (verify orders exist on exchange after placement)
-  - Full proof logging: order ID, stopPrice, reduceOnly, closePosition
-  - Critical Telegram alert if verification fails
-  - Position quantity validation
+Key V8 changes:
+  - Auto-detect Hedge Mode vs One-way Mode per account
+  - positionSide-aware TP/SL (fixes -4061 error on Hedge Mode accounts)
+  - Pre-trade dry-run validation: skip BEFORE entry if TP/SL cannot be placed
+  - Retry with fresh precision on -1111 errors
+  - Emergency close only as last resort (position is NEVER left naked)
 """
 
 import asyncio
@@ -33,6 +31,10 @@ CACHE_TTL = 300  # 5 minutes
 # ── TP/SL retry config ───────────────────────────────────────────────
 TP_SL_MAX_RETRIES = 3
 TP_SL_RETRY_DELAY = 1.0  # seconds
+
+# ── V8: Hedge Mode cache (per api_key, 10-minute TTL) ────────────────
+_hedge_mode_cache: dict = {}   # api_key -> (is_hedge: bool, ts: float)
+HEDGE_MODE_CACHE_TTL = 600    # 10 minutes
 
 
 @dataclass
@@ -388,41 +390,127 @@ class BinanceExecutor:
             {"symbol": symbol, "orderId": order_id},
         )
 
-    # ─── V3: TP/SL with closePosition + Retry ────────────────────────
+    # ─── V8: Hedge Mode Detection ─────────────────────────────────────
 
-    async def place_stop_loss(self, symbol: str, side: str, stop_price: float, precision: PrecisionInfo) -> dict:
-        """V3: Uses closePosition=true for reliable SL. No quantity needed."""
+    async def detect_position_mode(self) -> bool:
+        """
+        V8: Detect if this account uses Hedge Mode (dualSidePosition=true)
+        or One-way Mode (dualSidePosition=false).
+
+        Cached per api_key for 10 minutes to avoid hammering the API.
+        Returns True if Hedge Mode, False if One-way Mode.
+        """
+        global _hedge_mode_cache
+        cache_key = self.api_key[:16] if self.api_key else "default"
+        now = time.time()
+
+        if cache_key in _hedge_mode_cache:
+            is_hedge, ts = _hedge_mode_cache[cache_key]
+            if (now - ts) < HEDGE_MODE_CACHE_TTL:
+                return is_hedge
+
+        try:
+            data = await self._signed_request("GET", "/fapi/v1/positionSide/dual", {})
+            is_hedge = data.get("dualSidePosition", False)
+            _hedge_mode_cache[cache_key] = (is_hedge, now)
+            mode_str = "HEDGE" if is_hedge else "ONE-WAY"
+            logger.info(f"  📋 V8 Position Mode: {mode_str} (account={cache_key[:8]}...)")
+            return is_hedge
+        except Exception as e:
+            logger.warning(f"  ⚠️ V8: Could not detect position mode, assuming One-way: {e}")
+            _hedge_mode_cache[cache_key] = (False, now)
+            return False
+
+    # ─── V8: TP/SL Placement (Hedge + One-way aware) ─────────────────
+
+    async def place_stop_loss(
+        self, symbol: str, side: str, stop_price: float,
+        precision: PrecisionInfo,
+        position_side: str = "BOTH",
+        quantity: float = 0.0,
+    ) -> dict:
+        """
+        V8: Place SL order with Hedge Mode support.
+        - One-way Mode: closePosition=true (no positionSide needed)
+        - Hedge Mode: positionSide=LONG/SHORT + reduceOnly=true + quantity
+        """
         price_str = self.format_price(stop_price, precision.price_precision)
-        params = {
-            "symbol": symbol,
-            "side": side,
-            "type": "STOP_MARKET",
-            "stopPrice": price_str,
-            "closePosition": "true",
-            "timeInForce": "GTE_GTC",
-        }
+
+        if position_side in ("LONG", "SHORT"):  # Hedge Mode
+            if quantity <= 0:
+                raise ValueError("Hedge Mode SL requires a quantity > 0")
+            qty_str = self.format_quantity(quantity, precision.quantity_precision)
+            params = {
+                "symbol": symbol,
+                "side": side,
+                "type": "STOP_MARKET",
+                "stopPrice": price_str,
+                "quantity": qty_str,
+                "positionSide": position_side,
+                "reduceOnly": "true",
+                "workingType": "MARK_PRICE",
+                "timeInForce": "GTE_GTC",
+            }
+        else:  # One-way Mode (BOTH)
+            params = {
+                "symbol": symbol,
+                "side": side,
+                "type": "STOP_MARKET",
+                "stopPrice": price_str,
+                "closePosition": "true",
+                "workingType": "MARK_PRICE",
+                "timeInForce": "GTE_GTC",
+            }
         return await self._signed_request("POST", "/fapi/v1/order", params)
 
-    async def place_take_profit(self, symbol: str, side: str, stop_price: float, precision: PrecisionInfo) -> dict:
-        """V3: Uses closePosition=true for reliable TP. No quantity needed."""
+    async def place_take_profit(
+        self, symbol: str, side: str, stop_price: float,
+        precision: PrecisionInfo,
+        position_side: str = "BOTH",
+        quantity: float = 0.0,
+    ) -> dict:
+        """
+        V8: Place TP order with Hedge Mode support.
+        - One-way Mode: closePosition=true
+        - Hedge Mode: positionSide=LONG/SHORT + reduceOnly=true + quantity
+        """
         price_str = self.format_price(stop_price, precision.price_precision)
-        params = {
-            "symbol": symbol,
-            "side": side,
-            "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": price_str,
-            "closePosition": "true",
-            "timeInForce": "GTE_GTC",
-        }
+
+        if position_side in ("LONG", "SHORT"):  # Hedge Mode
+            if quantity <= 0:
+                raise ValueError("Hedge Mode TP requires a quantity > 0")
+            qty_str = self.format_quantity(quantity, precision.quantity_precision)
+            params = {
+                "symbol": symbol,
+                "side": side,
+                "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": price_str,
+                "quantity": qty_str,
+                "positionSide": position_side,
+                "reduceOnly": "true",
+                "workingType": "MARK_PRICE",
+                "timeInForce": "GTE_GTC",
+            }
+        else:  # One-way Mode (BOTH)
+            params = {
+                "symbol": symbol,
+                "side": side,
+                "type": "TAKE_PROFIT_MARKET",
+                "stopPrice": price_str,
+                "closePosition": "true",
+                "workingType": "MARK_PRICE",
+                "timeInForce": "GTE_GTC",
+            }
         return await self._signed_request("POST", "/fapi/v1/order", params)
 
     async def place_partial_take_profit(
         self, symbol: str, side: str, stop_price: float,
         quantity: float, precision: PrecisionInfo,
+        position_side: str = "BOTH",
     ) -> dict:
         """
-        V5.5: Place a partial TP order with specific quantity.
-        Uses reduceOnly=true instead of closePosition.
+        V8: Partial TP with Hedge Mode support.
+        Always uses reduceOnly=true + explicit quantity.
         """
         price_str = self.format_price(stop_price, precision.price_precision)
         qty_str = self.format_quantity(quantity, precision.quantity_precision)
@@ -433,9 +521,101 @@ class BinanceExecutor:
             "stopPrice": price_str,
             "quantity": qty_str,
             "reduceOnly": "true",
+            "workingType": "MARK_PRICE",
             "timeInForce": "GTE_GTC",
         }
+        if position_side in ("LONG", "SHORT"):
+            params["positionSide"] = position_side
+            del params["reduceOnly"]  # Hedge Mode uses positionSide instead
         return await self._signed_request("POST", "/fapi/v1/order", params)
+
+    # ─── V8: Pre-Trade TP/SL Dry-Run Validator ────────────────────────
+
+    async def can_place_tp_sl(
+        self,
+        symbol: str,
+        side: str,          # BUY or SELL
+        entry_price: float,
+        tp_price: float,
+        sl_price: float,
+        precision: PrecisionInfo,
+        is_hedge_mode: bool = False,
+        quantity: float = 0.0,
+    ) -> tuple[bool, str]:
+        """
+        V8: Pre-trade dry-run validation.
+        Validates TP/SL prices BEFORE opening the entry order.
+        Returns (can_proceed: bool, reason: str).
+
+        STRICT RULE: If this returns False, the trade is SKIPPED entirely.
+        No position is opened. No fees lost.
+        """
+        try:
+            current_price = await self.get_market_price(symbol)
+        except Exception as e:
+            return False, f"Cannot fetch market price: {e}"
+
+        # --- Side logic check ---
+        if side == "BUY":  # LONG
+            if tp_price <= current_price:
+                return False, (
+                    f"LONG TP {tp_price:.6f} is NOT above current price "
+                    f"{current_price:.6f} — invalid TP"
+                )
+            if sl_price >= current_price:
+                return False, (
+                    f"LONG SL {sl_price:.6f} is NOT below current price "
+                    f"{current_price:.6f} — invalid SL"
+                )
+        else:  # SHORT
+            if tp_price >= current_price:
+                return False, (
+                    f"SHORT TP {tp_price:.6f} is NOT below current price "
+                    f"{current_price:.6f} — invalid TP"
+                )
+            if sl_price <= current_price:
+                return False, (
+                    f"SHORT SL {sl_price:.6f} is NOT above current price "
+                    f"{current_price:.6f} — invalid SL"
+                )
+
+        # --- Tick-size rounding check ---
+        if precision.tick_size > 0:
+            tp_rounded = self.format_price(tp_price, precision.price_precision)
+            sl_rounded = self.format_price(sl_price, precision.price_precision)
+            # Verify that rounding doesn't flip the direction
+            tp_f = float(tp_rounded)
+            sl_f = float(sl_rounded)
+            if side == "BUY" and (tp_f <= current_price or sl_f >= current_price):
+                return False, (
+                    f"Tick-size rounding invalidated TP/SL for LONG: "
+                    f"tp_rounded={tp_f} sl_rounded={sl_f} price={current_price}"
+                )
+            if side == "SELL" and (tp_f >= current_price or sl_f <= current_price):
+                return False, (
+                    f"Tick-size rounding invalidated TP/SL for SHORT: "
+                    f"tp_rounded={tp_f} sl_rounded={sl_f} price={current_price}"
+                )
+
+        # --- Hedge Mode quantity check ---
+        if is_hedge_mode and quantity <= 0:
+            return False, "Hedge Mode requires quantity > 0 for TP/SL — cannot guarantee placement"
+
+        # --- Min notional check ---
+        if quantity > 0:
+            notional = quantity * entry_price
+            if notional < precision.min_notional:
+                return False, (
+                    f"Notional {notional:.2f} below min {precision.min_notional} "
+                    f"— TP/SL quantity would be rejected"
+                )
+
+        logger.info(
+            f"  ✅ V8 Pre-trade validation PASSED for {symbol} {side}: "
+            f"price={current_price:.6f} tp={tp_price:.6f} sl={sl_price:.6f} "
+            f"hedge_mode={is_hedge_mode}"
+        )
+        return True, "ok"
 
     async def _place_with_retry(
         self,
@@ -620,19 +800,19 @@ class BinanceExecutor:
 
     async def execute_trade(self, params, telegram_notifier=None) -> OrderResult:
         """
-        V4 Full trade execution flow:
-        1. Get precision
+        V8 Full trade execution flow:
+        1. Get precision + detect Hedge/One-way mode
         2. Validate notional + min qty
-        3. Set leverage + margin type
-        4. Try LIMIT order → wait → fallback to MARKET if unfilled
-        5. Verify position opened
-        6. Get actual fill price (from position data if needed)
+        3. Pre-validate TP/SL BEFORE entry (SKIP if invalid — no naked positions)
+        4. Set leverage + margin type
+        5. Try LIMIT → MARKET fallback entry
+        6. Verify position + get actual fill price
         7. Recalculate TP/SL from fill price
-        8. Place SL + TP with retry (closePosition=true)
-        9. Alert on failure
+        8. Place SL + TP with retry (hedge-mode-aware)
+        9. Emergency close ONLY if TP/SL fails post-entry
         """
         symbol = params.symbol
-        logger.info(f"⚡ Executing {params.side} on {symbol} (lev={params.leverage}x qty={params.quantity})...")
+        logger.info(f"⚡ V8 Executing {params.side} on {symbol} (lev={params.leverage}x qty={params.quantity})...")
 
         try:
             precision = await self.get_precision(symbol)
@@ -644,23 +824,75 @@ class BinanceExecutor:
             if params.quantity < precision.min_qty:
                 raise ValueError(f"Qty {params.quantity} below min {precision.min_qty}")
 
-            # Configure
+            # ── V8: Detect account position mode ─────────────────────
+            is_hedge_mode = await self.detect_position_mode()
+            position_side = "BOTH"  # One-way default
+            if is_hedge_mode:
+                position_side = "LONG" if params.side == "BUY" else "SHORT"
+                logger.info(f"  🔀 V8 Hedge Mode: positionSide={position_side}")
+
+            # ── V8: Pre-compute estimated TP/SL for dry-run check ────
+            # Use entry_price as estimate (will be recalculated post-fill)
+            est_price = params.entry_price
+            if hasattr(params, 'tp_pct') and params.tp_pct > 0:
+                tp_pct_decimal = params.tp_pct / 100.0
+                sl_pct_decimal = params.sl_pct / 100.0
+                if params.side == "BUY":
+                    est_tp = round(est_price * (1 + tp_pct_decimal), precision.price_precision)
+                    est_sl = round(est_price * (1 - sl_pct_decimal), precision.price_precision)
+                else:
+                    est_tp = round(est_price * (1 - tp_pct_decimal), precision.price_precision)
+                    est_sl = round(est_price * (1 + sl_pct_decimal), precision.price_precision)
+            else:
+                est_tp = params.take_profit
+                est_sl = params.stop_loss
+
+            # ══════════════════════════════════════════════════════════
+            # V8: PRE-TRADE TP/SL DRY-RUN VALIDATION
+            # STRICT RULE: SKIP TRADE ENTIRELY if TP/SL cannot be placed.
+            # No position opened. No fees. No emergency close needed.
+            # ══════════════════════════════════════════════════════════
+            can_proceed, validation_reason = await self.can_place_tp_sl(
+                symbol=symbol,
+                side=params.side,
+                entry_price=est_price,
+                tp_price=est_tp,
+                sl_price=est_sl,
+                precision=precision,
+                is_hedge_mode=is_hedge_mode,
+                quantity=params.quantity if is_hedge_mode else 0.0,
+            )
+
+            if not can_proceed:
+                logger.warning(
+                    f"  🛡️ V8 PRE-TRADE PROTECTION: Skipping {symbol} — "
+                    f"TP/SL cannot be guaranteed: {validation_reason}"
+                )
+                return OrderResult(
+                    success=False,
+                    order_id=None,
+                    symbol=symbol,
+                    side=params.side,
+                    quantity=params.quantity,
+                    entry_price=params.entry_price,
+                    error=f"PRE_TRADE_SKIP: {validation_reason}",
+                    tp_sl_protection_failed=True,
+                    emergency_closed=False,
+                )
+
+            # Configure margin + leverage
             await self.set_margin_type(symbol, "ISOLATED")
             await self.set_leverage(symbol, params.leverage)
 
-            # ── V4: LIMIT → MARKET fallback ──────────────────────────
+            # ── LIMIT → MARKET fallback ───────────────────────────────
             order = None
             order_method = "MARKET"
             fill_price = 0.0
 
             if settings.ENABLE_LIMIT_FALLBACK:
                 try:
-                    # Get best price for limit order
                     book = await self.get_book_ticker(symbol)
-                    if params.side == "BUY":
-                        limit_price = book["ask"]  # Match the ask for immediate-ish fill
-                    else:
-                        limit_price = book["bid"]  # Match the bid
+                    limit_price = book["ask"] if params.side == "BUY" else book["bid"]
 
                     if limit_price > 0:
                         logger.info(f"  📝 Trying LIMIT order at {limit_price}...")
@@ -670,10 +902,8 @@ class BinanceExecutor:
                         limit_order_id = order["orderId"]
                         logger.info(f"  📝 LIMIT order placed: #{limit_order_id}")
 
-                        # Wait for fill
                         await asyncio.sleep(settings.LIMIT_ORDER_WAIT_SECONDS)
 
-                        # Check if filled
                         order_status = await self.get_order_status(symbol, limit_order_id)
                         status = order_status.get("status", "")
 
@@ -682,29 +912,24 @@ class BinanceExecutor:
                             fill_price = self._get_fill_price(order_status)
                             logger.info(f"  ✅ LIMIT order FILLED: fill_price={fill_price}")
                         else:
-                            # Not filled — cancel and go MARKET
-                            logger.info(f"  ⏳ LIMIT order status={status} — cancelling, switching to MARKET")
+                            logger.info(f"  ⏳ LIMIT status={status} — cancelling, switching to MARKET")
                             try:
                                 await self.cancel_order(symbol, limit_order_id)
-                                logger.info(f"  ✅ LIMIT order cancelled")
                             except Exception as ce:
-                                logger.warning(f"  Cancel failed (may be partially filled): {ce}")
-                                # Check if it partially filled
+                                logger.warning(f"  Cancel failed: {ce}")
                                 recheck = await self.get_order_status(symbol, limit_order_id)
                                 if recheck.get("status") == "FILLED":
                                     order_method = "LIMIT"
                                     fill_price = self._get_fill_price(recheck)
                                     order = recheck
-                                    logger.info(f"  ✅ LIMIT actually filled during cancel: {fill_price}")
 
                             if order_method != "LIMIT":
-                                order = None  # Reset — will use MARKET below
-
+                                order = None
                 except Exception as le:
-                    logger.warning(f"  LIMIT order attempt failed: {le} — falling back to MARKET")
+                    logger.warning(f"  LIMIT attempt failed: {le} — falling back to MARKET")
                     order = None
 
-            # MARKET order (primary or fallback)
+            # MARKET entry (primary or fallback)
             if order is None or order_method == "MARKET":
                 order = await self.place_market_order(symbol, params.side, params.quantity, precision)
                 order_method = "MARKET"
@@ -713,19 +938,18 @@ class BinanceExecutor:
 
             order_id = order["orderId"]
 
-            # ── V4: Verify position before TP/SL ─────────────────────
+            # ── Verify position + get actual fill price ───────────────
             position_data = await self._verify_position(symbol)
             if position_data:
-                # Use position entry price (most accurate)
                 pos_entry = float(position_data.get("entryPrice", 0))
                 if pos_entry > 0:
                     fill_price = pos_entry
 
             if fill_price <= 0:
-                fill_price = params.entry_price  # Last resort fallback
+                fill_price = params.entry_price
                 logger.warning(f"  ⚠️ Could not determine fill price, using estimate: {fill_price}")
 
-            # ── Recalculate TP/SL from actual fill price ─────────────
+            # ── Recalculate TP/SL from ACTUAL fill price ──────────────
             if hasattr(params, 'tp_pct') and params.tp_pct > 0:
                 tp_pct_decimal = params.tp_pct / 100.0
                 sl_pct_decimal = params.sl_pct / 100.0
@@ -740,10 +964,18 @@ class BinanceExecutor:
                 actual_sl = params.stop_loss
 
             close_side = "SELL" if params.side == "BUY" else "BUY"
+            qty_for_hedge = params.quantity  # Used when position_side is LONG/SHORT
 
-            # ── SL with retry (always closePosition=true) ────────────
+            # ── V8: SL with retry (hedge-mode-aware) ──────────────────
+            async def _sl_placer(sym, s, price, prec):
+                return await self.place_stop_loss(
+                    sym, s, price, prec,
+                    position_side=position_side,
+                    quantity=qty_for_hedge if is_hedge_mode else 0.0,
+                )
+
             sl_order, sl_error = await self._place_with_retry(
-                self.place_stop_loss, "STOP_LOSS",
+                _sl_placer, "STOP_LOSS",
                 symbol, close_side, actual_sl, precision,
             )
 
@@ -790,6 +1022,7 @@ class BinanceExecutor:
                 try:
                     tp1_result = await self.place_partial_take_profit(
                         symbol, close_side, actual_tp1, tp1_qty, precision,
+                        position_side=position_side,
                     )
                     tp1_order = tp1_result
                     tp1_attached = True
@@ -804,6 +1037,7 @@ class BinanceExecutor:
                 try:
                     tp2_result = await self.place_partial_take_profit(
                         symbol, close_side, actual_tp2, tp2_qty, precision,
+                        position_side=position_side,
                     )
                     tp2_order = tp2_result
                     tp2_attached = True
@@ -819,9 +1053,16 @@ class BinanceExecutor:
                 tp_order = tp1_order or tp2_order  # For backward compat
 
             else:
-                # ── FULL TP MODE (original) ──────────────────────────
+                # ── FULL TP MODE (hedge-mode-aware) ───────────────────
+                async def _tp_placer(sym, s, price, prec):
+                    return await self.place_take_profit(
+                        sym, s, price, prec,
+                        position_side=position_side,
+                        quantity=qty_for_hedge if is_hedge_mode else 0.0,
+                    )
+
                 tp_order, tp_error = await self._place_with_retry(
-                    self.place_take_profit, "TAKE_PROFIT",
+                    _tp_placer, "TAKE_PROFIT",
                     symbol, close_side, actual_tp, precision,
                 )
                 tp_attached_status = tp_order is not None

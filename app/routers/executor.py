@@ -322,16 +322,18 @@ async def execute_multi_account(req: MultiExecuteRequest):
             result = await session.execute(
                 select(Account)
                 .where(Account.is_active == True)
+                .where(Account.bot_enabled == True)   # V8: skip disabled bots
             )
             accounts = result.scalars().all()
 
             for acc in accounts:
-                if acc.api_connection and acc.api_connection.is_active:
+                conn = acc.api_connection
+                if conn and conn.is_active and conn.api_key_encrypted:
                     accounts_data.append({
                         "id": acc.id,
                         "label": acc.label,
-                        "api_key_enc": acc.api_connection.api_key_encrypted,
-                        "api_secret_enc": acc.api_connection.api_secret_encrypted,
+                        "api_key_enc": conn.api_key_encrypted,
+                        "api_secret_enc": conn.api_secret_encrypted,
                     })
     except Exception as e:
         logger.warning(f"Failed to load accounts from DB: {e}")
@@ -669,8 +671,19 @@ async def execute_multi_account(req: MultiExecuteRequest):
                         "order_method": best_order_method,
                     }
                 else:
-                    # V7: Differentiate TP/SL protection failures from exchange rejections
-                    if getattr(result, 'tp_sl_protection_failed', False):
+                    # V8: Differentiate pre-trade skip from exchange errors
+                    error_msg = result.error or ""
+                    if "PRE_TRADE_SKIP" in error_msg:
+                        logger.warning(
+                            f"  🛡️ [{internal_label}] V8 PRE-TRADE PROTECTION: "
+                            f"TP/SL validation failed — trade skipped safely"
+                        )
+                        return _skip(
+                            acc_id,
+                            "TP/SL Protection",
+                            f"Skipped before entry: {error_msg.replace('PRE_TRADE_SKIP: ', '')}",
+                        )
+                    elif getattr(result, 'tp_sl_protection_failed', False):
                         emergency_status = "closed" if getattr(result, 'emergency_closed', False) else "FAILED"
                         logger.error(
                             f"  🚨 [{internal_label}] V7 ATOMIC PROTECTION: "
@@ -804,3 +817,89 @@ async def execute_multi_account(req: MultiExecuteRequest):
         "skipped": skipped,
         "skip_reasons": skip_reasons_map,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# V8: PRE-TRADE VALIDATION ENDPOINT — called by n8n BEFORE execute-multi
+# ═══════════════════════════════════════════════════════════════════════
+
+class ValidateTpSlRequest(BaseModel):
+    symbol: str
+    action: str           # BUY | SELL
+    current_price: float = 0.0
+    tp_pct: float = 2.0   # Take profit %
+    sl_pct: float = 1.0   # Stop loss %
+    quantity: float = 0.0
+
+
+@router.post("/validate-tpsl")
+async def validate_tpsl(req: ValidateTpSlRequest):
+    """
+    V8: Dry-run TP/SL validation endpoint.
+
+    Called by n8n BEFORE execute-multi to check if TP/SL can be placed.
+    No positions opened. No exchange orders. Pure validation only.
+
+    Returns:
+        { valid: true/false, reason: "...", hedge_mode: bool,
+          estimated_tp: float, estimated_sl: float }
+    """
+    symbol = req.symbol.upper().strip()
+    side = req.action.upper().strip()
+
+    if side not in ("BUY", "SELL"):
+        return {"valid": False, "reason": f"Invalid action: {req.action}"}
+
+    executor = BinanceExecutor()
+
+    try:
+        # Get precision
+        precision = await executor.get_precision(symbol)
+
+        # Get live price
+        entry_price = req.current_price
+        if entry_price <= 0:
+            entry_price = await executor.get_market_price(symbol)
+
+        # Detect account mode
+        is_hedge_mode = await executor.detect_position_mode()
+
+        # Compute estimated TP/SL
+        tp_pct_dec = req.tp_pct / 100.0
+        sl_pct_dec = req.sl_pct / 100.0
+        if side == "BUY":
+            est_tp = round(entry_price * (1 + tp_pct_dec), precision.price_precision)
+            est_sl = round(entry_price * (1 - sl_pct_dec), precision.price_precision)
+        else:
+            est_tp = round(entry_price * (1 - tp_pct_dec), precision.price_precision)
+            est_sl = round(entry_price * (1 + sl_pct_dec), precision.price_precision)
+
+        # Run dry-run validation
+        can_proceed, reason = await executor.can_place_tp_sl(
+            symbol=symbol,
+            side=side,
+            entry_price=entry_price,
+            tp_price=est_tp,
+            sl_price=est_sl,
+            precision=precision,
+            is_hedge_mode=is_hedge_mode,
+            quantity=req.quantity if is_hedge_mode else 0.0,
+        )
+
+        return {
+            "valid": can_proceed,
+            "reason": reason,
+            "symbol": symbol,
+            "side": side,
+            "hedge_mode": is_hedge_mode,
+            "estimated_tp": est_tp,
+            "estimated_sl": est_sl,
+            "entry_price": entry_price,
+            "tick_size": precision.tick_size,
+            "price_precision": precision.price_precision,
+        }
+
+    except Exception as e:
+        logger.error(f"validate-tpsl error for {symbol}: {e}")
+        return {"valid": False, "reason": f"Validation error: {str(e)[:200]}", "symbol": symbol}
+

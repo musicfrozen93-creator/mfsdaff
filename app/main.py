@@ -1,6 +1,6 @@
 """
-V7 AI-Powered Adaptive Crypto Futures Trading System
-V7: + Confidence Engine, Adaptive Learning, Atomic TP/SL, Risk Guardrails
+V8 Protected Execution Crypto Futures Trading System
+V8: + Hedge Mode detection, pre-trade TP/SL dry-run validation, positionSide-aware orders
 FastAPI Backend — Main Entry Point
 """
 
@@ -24,26 +24,25 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 V7 Adaptive Crypto Trading Bot starting up...")
+    logger.info("🚀 V8 Protected Crypto Trading Bot starting up...")
     await init_db()
     await seed_admin()
     await run_subscription_expiry_check()
-    # V7: Seed the 9 starter strategies into DB
     await learning_engine.seed_strategy_registry()
-    logger.info("✅ All V7 systems initialized")
+    logger.info("✅ All V8 systems initialized (Hedge Mode detection active)")
     yield
     await close_db()
     logger.info("🛑 V7 Crypto Trading Bot shutting down...")
 
 
 app = FastAPI(
-    title="V7 Adaptive Crypto Futures Trading Bot",
+    title="V8 Protected Crypto Futures Trading Bot",
     description=(
         "Production-grade automated crypto futures trading system with "
-        "V7 confidence engine, adaptive strategy learning, atomic TP/SL protection, "
-        "multi-account support, AI verification, and configurable risk guardrails."
+        "V8 Hedge Mode detection, pre-trade TP/SL validation, atomic protection, "
+        "adaptive learning, multi-account support, and configurable risk guardrails."
     ),
-    version="7.0.0",
+    version="8.0.0",
     lifespan=lifespan,
 )
 
@@ -68,6 +67,14 @@ app.include_router(admin.router,    tags=["Admin"])
 async def health_check():
     return {
         "status": "ok",
-        "service": "crypto-trading-bot-v7",
-        "version": "7.0.0",
+        "service": "crypto-trading-bot-v8",
+        "version": "8.0.0",
+        "features": [
+            "hedge_mode_detection",
+            "pre_trade_tpsl_validation",
+            "atomic_tpsl_protection",
+            "database_account_loader",
+            "subscription_guard",
+            "adaptive_learning",
+        ],
     }
