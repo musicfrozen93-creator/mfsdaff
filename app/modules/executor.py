@@ -131,7 +131,21 @@ class BinanceExecutor:
             else:
                 raise ValueError(f"Unknown method: {method}")
 
-            resp.raise_for_status()
+            if not resp.is_success:
+                # V9: Log FULL Binance error response for debugging
+                try:
+                    err_body = resp.json()
+                    err_code = err_body.get('code', resp.status_code)
+                    err_msg  = err_body.get('msg', resp.text)
+                    logger.error(
+                        f"  ❌ Binance API error {err_code}: {err_msg} "
+                        f"| path={path} params={params} | full_body={err_body}"
+                    )
+                    raise ValueError(f"Binance error {err_code}: {err_msg}")
+                except ValueError:
+                    raise
+                except Exception:
+                    resp.raise_for_status()
             return resp.json()
 
     # ─── Price Fetching ───────────────────────────────────────────────
@@ -220,6 +234,14 @@ class BinanceExecutor:
 
     def format_price(self, price: float, precision: int) -> str:
         return f"{price:.{precision}f}"
+
+    def round_to_tick(self, price: float, tick_size: float, price_precision: int) -> str:
+        """Snap price to nearest tick_size grid — prevents Binance -1111 errors."""
+        if tick_size <= 0:
+            return self.format_price(price, price_precision)
+        import math
+        snapped = math.floor(price / tick_size) * tick_size
+        return f"{snapped:.{price_precision}f}"
 
     # ─── V3: Pre-Entry Quality Checks ─────────────────────────────────
 
@@ -430,11 +452,13 @@ class BinanceExecutor:
         quantity: float = 0.0,
     ) -> dict:
         """
-        V8: Place SL order with Hedge Mode support.
-        - One-way Mode: closePosition=true (no positionSide needed)
-        - Hedge Mode: positionSide=LONG/SHORT + reduceOnly=true + quantity
+        V9: Place SL order — production-grade bracket protection.
+        One-way Mode: closePosition=true (NO timeInForce — Binance rejects -1106)
+        Hedge Mode:   positionSide + quantity + reduceOnly (NO closePosition)
+        Price snapped to tickSize grid to prevent -1111 errors.
         """
-        price_str = self.format_price(stop_price, precision.price_precision)
+        price_str = self.round_to_tick(stop_price, precision.tick_size, precision.price_precision)
+        logger.info(f"  [SL] Placing STOP_MARKET: {symbol} {side} stopPrice={price_str} mode={position_side}")
 
         if position_side in ("LONG", "SHORT"):  # Hedge Mode
             if quantity <= 0:
@@ -449,9 +473,11 @@ class BinanceExecutor:
                 "positionSide": position_side,
                 "reduceOnly": "true",
                 "workingType": "MARK_PRICE",
-                "timeInForce": "GTE_GTC",
+                # NOTE: timeInForce NOT sent for STOP_MARKET in hedge mode
             }
         else:  # One-way Mode (BOTH)
+            # CRITICAL: closePosition=true is INCOMPATIBLE with timeInForce
+            # Sending timeInForce causes Binance error -1106
             params = {
                 "symbol": symbol,
                 "side": side,
@@ -459,7 +485,7 @@ class BinanceExecutor:
                 "stopPrice": price_str,
                 "closePosition": "true",
                 "workingType": "MARK_PRICE",
-                "timeInForce": "GTE_GTC",
+                # NO timeInForce here — Binance rejects -1106 with closePosition=true
             }
         return await self._signed_request("POST", "/fapi/v1/order", params)
 
@@ -470,11 +496,13 @@ class BinanceExecutor:
         quantity: float = 0.0,
     ) -> dict:
         """
-        V8: Place TP order with Hedge Mode support.
-        - One-way Mode: closePosition=true
-        - Hedge Mode: positionSide=LONG/SHORT + reduceOnly=true + quantity
+        V9: Place TP order — production-grade bracket protection.
+        One-way Mode: closePosition=true (NO timeInForce — Binance rejects -1106)
+        Hedge Mode:   positionSide + quantity + reduceOnly (NO closePosition)
+        Price snapped to tickSize grid to prevent -1111 errors.
         """
-        price_str = self.format_price(stop_price, precision.price_precision)
+        price_str = self.round_to_tick(stop_price, precision.tick_size, precision.price_precision)
+        logger.info(f"  [TP] Placing TAKE_PROFIT_MARKET: {symbol} {side} stopPrice={price_str} mode={position_side}")
 
         if position_side in ("LONG", "SHORT"):  # Hedge Mode
             if quantity <= 0:
@@ -489,9 +517,11 @@ class BinanceExecutor:
                 "positionSide": position_side,
                 "reduceOnly": "true",
                 "workingType": "MARK_PRICE",
-                "timeInForce": "GTE_GTC",
+                # NOTE: timeInForce NOT sent for TAKE_PROFIT_MARKET in hedge mode
             }
         else:  # One-way Mode (BOTH)
+            # CRITICAL: closePosition=true is INCOMPATIBLE with timeInForce
+            # Sending timeInForce causes Binance error -1106
             params = {
                 "symbol": symbol,
                 "side": side,
@@ -499,7 +529,7 @@ class BinanceExecutor:
                 "stopPrice": price_str,
                 "closePosition": "true",
                 "workingType": "MARK_PRICE",
-                "timeInForce": "GTE_GTC",
+                # NO timeInForce here — Binance rejects -1106 with closePosition=true
             }
         return await self._signed_request("POST", "/fapi/v1/order", params)
 
@@ -509,10 +539,10 @@ class BinanceExecutor:
         position_side: str = "BOTH",
     ) -> dict:
         """
-        V8: Partial TP with Hedge Mode support.
-        Always uses reduceOnly=true + explicit quantity.
+        V9: Partial TP — tick-snapped price, no invalid timeInForce.
+        Always uses explicit quantity + reduceOnly=true (or positionSide in hedge mode).
         """
-        price_str = self.format_price(stop_price, precision.price_precision)
+        price_str = self.round_to_tick(stop_price, precision.tick_size, precision.price_precision)
         qty_str = self.format_quantity(quantity, precision.quantity_precision)
         params = {
             "symbol": symbol,
@@ -522,11 +552,11 @@ class BinanceExecutor:
             "quantity": qty_str,
             "reduceOnly": "true",
             "workingType": "MARK_PRICE",
-            "timeInForce": "GTE_GTC",
+            # No timeInForce — not required for TAKE_PROFIT_MARKET with quantity
         }
         if position_side in ("LONG", "SHORT"):
             params["positionSide"] = position_side
-            del params["reduceOnly"]  # Hedge Mode uses positionSide instead
+            del params["reduceOnly"]  # positionSide replaces reduceOnly in hedge mode
         return await self._signed_request("POST", "/fapi/v1/order", params)
 
     # ─── V8: Pre-Trade TP/SL Dry-Run Validator ────────────────────────
@@ -638,39 +668,53 @@ class BinanceExecutor:
         for attempt in range(1, TP_SL_MAX_RETRIES + 1):
             try:
                 result = await place_func(symbol, side, stop_price, current_precision)
-                logger.info(f"  ✅ {order_type} placed on attempt {attempt}: #{result.get('orderId')}")
+                logger.info(
+                    f"  ✅ {order_type} placed on attempt {attempt}/{TP_SL_MAX_RETRIES}: "
+                    f"orderId=#{result.get('orderId')} stopPrice={result.get('stopPrice')} "
+                    f"type={result.get('type')} closePosition={result.get('closePosition')}"
+                )
                 return result, ""
             except Exception as e:
                 last_error = str(e)
                 error_str = str(e)
-                logger.warning(
-                    f"  ⚠️ {order_type} attempt {attempt}/{TP_SL_MAX_RETRIES} failed: {e}"
+                logger.error(
+                    f"  ❌ {order_type} attempt {attempt}/{TP_SL_MAX_RETRIES} FAILED "
+                    f"for {symbol}: {error_str}"
                 )
 
-                # V7: On precision errors (-1111), re-fetch precision from exchange
-                if "-1111" in error_str or "precision" in error_str.lower():
+                # V9: On ANY precision/parameter error, force fresh precision from exchange
+                if any(code in error_str for code in ["-1111", "-1106", "-1102", "precision", "parameter"]):
                     try:
-                        logger.info(f"  🔄 V7: Re-fetching precision for {symbol} after -1111 error")
+                        logger.info(f"  🔄 V9: Re-fetching precision for {symbol} after error")
+                        global _exchange_info_cache, _exchange_info_ts
+                        _exchange_info_ts = 0.0  # Force cache invalidation
                         current_precision = await self.get_precision(symbol)
+                        logger.info(
+                            f"  🔄 Fresh precision: tick={current_precision.tick_size} "
+                            f"price_prec={current_precision.price_precision}"
+                        )
                     except Exception as pe:
                         logger.warning(f"  ⚠️ Precision re-fetch failed: {pe}")
 
                 if attempt < TP_SL_MAX_RETRIES:
-                    # V7: 2s exchange-lag wait (longer than original 1s)
                     await asyncio.sleep(2.0)
 
-        # V7: Final hail-mary attempt after fresh precision fetch + 3s wait
+        # Final hail-mary: fresh precision + 3s wait
         try:
-            logger.info(f"  🔄 V7: Hail-mary {order_type} attempt with fresh precision + 3s wait")
+            logger.info(f"  🔄 V9 Hail-mary {order_type} for {symbol}: fresh precision + 3s wait")
             await asyncio.sleep(3.0)
+            _exchange_info_ts = 0.0
             fresh_precision = await self.get_precision(symbol)
             result = await place_func(symbol, side, stop_price, fresh_precision)
-            logger.info(f"  ✅ {order_type} placed on hail-mary attempt: #{result.get('orderId')}")
+            logger.info(
+                f"  ✅ {order_type} placed on hail-mary: #{result.get('orderId')} "
+                f"stopPrice={result.get('stopPrice')}"
+            )
             return result, ""
         except Exception as e:
             last_error = str(e)
             logger.error(
-                f"  ❌ {order_type} FAILED after {TP_SL_MAX_RETRIES} retries + hail-mary: {last_error}"
+                f"  ❌ {order_type} PROTECTION FAILED for {symbol} after all retries: {last_error}"
             )
 
         return None, last_error
@@ -732,9 +776,15 @@ class BinanceExecutor:
         """
         close_side = "SELL" if side == "BUY" else "BUY"
         logger.warning(
-            f"  🚨 V7 EMERGENCY CLOSE: Attempting to close {symbol} "
+            f"  🚨 V9 EMERGENCY CLOSE: Attempting to close {symbol} "
             f"position (close_side={close_side}) due to TP/SL failure"
         )
+
+        # Detect hedge mode for emergency close
+        try:
+            is_hedge = await self.detect_position_mode()
+        except Exception:
+            is_hedge = False
 
         for attempt in range(1, 4):  # 3 attempts
             try:
@@ -748,6 +798,7 @@ class BinanceExecutor:
                     return True
 
                 pos_amt = abs(float(position.get("positionAmt", 0)))
+                pos_side = position.get("positionSide", "BOTH")  # LONG/SHORT/BOTH
                 if pos_amt == 0:
                     logger.info(f"  ✅ Emergency close: Position amount is 0 for {symbol}")
                     return True
@@ -755,14 +806,18 @@ class BinanceExecutor:
                 precision = await self.get_precision(symbol)
                 qty_str = self.format_quantity(pos_amt, precision.quantity_precision)
 
-                # Place market close order with reduceOnly
-                params = {
+                # Build emergency close params (hedge-mode-aware)
+                params: dict = {
                     "symbol": symbol,
                     "side": close_side,
                     "type": "MARKET",
                     "quantity": qty_str,
-                    "reduceOnly": "true",
                 }
+                if is_hedge and pos_side in ("LONG", "SHORT"):
+                    params["positionSide"] = pos_side  # hedge mode needs positionSide
+                else:
+                    params["reduceOnly"] = "true"  # one-way mode uses reduceOnly
+
                 result = await self._signed_request("POST", "/fapi/v1/order", params)
                 close_order_id = result.get("orderId")
 
@@ -771,13 +826,13 @@ class BinanceExecutor:
                     f"qty={pos_amt} order=#{close_order_id} (attempt {attempt})"
                 )
 
-                # Also cancel any remaining open orders for this symbol
+                # Cancel any remaining open orders
                 try:
                     await self._signed_request(
                         "DELETE", "/fapi/v1/allOpenOrders",
                         {"symbol": symbol},
                     )
-                    logger.info(f"  ✅ Cancelled all open orders for {symbol}")
+                    logger.info(f"  ✅ Cancelled all open orders for {symbol} after emergency close")
                 except Exception as ce:
                     logger.warning(f"  ⚠️ Failed to cancel open orders for {symbol}: {ce}")
 
@@ -788,7 +843,7 @@ class BinanceExecutor:
                     f"  ❌ Emergency close attempt {attempt}/3 failed for {symbol}: {e}"
                 )
                 if attempt < 3:
-                    await asyncio.sleep(2.0)  # Wait before retry
+                    await asyncio.sleep(2.0)
 
         logger.critical(
             f"  🔥 CRITICAL: Emergency close FAILED for {symbol} after 3 attempts! "
@@ -800,18 +855,18 @@ class BinanceExecutor:
 
     async def execute_trade(self, params, telegram_notifier=None) -> OrderResult:
         """
-        V8 Full trade execution flow:
+        V9 Full trade execution flow:
         1. Get precision + detect Hedge/One-way mode
         2. Validate notional + min qty
         3. Pre-validate TP/SL BEFORE entry (SKIP if invalid — no naked positions)
         4. Set leverage + margin type
         5. Try LIMIT → MARKET fallback entry
         6. Verify position + get actual fill price
-        7. Recalculate TP/SL from fill price
-        8. Place SL + TP with retry (hedge-mode-aware)
+        7. Recalculate TP/SL from fill price (tick-snapped)
+        8. Place SL + TP with 3-retry (hedge-mode-aware, no invalid timeInForce)
         9. Emergency close ONLY if TP/SL fails post-entry
         """
-        symbol = params.symbol
+        symbol = params.symbol  # Defined BEFORE try so except block always has it
         logger.info(f"⚡ V8 Executing {params.side} on {symbol} (lev={params.leverage}x qty={params.quantity})...")
 
         try:
@@ -966,7 +1021,13 @@ class BinanceExecutor:
             close_side = "SELL" if params.side == "BUY" else "BUY"
             qty_for_hedge = params.quantity  # Used when position_side is LONG/SHORT
 
-            # ── V8: SL with retry (hedge-mode-aware) ──────────────────
+            logger.info(
+                f"  🛡️ V9 Bracket protection: {symbol} fill={fill_price} "
+                f"SL={actual_sl} TP={actual_tp} side={close_side} "
+                f"hedge={is_hedge_mode} position_side={position_side}"
+            )
+
+            # ── V9: SL with retry (hedge-mode-aware, tick-snapped) ─────
             async def _sl_placer(sym, s, price, prec):
                 return await self.place_stop_loss(
                     sym, s, price, prec,

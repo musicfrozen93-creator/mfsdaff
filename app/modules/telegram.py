@@ -282,7 +282,7 @@ class TelegramNotifier:
         tp_attached: bool,
         error: str,
     ):
-        """V7: Alert when position was emergency-closed due to TP/SL failure."""
+        """V9: Alert when position was emergency-closed due to TP/SL failure."""
         direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
         failed_items = []
         if not sl_attached:
@@ -291,15 +291,15 @@ class TelegramNotifier:
             failed_items.append("❌ TAKE PROFIT")
 
         msg = (
-            f"🚨 <b>POSITION EMERGENCY CLOSED</b>\n\n"
+            f"🚨 <b>PROTECTION FAILED — Position closed safely</b>\n\n"
             f"Coin: <b>{symbol}</b>\n"
             f"Side: <b>{direction}</b>\n"
             f"Entry: <b>${fill_price:,.6f}</b>\n\n"
             f"<b>Reason:</b> TP/SL attachment failed after all retries\n"
             f"Failed: {', '.join(failed_items)}\n"
             f"Error: <code>{error[:150]}</code>\n\n"
-            f"✅ <b>Position was closed to prevent unprotected exposure.</b>\n"
-            f"<i>V7 Atomic Protection: No naked positions allowed.</i>"
+            f"✅ <b>Position was closed at market to prevent unprotected exposure.</b>\n"
+            f"<i>V9 Bracket Protection: No naked positions allowed.</i>"
         )
         await self.send(msg)
 
