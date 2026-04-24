@@ -32,7 +32,7 @@ from app.modules.learning_engine import learning_engine      # V7: adaptive lear
 from app.utils.state import state_manager
 from app.config import settings
 from app.database import async_session
-from app.models.user import Account
+from app.models.user import Account, ApiConnection
 from app.models.trading import Signal, Trade, TradeSkip, OpenPosition
 from app.utils.subscription_guard import check_account_eligible
 
@@ -315,26 +315,28 @@ async def execute_multi_account(req: MultiExecuteRequest):
     except Exception as e:
         logger.warning(f"Failed to save signal to DB: {e}")
 
-    # ── Load active accounts ─────────────────────────────────────────
+    # ── Load active accounts (direct JOIN — bypass ORM relationship) ────
     accounts_data = []
     try:
         async with async_session() as session:
-            result = await session.execute(
-                select(Account)
-                .where(Account.is_active == True)
-                .where(Account.bot_enabled == True)   # V8: skip disabled bots
+            rows = await session.execute(
+                select(Account, ApiConnection)
+                .join(ApiConnection, ApiConnection.account_id == Account.id)
+                .where(
+                    Account.is_active == True,
+                    Account.bot_enabled == True,
+                    ApiConnection.is_active == True,
+                )
             )
-            accounts = result.scalars().all()
-
-            for acc in accounts:
-                conn = acc.api_connection
-                if conn and conn.is_active and conn.api_key_encrypted:
+            for acc, conn in rows.all():
+                if conn.api_key_encrypted:
                     accounts_data.append({
                         "id": acc.id,
                         "label": acc.label,
                         "api_key_enc": conn.api_key_encrypted,
                         "api_secret_enc": conn.api_secret_encrypted,
                     })
+        logger.info(f"🔑 Loaded {len(accounts_data)} active account(s) via JOIN")
     except Exception as e:
         logger.warning(f"Failed to load accounts from DB: {e}")
 
