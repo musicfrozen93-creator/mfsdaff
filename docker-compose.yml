@@ -23,7 +23,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # ── Trading Bot Backend ──────────────────────────────────────────────
+  # ── Main Trading Bot (signal engine + trade entry) ───────────────────
   trading-bot:
     build: .
     container_name: crypto-trading-bot
@@ -69,6 +69,40 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  # ── Position Manager Bot (24/7 exit engine) ──────────────────────────
+  position-manager:
+    build: .
+    container_name: position-manager
+    # Override the default CMD to run position_manager.py instead of FastAPI
+    command: ["python", "position_manager.py"]
+    environment:
+      # Database
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      # Binance (master account — CloseEngine also reads per-account creds from DB)
+      - BINANCE_API_KEY=${BINANCE_API_KEY}
+      - BINANCE_SECRET_KEY=${BINANCE_SECRET_KEY}
+      - BINANCE_TESTNET=${BINANCE_TESTNET:-true}
+      # Encryption (needed to decrypt per-account API keys)
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      # Telegram (for close notifications)
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      # Risk settings (used for trailing trigger)
+      - BREAK_EVEN_ENABLED=${BREAK_EVEN_ENABLED:-true}
+      - BREAK_EVEN_TRIGGER_PCT=${BREAK_EVEN_TRIGGER_PCT:-3.0}
+      - BREAK_EVEN_BUFFER_PCT=${BREAK_EVEN_BUFFER_PCT:-0.1}
+    volumes:
+      - ./logs:/app/logs
+    # ALWAYS restart — this must never go down
+    restart: always
+    networks:
+      - bot-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      trading-bot:
+        condition: service_started
 
   # ── n8n Workflow Automation ──────────────────────────────────────────
   n8n:
