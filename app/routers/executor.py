@@ -33,7 +33,7 @@ from app.utils.state import state_manager
 from app.config import settings
 from app.database import async_session
 from app.models.user import Account
-from app.models.trading import Signal, Trade, TradeSkip
+from app.models.trading import Signal, Trade, TradeSkip, OpenPosition
 from app.utils.subscription_guard import check_account_eligible
 
 router = APIRouter()
@@ -603,6 +603,51 @@ async def execute_multi_account(req: MultiExecuteRequest):
                             await session.commit()
                             await session.refresh(trade)
                             trade_db_id = trade.id
+
+                            # ── V9: Write OpenPosition for Position Manager ──
+                            # Read hedge mode + position_side from executor result
+                            _is_hedge = result.is_hedge_mode
+                            _pos_side = result.position_side
+                            # Determine timeframe from strategy type
+                            _timeframe = (
+                                "4h" if req.strategy_type.startswith("swing")
+                                else ("15m" if req.strategy_type.startswith("sniper") else "1m")
+                            )
+                            # Trailing trigger = BREAK_EVEN_TRIGGER_PCT from settings
+                            from app.config import settings as _s
+                            open_pos = OpenPosition(
+                                account_id=acc_id,
+                                trade_id=trade_db_id,
+                                symbol=symbol,
+                                side=side,
+                                entry_price=result.fill_price or entry_price,
+                                quantity=trade_params.quantity,
+                                leverage=trade_params.leverage,
+                                position_size_usdt=trade_params.position_size_usdt,
+                                strategy_type=req.strategy_type,
+                                timeframe=_timeframe,
+                                confidence=req.confidence,
+                                regime=req.regime,
+                                tp_price=trade_params.take_profit,
+                                sl_price=trade_params.stop_loss,
+                                tp_pct=trade_params.tp_pct,
+                                sl_pct=trade_params.sl_pct,
+                                trailing_trigger_pct=_s.BREAK_EVEN_TRIGGER_PCT,
+                                entry_order_id=str(result.order_id) if result.order_id else None,
+                                is_hedge_mode=_is_hedge,
+                                position_side=_pos_side,
+                                status="open",
+                                last_price=result.fill_price or entry_price,
+                                highest_price=result.fill_price or entry_price,
+                                lowest_price=result.fill_price or entry_price,
+                            )
+                            session.add(open_pos)
+                            await session.commit()
+                            logger.info(
+                                f"  📌 [{internal_label}] OpenPosition saved: "
+                                f"{symbol} {side} TP={trade_params.take_profit} "
+                                f"SL={trade_params.stop_loss} strategy={req.strategy_type}"
+                            )
                     except Exception as dbe:
                         logger.warning(f"  [{internal_label}] Failed to save trade to DB: {dbe}")
 

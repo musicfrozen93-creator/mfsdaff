@@ -541,3 +541,185 @@ class TelegramNotifier:
             f"<i>Position scaling out — locking profits</i>"
         )
         await self.send(msg)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # V9 Position Manager — Trade Close Notifications
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def trade_closed_tp(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        close_price: float,
+        pnl_usdt: float,
+        pnl_pct: float,
+        strategy_type: str = "",
+        confidence: int = 0,
+        tp_price: float = 0.0,
+        duration_minutes: int = 0,
+    ):
+        """
+        V9: Position Manager — Take Profit hit notification.
+        Sent when position_manager.py closes a trade at TP.
+        """
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        pnl_emoji = "📈" if pnl_usdt >= 0 else "📉"
+
+        strategy_display = ""
+        if strategy_type:
+            if strategy_type.startswith("swing"):
+                strategy_display = "🌊 Swing"
+            elif strategy_type.startswith("sniper"):
+                strategy_display = "🎯 Sniper"
+            else:
+                strategy_display = "⚡ Scalp"
+
+        type_line = f"\nType: <b>{strategy_display}</b>" if strategy_display else ""
+        conf_line = f"\nConfidence: <b>{confidence}%</b>" if confidence > 0 else ""
+        tp_line = f"\nTP Level: <b>${tp_price:,.6f}</b>" if tp_price > 0 else ""
+        dur_line = f"\nDuration: <b>{duration_minutes}m</b>" if duration_minutes > 0 else ""
+        pnl_sign = "+" if pnl_usdt >= 0 else ""
+
+        msg = (
+            f"✅ <b>TP HIT</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>"
+            f"{type_line}"
+            f"{conf_line}\n\n"
+            f"Entry: <b>${entry_price:,.6f}</b>\n"
+            f"Close: <b>${close_price:,.6f}</b>"
+            f"{tp_line}"
+            f"{dur_line}\n\n"
+            f"P&L: <b>{pnl_emoji} {pnl_sign}${pnl_usdt:,.4f} ({pnl_sign}{pnl_pct:.2f}%)</b>"
+        )
+        await self.send(msg)
+
+    async def trade_closed_sl(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        close_price: float,
+        pnl_usdt: float,
+        pnl_pct: float,
+        strategy_type: str = "",
+        confidence: int = 0,
+        sl_price: float = 0.0,
+        duration_minutes: int = 0,
+    ):
+        """
+        V9: Position Manager — Stop Loss hit notification.
+        Sent when position_manager.py closes a trade at SL.
+        """
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+
+        strategy_display = ""
+        if strategy_type:
+            if strategy_type.startswith("swing"):
+                strategy_display = "🌊 Swing"
+            elif strategy_type.startswith("sniper"):
+                strategy_display = "🎯 Sniper"
+            else:
+                strategy_display = "⚡ Scalp"
+
+        type_line = f"\nType: <b>{strategy_display}</b>" if strategy_display else ""
+        conf_line = f"\nConfidence: <b>{confidence}%</b>" if confidence > 0 else ""
+        sl_line = f"\nSL Level: <b>${sl_price:,.6f}</b>" if sl_price > 0 else ""
+        dur_line = f"\nDuration: <b>{duration_minutes}m</b>" if duration_minutes > 0 else ""
+        pnl_sign = "+" if pnl_usdt >= 0 else ""
+
+        msg = (
+            f"🛑 <b>SL HIT</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>"
+            f"{type_line}"
+            f"{conf_line}\n\n"
+            f"Entry: <b>${entry_price:,.6f}</b>\n"
+            f"Close: <b>${close_price:,.6f}</b>"
+            f"{sl_line}"
+            f"{dur_line}\n\n"
+            f"P&L: <b>📉 {pnl_sign}${pnl_usdt:,.4f} ({pnl_sign}{pnl_pct:.2f}%)</b>"
+        )
+        await self.send(msg)
+
+    async def trade_closed_trailing(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        close_price: float,
+        pnl_usdt: float,
+        pnl_pct: float,
+        peak_price: float = 0.0,
+        strategy_type: str = "",
+        duration_minutes: int = 0,
+    ):
+        """
+        V9: Position Manager — Trailing stop exit notification.
+        """
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        pnl_emoji = "📈" if pnl_usdt >= 0 else "📉"
+        pnl_sign = "+" if pnl_usdt >= 0 else ""
+
+        strategy_display = ""
+        if strategy_type:
+            if strategy_type.startswith("swing"):
+                strategy_display = "🌊 Swing"
+            elif strategy_type.startswith("sniper"):
+                strategy_display = "🎯 Sniper"
+            else:
+                strategy_display = "⚡ Scalp"
+
+        type_line = f"\nType: <b>{strategy_display}</b>" if strategy_display else ""
+        peak_line = f"\nPeak: <b>${peak_price:,.6f}</b>" if peak_price > 0 else ""
+        dur_line = f"\nDuration: <b>{duration_minutes}m</b>" if duration_minutes > 0 else ""
+
+        msg = (
+            f"📈 <b>TRAILING EXIT</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>"
+            f"{type_line}\n\n"
+            f"Entry: <b>${entry_price:,.6f}</b>\n"
+            f"Close: <b>${close_price:,.6f}</b>"
+            f"{peak_line}"
+            f"{dur_line}\n\n"
+            f"P&L: <b>{pnl_emoji} {pnl_sign}${pnl_usdt:,.4f} ({pnl_sign}{pnl_pct:.2f}%)</b>\n\n"
+            f"<i>Position trailed to profit — locked in gains</i>"
+        )
+        await self.send(msg)
+
+    async def position_manager_started(self, version: str = "V9"):
+        """V9: Notify that Position Manager has started/restarted."""
+        msg = (
+            f"🤖 <b>POSITION MANAGER STARTED</b>\n\n"
+            f"Version: <b>{version}</b>\n"
+            f"Status: <b>✅ Online — monitoring all open positions</b>\n\n"
+            f"<i>Will auto-close trades on TP/SL/trailing trigger.</i>"
+        )
+        await self.send(msg)
+
+    async def position_manager_error(self, error: str, context: str = ""):
+        """V9: Alert when Position Manager encounters a critical error."""
+        ctx_line = f"\nContext: <code>{context[:150]}</code>" if context else ""
+        msg = (
+            f"🔥 <b>POSITION MANAGER ERROR</b>\n\n"
+            f"Error: <code>{error[:300]}</code>"
+            f"{ctx_line}\n\n"
+            f"⚠️ <b>Positions may not be monitored — check VPS!</b>"
+        )
+        await self.send(msg)
+
+    async def close_failed_manual(self, symbol: str, side: str, reason: str, error: str):
+        """V9: Alert when Position Manager cannot close a position — needs manual action."""
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        msg = (
+            f"🔥 <b>CLOSE FAILED — MANUAL ACTION REQUIRED</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Trigger: <b>{reason}</b>\n\n"
+            f"Error: <code>{error[:200]}</code>\n\n"
+            f"⚠️ <b>Close this position manually on Binance immediately!</b>"
+        )
+        await self.send(msg)
+

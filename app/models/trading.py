@@ -268,3 +268,78 @@ class DailyPnlLog(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# V9 Position Manager — Open Position Tracking
+# ═══════════════════════════════════════════════════════════════════════
+
+class OpenPosition(Base):
+    """
+    V9: Live position tracking for the Position Manager bot.
+
+    Written at trade OPEN by the main bot.
+    Read every loop iteration by position_manager.py.
+    Updated to status='closed' when TP/SL/trailing triggers.
+
+    Strategy-aware: stores the exact TP/SL prices computed by RiskEngine
+    at trade open time — no re-calculation needed later.
+    """
+    __tablename__ = "open_positions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # ── Identity ─────────────────────────────────────────────────────
+    account_id = Column(Integer, ForeignKey("accounts.id"), nullable=False, index=True)
+    trade_id = Column(Integer, ForeignKey("trades.id"), nullable=True)  # link to trades table
+    symbol = Column(String(20), nullable=False, index=True)
+    side = Column(String(10), nullable=False)             # BUY | SELL
+
+    # ── Entry data ───────────────────────────────────────────────────
+    entry_price = Column(Float, nullable=False)
+    quantity = Column(Float, nullable=False)
+    leverage = Column(Integer, default=1)
+    position_size_usdt = Column(Float, default=0.0)
+
+    # ── Strategy context (preserved from signal engine) ───────────────
+    strategy_type = Column(String(30), nullable=True)    # scalp_trend_pullback | swing_* | sniper_*
+    timeframe = Column(String(10), nullable=True)        # 1m | 5m | 15m | 4h
+    confidence = Column(Integer, default=0)
+    regime = Column(String(30), nullable=True)
+
+    # ── TP/SL prices (computed by RiskEngine at open — exact formulas) ─
+    tp_price = Column(Float, nullable=False)
+    sl_price = Column(Float, nullable=False)
+    tp_pct = Column(Float, default=0.0)   # e.g. 3.5 (percent)
+    sl_pct = Column(Float, default=0.0)   # e.g. 1.5 (percent)
+
+    # ── Trailing stop (optional, activated after BE trigger) ──────────
+    trailing_active = Column(Boolean, default=False)
+    trailing_sl_price = Column(Float, nullable=True)    # Current trailing SL price
+    trailing_trigger_pct = Column(Float, default=0.0)   # % profit to activate trailing
+    highest_price = Column(Float, nullable=True)        # Peak price seen (for trailing calc)
+    lowest_price = Column(Float, nullable=True)         # Trough price seen (for trailing calc)
+
+    # ── Binance execution IDs (may be None if broker protection disabled) ─
+    entry_order_id = Column(String(50), nullable=True)
+
+    # ── Hedge mode flags (needed for correct reduceOnly / positionSide) ─
+    is_hedge_mode = Column(Boolean, default=False)
+    position_side = Column(String(10), default="BOTH")   # BOTH | LONG | SHORT
+
+    # ── Status ───────────────────────────────────────────────────────
+    status = Column(String(20), default="open", nullable=False, index=True)
+    # open | closed | error
+    close_price = Column(Float, nullable=True)
+    close_reason = Column(String(30), nullable=True)     # tp_hit | sl_hit | trailing_exit | manual
+    pnl_usdt = Column(Float, nullable=True)
+    pnl_pct = Column(Float, nullable=True)
+
+    # ── Monitoring metadata ───────────────────────────────────────────
+    last_checked_at = Column(DateTime, nullable=True)
+    last_price = Column(Float, nullable=True)            # Last known market price
+    check_count = Column(Integer, default=0)
+
+    # ── Timestamps ───────────────────────────────────────────────────
+    opened_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    closed_at = Column(DateTime, nullable=True)
+

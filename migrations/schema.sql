@@ -283,3 +283,71 @@ CREATE TABLE IF NOT EXISTS payments (
 );
 CREATE INDEX IF NOT EXISTS idx_payments_user ON payments(user_id);
 CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_at);
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- V9 Position Manager — open_positions tracking table
+-- Written at trade OPEN. Monitored 24/7 by position_manager.py.
+-- ═══════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS open_positions (
+    id SERIAL PRIMARY KEY,
+
+    -- Identity
+    account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    trade_id   INTEGER REFERENCES trades(id),
+    symbol     VARCHAR(20) NOT NULL,
+    side       VARCHAR(10) NOT NULL,          -- BUY | SELL
+
+    -- Entry
+    entry_price        DOUBLE PRECISION NOT NULL,
+    quantity           DOUBLE PRECISION NOT NULL,
+    leverage           INTEGER          NOT NULL DEFAULT 1,
+    position_size_usdt DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+
+    -- Strategy context (preserved from signal engine)
+    strategy_type VARCHAR(30),               -- scalp_trend_pullback | swing_* | sniper_*
+    timeframe     VARCHAR(10),               -- 1m | 5m | 15m | 4h
+    confidence    INTEGER DEFAULT 0,
+    regime        VARCHAR(30),
+
+    -- TP/SL prices (computed by RiskEngine at open — exact, not static)
+    tp_price DOUBLE PRECISION NOT NULL,
+    sl_price DOUBLE PRECISION NOT NULL,
+    tp_pct   DOUBLE PRECISION DEFAULT 0.0,
+    sl_pct   DOUBLE PRECISION DEFAULT 0.0,
+
+    -- Trailing stop
+    trailing_active      BOOLEAN          DEFAULT FALSE,
+    trailing_sl_price    DOUBLE PRECISION,
+    trailing_trigger_pct DOUBLE PRECISION DEFAULT 0.0,
+    highest_price        DOUBLE PRECISION,
+    lowest_price         DOUBLE PRECISION,
+
+    -- Binance entry order
+    entry_order_id VARCHAR(50),
+
+    -- Hedge mode flags
+    is_hedge_mode BOOLEAN     DEFAULT FALSE,
+    position_side VARCHAR(10) DEFAULT 'BOTH',   -- BOTH | LONG | SHORT
+
+    -- Status
+    status        VARCHAR(20) NOT NULL DEFAULT 'open',  -- open | closed | error
+    close_price   DOUBLE PRECISION,
+    close_reason  VARCHAR(30),   -- tp_hit | sl_hit | trailing_exit | manual
+    pnl_usdt      DOUBLE PRECISION,
+    pnl_pct       DOUBLE PRECISION,
+
+    -- Monitoring
+    last_checked_at TIMESTAMP,
+    last_price      DOUBLE PRECISION,
+    check_count     INTEGER DEFAULT 0,
+
+    -- Timestamps
+    opened_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    closed_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_open_positions_account ON open_positions(account_id);
+CREATE INDEX IF NOT EXISTS idx_open_positions_symbol  ON open_positions(symbol);
+CREATE INDEX IF NOT EXISTS idx_open_positions_status  ON open_positions(status);
+CREATE INDEX IF NOT EXISTS idx_open_positions_opened  ON open_positions(opened_at);

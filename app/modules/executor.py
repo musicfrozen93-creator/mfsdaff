@@ -72,6 +72,9 @@ class OrderResult:
     # V7: TP/SL atomic protection
     tp_sl_protection_failed: bool = False   # True if TP/SL couldn't be attached
     emergency_closed: bool = False          # True if position was emergency-closed
+    # V9: Hedge mode info (needed by Position Manager)
+    is_hedge_mode: bool = False
+    position_side: str = "BOTH"             # BOTH | LONG | SHORT
 
 
 @dataclass
@@ -1251,6 +1254,8 @@ class BinanceExecutor:
                 tp2_order_id=tp2_order.get("orderId") if tp2_order else None,
                 tp1_attached=tp1_attached,
                 tp2_attached=tp2_attached,
+                is_hedge_mode=is_hedge_mode,
+                position_side=position_side,
             )
 
         except Exception as e:
