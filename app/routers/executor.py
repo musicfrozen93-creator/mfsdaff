@@ -329,7 +329,6 @@ async def execute_multi_account(req: MultiExecuteRequest):
                 )
             )
             for acc, conn in rows.all():
-                if conn.api_key_encrypted:
                     accounts_data.append({
                         "id": acc.id,
                         "label": acc.label,
