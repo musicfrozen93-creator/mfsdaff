@@ -18,7 +18,7 @@ services:
     networks:
       - bot-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U botuser -d trading_bot"]
+      test: [ "CMD-SHELL", "pg_isready -U botuser -d trading_bot" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -74,8 +74,8 @@ services:
   position-manager:
     build: .
     container_name: position-manager
-    # Override the default CMD to run position_manager.py instead of FastAPI
-    command: ["python", "position_manager.py"]
+    # WORKDIR is /app, file is copied to /app/position_manager.py
+    command: [ "python", "/app/position_manager.py" ]
     environment:
       # Database
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}

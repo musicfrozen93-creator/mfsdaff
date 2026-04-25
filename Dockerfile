@@ -14,6 +14,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY app/ ./app/
 COPY migrations/ ./migrations/
+# V10: copy position manager (root-level standalone service)
+COPY position_manager.py ./position_manager.py
 
 # Create logs directory
 RUN mkdir -p logs

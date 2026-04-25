@@ -508,9 +508,7 @@ async def execute_multi_account(req: MultiExecuteRequest):
 
     async def execute_for_account(acc_data: dict):
         nonlocal best_fill_price, best_leverage, best_tp, best_sl
-        nonlocal best_tp_pct, best_sl_pct, best_grade
-        nonlocal all_sl_attached, all_tp_attached, best_order_method
-        nonlocal best_sl_order_id, best_tp_order_id, best_rr
+        nonlocal best_tp_pct, best_sl_pct, best_grade, best_order_method, best_rr
 
         async with semaphore:
             acc_id = acc_data["id"]
