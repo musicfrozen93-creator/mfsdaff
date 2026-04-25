@@ -313,7 +313,14 @@ async def execute_multi_account(req: MultiExecuteRequest):
             signal_id = signal.id
             logger.info(f"📝 Signal #{signal_id} saved: {symbol} {side} conf={req.confidence}")
     except Exception as e:
-        logger.warning(f"Failed to save signal to DB: {e}")
+        # Log at ERROR (not WARNING) so schema errors like
+        # "column does not exist" are immediately visible in logs.
+        logger.error(
+            f"❌ Failed to save signal to DB: {e} — "
+            f"check schema migration if error mentions missing columns",
+            exc_info=True,
+        )
+        # Do NOT abort — signal save is non-critical; continue to account loading
 
     # ── Load active accounts (direct JOIN — bypass ORM relationship) ────
     # Uses sqlalchemy.true() for DB-safe boolean comparisons (avoids Python True
@@ -420,11 +427,14 @@ async def execute_multi_account(req: MultiExecuteRequest):
                 "api_secret_enc": None,
             }]
         else:
-            err_detail = f" (query error: {_load_error})" if _load_error else ""
+            err_detail = f" — cause: {_load_error}" if _load_error else ""
             logger.error(
                 f"❌ No active accounts found and no master API key configured{err_detail}"
             )
-            return {"status": "error", "message": "No active accounts found"}
+            return {
+                "status": "error",
+                "message": f"No active accounts found{err_detail}",
+            }
 
     # ── V4: Pre-entry check ONCE (symbol-level, not per account) ─────
     risk_engine = RiskEngine()

@@ -163,12 +163,12 @@ CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
 -- ═══════════════════════════════════════════════════════════════════════
 
 -- V5: Add strategy tracking to signals
-ALTER TABLE signals ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(30);
-ALTER TABLE signals ADD COLUMN IF NOT EXISTS regime VARCHAR(30);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(100);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS regime VARCHAR(100);
 
--- V5: Add strategy tracking to trades
-ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(30);
-ALTER TABLE trades ADD COLUMN IF NOT EXISTS regime VARCHAR(30);
+-- V5: Add strategy tracking to trades  ← PRIMARY FIX (was missing from live DB)
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS strategy_type VARCHAR(100);
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS regime VARCHAR(100);
 
 -- ── Swing Watchlist ─────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS swing_watchlist (
