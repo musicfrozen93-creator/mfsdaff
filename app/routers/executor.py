@@ -19,7 +19,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, true
 
 
 from app.modules.risk_engine import RiskEngine
@@ -316,32 +316,103 @@ async def execute_multi_account(req: MultiExecuteRequest):
         logger.warning(f"Failed to save signal to DB: {e}")
 
     # ── Load active accounts (direct JOIN — bypass ORM relationship) ────
+    # Uses sqlalchemy.true() for DB-safe boolean comparisons (avoids Python True
+    # comparison mismatches with asyncpg on some PostgreSQL column types).
     accounts_data = []
+    _load_error: str | None = None
     try:
         async with async_session() as session:
-            rows = await session.execute(
+            stmt = (
                 select(Account, ApiConnection)
                 .join(ApiConnection, ApiConnection.account_id == Account.id)
                 .where(
-                    Account.is_active == True,
-                    Account.bot_enabled == True,
-                    ApiConnection.is_active == True,
+                    Account.is_active == true(),
+                    Account.bot_enabled == true(),
+                    ApiConnection.is_active == true(),
                 )
             )
-            for acc, conn in rows.all():
-                    accounts_data.append({
-                        "id": acc.id,
-                        "label": acc.label,
-                        "api_key_enc": conn.api_key_encrypted,
-                        "api_secret_enc": conn.api_secret_encrypted,
-                    })
-        logger.info(f"🔑 Loaded {len(accounts_data)} active account(s) via JOIN")
-    except Exception as e:
-        logger.warning(f"Failed to load accounts from DB: {e}")
+            result = await session.execute(stmt)
+            raw_rows = result.all()  # consume cursor ONCE into a list
 
-    # Fallback to master account if no DB accounts
+            logger.info(f"🔍 Account JOIN query returned {len(raw_rows)} raw row(s)")
+
+            for row in raw_rows:
+                acc: Account = row[0]
+                conn: ApiConnection = row[1]
+
+                logger.info(
+                    f"  → Account found: id={acc.id} label='{acc.label}' "
+                    f"is_active={acc.is_active} bot_enabled={acc.bot_enabled} "
+                    f"conn.is_active={conn.is_active} "
+                    f"has_key={bool(conn.api_key_encrypted)} "
+                    f"has_secret={bool(conn.api_secret_encrypted)}"
+                )
+
+                # Guard: encrypted keys must not be empty
+                if not conn.api_key_encrypted:
+                    logger.warning(
+                        f"  ⚠️ Skipped account id={acc.id} ('{acc.label}'): "
+                        f"api_key_encrypted is NULL/empty in DB"
+                    )
+                    continue
+                if not conn.api_secret_encrypted:
+                    logger.warning(
+                        f"  ⚠️ Skipped account id={acc.id} ('{acc.label}'): "
+                        f"api_secret_encrypted is NULL/empty in DB"
+                    )
+                    continue
+
+                # Verify decrypt works NOW — fail loudly, not silently later
+                try:
+                    _test_key = decrypt_api_key(conn.api_key_encrypted)
+                    _test_secret = decrypt_api_key(conn.api_secret_encrypted)
+                    if not _test_key or not _test_secret:
+                        raise ValueError("Decrypted value is empty string")
+                except Exception as dec_err:
+                    logger.error(
+                        f"  ❌ DECRYPT FAILED for account id={acc.id} ('{acc.label}'): "
+                        f"{dec_err} — check ENCRYPTION_KEY env var matches what was used "
+                        f"when the key was originally stored"
+                    )
+                    continue
+
+                accounts_data.append({
+                    "id": acc.id,
+                    "label": acc.label,
+                    "api_key_enc": conn.api_key_encrypted,
+                    "api_secret_enc": conn.api_secret_encrypted,
+                })
+                logger.info(f"  ✅ Account id={acc.id} ('{acc.label}') added to execution list")
+
+        if raw_rows and not accounts_data:
+            logger.error(
+                f"❌ {len(raw_rows)} DB row(s) found but ALL were filtered out "
+                f"(likely decrypt failure or empty encrypted keys). "
+                f"Check ENCRYPTION_KEY and api_connections table data."
+            )
+        elif not raw_rows:
+            logger.error(
+                "❌ Account JOIN returned 0 rows. "
+                "Verify: accounts.is_active=true, accounts.bot_enabled=true, "
+                "api_connections.is_active=true, and account_id FK is correct."
+            )
+        else:
+            logger.info(f"🔑 {len(accounts_data)} account(s) ready for execution")
+
+    except Exception as e:
+        _load_error = str(e)
+        logger.error(
+            f"❌ CRITICAL: Account loading query failed with exception: {e}",
+            exc_info=True,
+        )
+
+    # Fallback to master account only if env key is explicitly set
     if not accounts_data:
-        if settings.BINANCE_API_KEY:
+        master_key = (settings.BINANCE_API_KEY or "").strip()
+        if master_key:
+            logger.warning(
+                "⚠️ No DB accounts loaded — falling back to master BINANCE_API_KEY env var"
+            )
             accounts_data = [{
                 "id": 0,
                 "label": "Master",
@@ -349,6 +420,10 @@ async def execute_multi_account(req: MultiExecuteRequest):
                 "api_secret_enc": None,
             }]
         else:
+            err_detail = f" (query error: {_load_error})" if _load_error else ""
+            logger.error(
+                f"❌ No active accounts found and no master API key configured{err_detail}"
+            )
             return {"status": "error", "message": "No active accounts found"}
 
     # ── V4: Pre-entry check ONCE (symbol-level, not per account) ─────
