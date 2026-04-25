@@ -492,7 +492,8 @@ async def execute_multi_account(req: MultiExecuteRequest):
     skipped = []
     skip_reasons_map = {}
 
-    # V4: Track best trade result for the single Telegram message
+    # V10: Track best trade result for the single Telegram message
+    # Note: sl_attached / tp_attached removed — Protection Engine owns that
     best_fill_price = 0.0
     best_leverage = 0
     best_tp = 0.0
@@ -500,12 +501,7 @@ async def execute_multi_account(req: MultiExecuteRequest):
     best_tp_pct = 0.0
     best_sl_pct = 0.0
     best_grade = "C"
-    all_sl_attached = True
-    all_tp_attached = True
     best_order_method = "MARKET"
-    # V5.5: Track order IDs for proof + R:R
-    best_sl_order_id = ""
-    best_tp_order_id = ""
     best_rr = 0.0
 
     semaphore = asyncio.Semaphore(5)  # Max 5 concurrent account executions
@@ -679,11 +675,16 @@ async def execute_multi_account(req: MultiExecuteRequest):
                                 risk_pct=trade_params.risk_pct,
                                 confidence=req.confidence,
                                 order_id=str(result.order_id),
-                                sl_order_id=str(result.stop_loss_order_id) if result.stop_loss_order_id else None,
-                                tp_order_id=str(result.take_profit_order_id) if result.take_profit_order_id else None,
+                                sl_order_id=None,   # V10: No native SL placed -- Protection Engine manages
+                                tp_order_id=None,   # V10: No native TP placed -- Protection Engine manages
                                 status="open",
                                 strategy_type=req.strategy_type,
                                 regime=req.regime,
+                                # V10: Protection Engine lifecycle
+                                protection_status="PENDING",
+                                virtual_sl=trade_params.stop_loss,
+                                virtual_tp=trade_params.take_profit,
+                                managed_by="external_engine",
                             )
                             session.add(trade)
                             await session.commit()
@@ -758,7 +759,8 @@ async def execute_multi_account(req: MultiExecuteRequest):
                     except Exception as le:
                         logger.debug(f"  [{internal_label}] Learning engine record failed: {le}")
 
-                    # Track best result for Telegram message
+                    # V10: Track best result for Telegram message
+                    # sl_attached/tp_attached removed — Protection Engine owns TP/SL
                     if result.fill_price > 0:
                         best_fill_price = result.fill_price
                     best_leverage = trade_params.leverage
@@ -769,20 +771,12 @@ async def execute_multi_account(req: MultiExecuteRequest):
                     best_grade = trade_params.setup_grade
                     best_order_method = getattr(result, 'order_method', 'MARKET')
                     best_rr = trade_params.risk_reward
-                    if result.stop_loss_order_id:
-                        best_sl_order_id = str(result.stop_loss_order_id)
-                    if result.take_profit_order_id:
-                        best_tp_order_id = str(result.take_profit_order_id)
-                    if not result.sl_attached:
-                        all_sl_attached = False
-                    if not result.tp_attached:
-                        all_tp_attached = False
 
                     logger.info(
-                        f"  ✅ [{internal_label}] EXECUTED: "
+                        f"  [V10] [{internal_label}] EXECUTED: "
                         f"order=#{result.order_id} fill={result.fill_price} "
                         f"method={best_order_method} "
-                        f"SL_ok={result.sl_attached} TP_ok={result.tp_attached}"
+                        f"-- Protection Engine will manage TP/SL"
                     )
 
                     return {
@@ -797,7 +791,8 @@ async def execute_multi_account(req: MultiExecuteRequest):
                         "sl_pct": trade_params.sl_pct,
                         "setup_grade": trade_params.setup_grade,
                         "fill_price": result.fill_price,
-                        "sl_attached": result.sl_attached,
+                        # V10: No sl_attached/tp_attached -- Protection Engine manages
+                        "protection_mode": "external_engine",
                         "tp_attached": result.tp_attached,
                         "order_method": best_order_method,
                     }
@@ -891,7 +886,7 @@ async def execute_multi_account(req: MultiExecuteRequest):
     skipped_count = len(skipped)
 
     if executed_count > 0:
-        # At least one account traded → send execution result
+        # At least one account traded -- send execution result
         display_fill = best_fill_price if best_fill_price > 0 else entry_price
 
         await telegram.send_execution_result(
@@ -910,14 +905,12 @@ async def execute_multi_account(req: MultiExecuteRequest):
             sl_pct=best_sl_pct,
             reason=req.reason,
             setup_grade=best_grade,
-            sl_attached=all_sl_attached,
-            tp_attached=all_tp_attached,
             order_method=best_order_method,
             strategy_type=req.strategy_type,
             regime=req.regime,
-            sl_order_id=best_sl_order_id,
-            tp_order_id=best_tp_order_id,
             risk_reward=best_rr,
+            # V10: Protection Engine manages TP/SL -- no attachment flags
+            protection_mode="external_engine",
         )
     elif skipped_count > 0:
         # V4: All accounts skipped — send compact no-execution message
@@ -947,6 +940,9 @@ async def execute_multi_account(req: MultiExecuteRequest):
         "executed": executed,
         "skipped": skipped,
         "skip_reasons": skip_reasons_map,
+        # V10: entry engine only, protection is external
+        "protection_mode": "external_engine",
+        "entry_opened": executed_count > 0,
     }
 
 

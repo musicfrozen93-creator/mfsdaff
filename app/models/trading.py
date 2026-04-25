@@ -65,6 +65,12 @@ class Trade(Base):
     regime = Column(String(30), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     closed_at = Column(DateTime, nullable=True)
+    # V10: Protection Engine lifecycle tracking
+    protection_status = Column(String(30), default="PENDING", nullable=True)  # PENDING | ACTIVE | CLOSED
+    virtual_sl = Column(Float, nullable=True)     # SL price managed by Protection Engine
+    virtual_tp = Column(Float, nullable=True)     # TP price managed by Protection Engine
+    managed_by = Column(String(50), default="external_engine", nullable=True)  # which engine closed
+    opened_at = Column(DateTime, default=datetime.utcnow, nullable=True)
 
     # Relationships
     signal = relationship("Signal", back_populates="trades")

@@ -1,4 +1,4 @@
-"""
+﻿"""
 V8 Binance Futures Execution Module
 
 Key V8 changes:
@@ -854,23 +854,31 @@ class BinanceExecutor:
         )
         return False
 
-    # ─── V4: Full Trade Flow (LIMIT→MARKET Fallback + Position Verify) ──
+    # --- V10: Entry-Only Trade Execution (2-Engine Architecture) ---
 
     async def execute_trade(self, params, telegram_notifier=None) -> OrderResult:
         """
-        V9 Full trade execution flow:
-        1. Get precision + detect Hedge/One-way mode
-        2. Validate notional + min qty
-        3. Pre-validate TP/SL BEFORE entry (SKIP if invalid — no naked positions)
-        4. Set leverage + margin type
-        5. Try LIMIT → MARKET fallback entry
-        6. Verify position + get actual fill price
-        7. Recalculate TP/SL from fill price (tick-snapped)
-        8. Place SL + TP with 3-retry (hedge-mode-aware, no invalid timeInForce)
-        9. Emergency close ONLY if TP/SL fails post-entry
+        V10 Entry-Only Trade Execution (2-Engine Architecture).
+
+        System A responsibilities (this method ONLY):
+          1. Get precision + detect Hedge/One-way mode
+          2. Validate notional + min qty
+          3. Set leverage + margin type
+          4. Place entry order (LIMIT->MARKET fallback)
+          5. Verify position + capture actual fill price
+          6. Return success — NO TP/SL placement here
+
+        System B (position_manager.py) handles ALL protection:
+          - Stop loss, take profit, trailing stop, break-even, emergency close
+
+        Why: Legacy TP/SL placement caused Binance -4120 errors which triggered
+        the emergency close BEFORE the Protection Engine could manage the trade.
+
+        NOTE: telegram_notifier parameter kept for API compatibility but is not
+        used in this method. Protection Engine sends its own Telegram alerts.
         """
         symbol = params.symbol  # Defined BEFORE try so except block always has it
-        logger.info(f"⚡ V8 Executing {params.side} on {symbol} (lev={params.leverage}x qty={params.quantity})...")
+        logger.info(f">> V10 Entry-Only: {params.side} {symbol} (lev={params.leverage}x qty={params.quantity})...")
 
         try:
             precision = await self.get_precision(symbol)
@@ -882,67 +890,18 @@ class BinanceExecutor:
             if params.quantity < precision.min_qty:
                 raise ValueError(f"Qty {params.quantity} below min {precision.min_qty}")
 
-            # ── V8: Detect account position mode ─────────────────────
+            # V8: Detect account position mode (Hedge vs One-way)
             is_hedge_mode = await self.detect_position_mode()
             position_side = "BOTH"  # One-way default
             if is_hedge_mode:
                 position_side = "LONG" if params.side == "BUY" else "SHORT"
-                logger.info(f"  🔀 V8 Hedge Mode: positionSide={position_side}")
+                logger.info(f"  [V10] Hedge Mode detected: positionSide={position_side}")
 
-            # ── V8: Pre-compute estimated TP/SL for dry-run check ────
-            # Use entry_price as estimate (will be recalculated post-fill)
-            est_price = params.entry_price
-            if hasattr(params, 'tp_pct') and params.tp_pct > 0:
-                tp_pct_decimal = params.tp_pct / 100.0
-                sl_pct_decimal = params.sl_pct / 100.0
-                if params.side == "BUY":
-                    est_tp = round(est_price * (1 + tp_pct_decimal), precision.price_precision)
-                    est_sl = round(est_price * (1 - sl_pct_decimal), precision.price_precision)
-                else:
-                    est_tp = round(est_price * (1 - tp_pct_decimal), precision.price_precision)
-                    est_sl = round(est_price * (1 + sl_pct_decimal), precision.price_precision)
-            else:
-                est_tp = params.take_profit
-                est_sl = params.stop_loss
-
-            # ══════════════════════════════════════════════════════════
-            # V8: PRE-TRADE TP/SL DRY-RUN VALIDATION
-            # STRICT RULE: SKIP TRADE ENTIRELY if TP/SL cannot be placed.
-            # No position opened. No fees. No emergency close needed.
-            # ══════════════════════════════════════════════════════════
-            can_proceed, validation_reason = await self.can_place_tp_sl(
-                symbol=symbol,
-                side=params.side,
-                entry_price=est_price,
-                tp_price=est_tp,
-                sl_price=est_sl,
-                precision=precision,
-                is_hedge_mode=is_hedge_mode,
-                quantity=params.quantity if is_hedge_mode else 0.0,
-            )
-
-            if not can_proceed:
-                logger.warning(
-                    f"  🛡️ V8 PRE-TRADE PROTECTION: Skipping {symbol} — "
-                    f"TP/SL cannot be guaranteed: {validation_reason}"
-                )
-                return OrderResult(
-                    success=False,
-                    order_id=None,
-                    symbol=symbol,
-                    side=params.side,
-                    quantity=params.quantity,
-                    entry_price=params.entry_price,
-                    error=f"PRE_TRADE_SKIP: {validation_reason}",
-                    tp_sl_protection_failed=True,
-                    emergency_closed=False,
-                )
-
-            # Configure margin + leverage
+            # Configure margin type + leverage
             await self.set_margin_type(symbol, "ISOLATED")
             await self.set_leverage(symbol, params.leverage)
 
-            # ── LIMIT → MARKET fallback ───────────────────────────────
+            # LIMIT -> MARKET fallback entry
             order = None
             order_method = "MARKET"
             fill_price = 0.0
@@ -953,12 +912,12 @@ class BinanceExecutor:
                     limit_price = book["ask"] if params.side == "BUY" else book["bid"]
 
                     if limit_price > 0:
-                        logger.info(f"  📝 Trying LIMIT order at {limit_price}...")
+                        logger.info(f"  [V10] Trying LIMIT order at {limit_price}...")
                         order = await self.place_limit_order(
                             symbol, params.side, params.quantity, limit_price, precision
                         )
                         limit_order_id = order["orderId"]
-                        logger.info(f"  📝 LIMIT order placed: #{limit_order_id}")
+                        logger.info(f"  [V10] LIMIT placed: #{limit_order_id}")
 
                         await asyncio.sleep(settings.LIMIT_ORDER_WAIT_SECONDS)
 
@@ -968,13 +927,13 @@ class BinanceExecutor:
                         if status == "FILLED":
                             order_method = "LIMIT"
                             fill_price = self._get_fill_price(order_status)
-                            logger.info(f"  ✅ LIMIT order FILLED: fill_price={fill_price}")
+                            logger.info(f"  [V10] LIMIT FILLED: fill_price={fill_price}")
                         else:
-                            logger.info(f"  ⏳ LIMIT status={status} — cancelling, switching to MARKET")
+                            logger.info(f"  [V10] LIMIT status={status} -- cancelling, falling back to MARKET")
                             try:
                                 await self.cancel_order(symbol, limit_order_id)
                             except Exception as ce:
-                                logger.warning(f"  Cancel failed: {ce}")
+                                logger.warning(f"  [V10] Cancel failed: {ce}")
                                 recheck = await self.get_order_status(symbol, limit_order_id)
                                 if recheck.get("status") == "FILLED":
                                     order_method = "LIMIT"
@@ -984,7 +943,7 @@ class BinanceExecutor:
                             if order_method != "LIMIT":
                                 order = None
                 except Exception as le:
-                    logger.warning(f"  LIMIT attempt failed: {le} — falling back to MARKET")
+                    logger.warning(f"  [V10] LIMIT attempt failed: {le} -- falling back to MARKET")
                     order = None
 
             # MARKET entry (primary or fallback)
@@ -992,11 +951,11 @@ class BinanceExecutor:
                 order = await self.place_market_order(symbol, params.side, params.quantity, precision)
                 order_method = "MARKET"
                 fill_price = self._get_fill_price(order)
-                logger.info(f"  ✅ MARKET order: #{order['orderId']} fill={fill_price}")
+                logger.info(f"  [V10] MARKET order: #{order['orderId']} fill={fill_price}")
 
             order_id = order["orderId"]
 
-            # ── Verify position + get actual fill price ───────────────
+            # Verify position + get actual fill price from exchange
             position_data = await self._verify_position(symbol)
             if position_data:
                 pos_entry = float(position_data.get("entryPrice", 0))
@@ -1005,236 +964,16 @@ class BinanceExecutor:
 
             if fill_price <= 0:
                 fill_price = params.entry_price
-                logger.warning(f"  ⚠️ Could not determine fill price, using estimate: {fill_price}")
+                logger.warning(f"  [V10] Could not determine fill price, using signal price: {fill_price}")
 
-            # ── Recalculate TP/SL from ACTUAL fill price ──────────────
-            if hasattr(params, 'tp_pct') and params.tp_pct > 0:
-                tp_pct_decimal = params.tp_pct / 100.0
-                sl_pct_decimal = params.sl_pct / 100.0
-                if params.side == "BUY":
-                    actual_tp = round(fill_price * (1 + tp_pct_decimal), precision.price_precision)
-                    actual_sl = round(fill_price * (1 - sl_pct_decimal), precision.price_precision)
-                else:
-                    actual_tp = round(fill_price * (1 - tp_pct_decimal), precision.price_precision)
-                    actual_sl = round(fill_price * (1 + sl_pct_decimal), precision.price_precision)
-            else:
-                actual_tp = params.take_profit
-                actual_sl = params.stop_loss
-
-            close_side = "SELL" if params.side == "BUY" else "BUY"
-            qty_for_hedge = params.quantity  # Used when position_side is LONG/SHORT
-
+            # Entry complete -- Protection Engine takes over from here
+            # position_manager.py will read open_positions table and apply TP/SL/trailing
             logger.info(
-                f"  🛡️ V9 Bracket protection: {symbol} fill={fill_price} "
-                f"SL={actual_sl} TP={actual_tp} side={close_side} "
-                f"hedge={is_hedge_mode} position_side={position_side}"
+                f"  [V10] Entry COMPLETE: {symbol} {params.side} "
+                f"fill={fill_price} order=#{order_id} method={order_method} "
+                f"hedge={is_hedge_mode} pos_side={position_side} "
+                f"-- Protection Engine will manage TP/SL"
             )
-
-            # ── V9: SL with retry (hedge-mode-aware, tick-snapped) ─────
-            async def _sl_placer(sym, s, price, prec):
-                return await self.place_stop_loss(
-                    sym, s, price, prec,
-                    position_side=position_side,
-                    quantity=qty_for_hedge if is_hedge_mode else 0.0,
-                )
-
-            sl_order, sl_error = await self._place_with_retry(
-                _sl_placer, "STOP_LOSS",
-                symbol, close_side, actual_sl, precision,
-            )
-
-            # ── V5.5: Partial TP or Full TP ──────────────────────────
-            tp_order = None
-            tp_error = ""
-            tp1_order = None
-            tp2_order = None
-            tp1_attached = False
-            tp2_attached = False
-            partial_tp_used = False
-
-            if getattr(params, 'partial_tp_enabled', False) and params.quantity > 0:
-                # ── PARTIAL TP MODE ──────────────────────────────────
-                partial_tp_used = True
-                logger.info(f"  📊 Using PARTIAL TP mode for {symbol}")
-
-                # Recalculate partial TP prices from actual fill
-                if fill_price > 0 and hasattr(params, 'tp_pct') and params.tp_pct > 0:
-                    tp_pct_decimal = params.tp_pct / 100.0
-                    tp_distance = fill_price * tp_pct_decimal
-                    tp1_distance = tp_distance * settings.PARTIAL_TP1_DISTANCE
-
-                    if params.side == "BUY":
-                        actual_tp1 = round(fill_price + tp1_distance, precision.price_precision)
-                    else:
-                        actual_tp1 = round(fill_price - tp1_distance, precision.price_precision)
-                    actual_tp2 = actual_tp  # Full TP = TP2
-                else:
-                    actual_tp1 = params.tp1_price
-                    actual_tp2 = params.tp2_price
-
-                # Calculate quantities for each partial
-                tp1_qty = round(params.quantity * params.tp1_qty_pct, precision.quantity_precision)
-                tp2_qty = round(params.quantity * params.tp2_qty_pct, precision.quantity_precision)
-
-                # Ensure quantities respect min_qty
-                if tp1_qty < precision.min_qty:
-                    tp1_qty = precision.min_qty
-                if tp2_qty < precision.min_qty:
-                    tp2_qty = precision.min_qty
-
-                # TP1: 40% at halfway
-                try:
-                    tp1_result = await self.place_partial_take_profit(
-                        symbol, close_side, actual_tp1, tp1_qty, precision,
-                        position_side=position_side,
-                    )
-                    tp1_order = tp1_result
-                    tp1_attached = True
-                    logger.info(
-                        f"  ✅ TP1 placed: #{tp1_result.get('orderId')} "
-                        f"qty={tp1_qty} price={actual_tp1}"
-                    )
-                except Exception as e:
-                    logger.warning(f"  ⚠️ TP1 failed: {e}")
-
-                # TP2: 30% at full TP
-                try:
-                    tp2_result = await self.place_partial_take_profit(
-                        symbol, close_side, actual_tp2, tp2_qty, precision,
-                        position_side=position_side,
-                    )
-                    tp2_order = tp2_result
-                    tp2_attached = True
-                    logger.info(
-                        f"  ✅ TP2 placed: #{tp2_result.get('orderId')} "
-                        f"qty={tp2_qty} price={actual_tp2}"
-                    )
-                except Exception as e:
-                    logger.warning(f"  ⚠️ TP2 failed: {e}")
-
-                # Consider TP attached if at least TP1 succeeded
-                tp_attached_status = tp1_attached or tp2_attached
-                tp_order = tp1_order or tp2_order  # For backward compat
-
-            else:
-                # ── FULL TP MODE (hedge-mode-aware) ───────────────────
-                async def _tp_placer(sym, s, price, prec):
-                    return await self.place_take_profit(
-                        sym, s, price, prec,
-                        position_side=position_side,
-                        quantity=qty_for_hedge if is_hedge_mode else 0.0,
-                    )
-
-                tp_order, tp_error = await self._place_with_retry(
-                    _tp_placer, "TAKE_PROFIT",
-                    symbol, close_side, actual_tp, precision,
-                )
-                tp_attached_status = tp_order is not None
-
-            # ── V5.5: TP/SL Execution Proof ─────────────────────────
-            sl_attached = sl_order is not None
-
-            # Verify orders actually exist on exchange
-            if sl_attached or tp_attached_status:
-                proof_ok = await self._verify_tp_sl_proof(
-                    symbol=symbol,
-                    sl_order_id=sl_order.get("orderId") if sl_order else None,
-                    tp_order_id=tp_order.get("orderId") if tp_order else None,
-                    expected_sl_price=actual_sl,
-                    expected_tp_price=actual_tp,
-                    precision=precision,
-                )
-                if not proof_ok:
-                    logger.error(
-                        f"  🚨 PROOF FAILED for {symbol} — "
-                        f"TP/SL orders may not be correctly placed!"
-                    )
-
-            if not sl_attached or not tp_attached_status:
-                failure_msg = []
-                if not sl_attached:
-                    failure_msg.append(f"SL: {sl_error}")
-                if not tp_attached_status:
-                    failure_msg.append(f"TP: {tp_error}")
-                error_detail = " | ".join(failure_msg)
-                logger.error(f"  🚨 TP/SL INCOMPLETE for {symbol}: {error_detail}")
-
-                # ═══════════════════════════════════════════════════════
-                # V7: ATOMIC TP/SL PROTECTION — EMERGENCY CLOSE
-                # No position is EVER allowed to exist without both TP + SL.
-                # If either failed after all retries → close position immediately.
-                # ═══════════════════════════════════════════════════════
-
-                logger.warning(
-                    f"  🚨 V7 ATOMIC PROTECTION: TP/SL incomplete for {symbol} — "
-                    f"initiating emergency close to prevent naked position"
-                )
-
-                # Cancel any partial TP/SL orders that DID succeed
-                try:
-                    await self._signed_request(
-                        "DELETE", "/fapi/v1/allOpenOrders",
-                        {"symbol": symbol},
-                    )
-                    logger.info(f"  ✅ Cancelled all open orders for {symbol} before emergency close")
-                except Exception as cancel_err:
-                    logger.warning(f"  ⚠️ Failed to cancel open orders: {cancel_err}")
-
-                # Emergency close the position
-                close_success = await self._emergency_close_position(
-                    symbol=symbol, side=params.side, telegram_notifier=telegram_notifier,
-                )
-
-                if telegram_notifier:
-                    if close_success:
-                        await telegram_notifier.send_emergency_close(
-                            symbol=symbol,
-                            side=params.side,
-                            fill_price=fill_price,
-                            sl_attached=sl_attached,
-                            tp_attached=tp_attached_status,
-                            error=error_detail,
-                        )
-                    else:
-                        # CRITICAL: Position is naked AND couldn't be closed
-                        await telegram_notifier.tp_sl_failed(
-                            symbol=symbol, side=params.side,
-                            sl_attached=sl_attached, tp_attached=tp_attached_status,
-                            error=f"CRITICAL: Emergency close also failed! {error_detail}",
-                        )
-
-                return OrderResult(
-                    success=False,
-                    order_id=order_id,
-                    symbol=symbol,
-                    side=params.side,
-                    quantity=params.quantity,
-                    entry_price=params.entry_price,
-                    fill_price=fill_price,
-                    sl_attached=sl_attached,
-                    tp_attached=tp_attached_status,
-                    order_method=order_method,
-                    error=f"V7_ATOMIC_PROTECTION: TP/SL failed → position emergency closed. {error_detail}",
-                    tp_sl_protection_failed=True,
-                    emergency_closed=close_success,
-                )
-
-            # ── TP/SL SUCCESS — Normal completion ────────────────────
-            # Summary log
-            if partial_tp_used:
-                logger.info(
-                    f"  📊 Trade summary: method={order_method} fill={fill_price} "
-                    f"TP1={actual_tp1 if partial_tp_used else 'N/A'} "
-                    f"TP2={actual_tp2 if partial_tp_used else 'N/A'} SL={actual_sl} "
-                    f"TP1_ok={tp1_attached} TP2_ok={tp2_attached} SL_ok={sl_attached} "
-                    f"| PARTIAL_TP mode"
-                )
-            else:
-                logger.info(
-                    f"  📊 Trade summary: method={order_method} fill={fill_price} "
-                    f"TP={actual_tp} SL={actual_sl} "
-                    f"SL_ok={sl_attached} TP_ok={tp_attached_status}"
-                )
 
             return OrderResult(
                 success=True,
@@ -1244,22 +983,15 @@ class BinanceExecutor:
                 quantity=params.quantity,
                 entry_price=params.entry_price,
                 fill_price=fill_price,
-                stop_loss_order_id=sl_order.get("orderId") if sl_order else None,
-                take_profit_order_id=tp_order.get("orderId") if tp_order else None,
-                sl_attached=sl_attached,
-                tp_attached=tp_attached_status,
+                sl_attached=False,   # Always False -- managed by Protection Engine
+                tp_attached=False,   # Always False -- managed by Protection Engine
                 order_method=order_method,
-                partial_tp_enabled=partial_tp_used,
-                tp1_order_id=tp1_order.get("orderId") if tp1_order else None,
-                tp2_order_id=tp2_order.get("orderId") if tp2_order else None,
-                tp1_attached=tp1_attached,
-                tp2_attached=tp2_attached,
                 is_hedge_mode=is_hedge_mode,
                 position_side=position_side,
             )
 
         except Exception as e:
-            logger.error(f"  ❌ Execution failed: {e}")
+            logger.error(f"  [V10] Entry execution failed for {symbol}: {e}")
             return OrderResult(
                 success=False,
                 order_id=None,

@@ -71,25 +71,28 @@ class TelegramNotifier:
         sl_pct: float = 0.0,
         reason: str = "",
         setup_grade: str = "",
-        sl_attached: bool = True,
-        tp_attached: bool = True,
         order_method: str = "MARKET",
         # V5 additions
         strategy_type: str = "",
         regime: str = "",
-        # V5.5 additions
+        # V5.5 additions (kept for API compat with /execute-full, but not used by /execute-multi)
+        sl_attached: bool = True,
+        tp_attached: bool = True,
         sl_order_id: str = "",
         tp_order_id: str = "",
         risk_reward: float = 0.0,
-        # V5.5 Partial TP
         partial_tp_enabled: bool = False,
         tp1_price: float = 0.0,
         tp2_price: float = 0.0,
+        # V10: Two-Engine Architecture
+        protection_mode: str = "",  # "external_engine" = Protection Engine manages TP/SL
     ):
         """
-        V4: Single clean Telegram message for executed trades.
+        V10: Single clean Telegram message for executed trades.
         NO account names/labels/IDs/balances.
         Shows totals only.
+        In 2-Engine mode (protection_mode='external_engine'): shows
+        Protection Engine banner instead of TP/SL order status.
         """
         direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
 
@@ -97,8 +100,10 @@ class TelegramNotifier:
         grade_emoji = {"A": "🅰️", "B": "🅱️", "C": "©️"}.get(setup_grade, "")
         grade_line = f"\nGrade: <b>{grade_emoji} {setup_grade}</b>" if setup_grade else ""
 
-        # TP/SL status
-        if sl_attached and tp_attached:
+        # V10: Protection status line
+        if protection_mode == "external_engine":
+            tp_sl_status = "🛡️ <b>Protection: External Engine Active</b>"
+        elif sl_attached and tp_attached:
             tp_sl_status = "✅ TP/SL attached successfully"
         elif sl_attached and not tp_attached:
             tp_sl_status = "⚠️ SL attached, TP FAILED — check manually"
@@ -155,8 +160,9 @@ class TelegramNotifier:
         regime_line = f"\nRegime: <b>{regime_display}</b>" if regime_display else ""
 
         # V5.5: TP/SL proof line with order IDs
+        # V10: In external_engine mode, no order IDs (no native orders placed)
         proof_line = ""
-        if sl_order_id or tp_order_id:
+        if protection_mode != "external_engine" and (sl_order_id or tp_order_id):
             proof_parts = []
             if sl_order_id:
                 proof_parts.append(f"SL=#{sl_order_id}")
@@ -185,7 +191,7 @@ class TelegramNotifier:
             )
 
         msg = (
-            f"🚀 <b>TRADE EXECUTED</b>\n\n"
+            f"🚀 <b>TRADE OPENED</b>\n\n"
             f"Coin: <b>{symbol}</b>\n"
             f"Side: <b>{direction}</b>\n"
             f"Confidence: <b>{confidence}%</b>"
@@ -198,17 +204,81 @@ class TelegramNotifier:
             f"Leverage: <b>{leverage}x</b>\n"
             f"Method: <b>{order_method}</b>\n\n"
             f"{tp_block}"
-            f"{rr_line}"
-            f"{reason_block}\n\n"
-            f"<b>Status:</b>\n{tp_sl_status}"
+            f"{rr_line}\n\n"
+            f"<b>Protection:</b>\n{tp_sl_status}"
             f"{proof_line}"
+            f"{reason_block}"
             f"{skip_block}"
+        )
+        await self.send(msg)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # V10: Protection Engine — Trade Closed notification
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def send_position_closed_by_engine(
+        self,
+        symbol: str,
+        side: str,
+        close_reason: str,           # "tp_hit" | "sl_hit" | "trailing_exit" | "manual"
+        pnl_pct: float,
+        accounts_closed: int = 1,
+        entry_price: float = 0.0,
+        close_price: float = 0.0,
+        duration_minutes: int = 0,
+        strategy_type: str = "",
+    ):
+        """
+        V10: Protection Engine bulk close notification.
+
+        Sent when position_manager.py closes a trade on behalf of all accounts.
+        Format: Shield POSITION CLOSED / Coin / Side / Accounts / Reason / PnL
+        """
+        direction = "\U0001f7e2 LONG" if side == "BUY" else "\U0001f534 SHORT"
+        pnl_sign = "+" if pnl_pct >= 0 else ""
+        pnl_emoji = "\U0001f4c8" if pnl_pct >= 0 else "\U0001f4c9"
+
+        reason_map = {
+            "tp_hit": "TAKE PROFIT",
+            "sl_hit": "STOP LOSS",
+            "trailing_exit": "TRAILING EXIT",
+            "manual": "MANUAL CLOSE",
+        }
+        reason_display = reason_map.get(close_reason, close_reason.upper())
+
+        entry_line = f"\nEntry: <b>${entry_price:,.6f}</b>" if entry_price > 0 else ""
+        close_line = f"\nClose: <b>${close_price:,.6f}</b>" if close_price > 0 else ""
+        dur_line = f"\nDuration: <b>{duration_minutes}m</b>" if duration_minutes > 0 else ""
+
+        strategy_display = ""
+        if strategy_type:
+            if strategy_type.startswith("swing"):
+                strategy_display = "\U0001f30a Swing"
+            elif strategy_type.startswith("sniper"):
+                strategy_display = "\U0001f3af Sniper"
+            else:
+                strategy_display = "\u26a1 Scalp"
+        type_line = f"\nType: <b>{strategy_display}</b>" if strategy_display else ""
+
+        msg = (
+            f"\U0001f6e1\ufe0f <b>POSITION CLOSED</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>"
+            f"{type_line}\n"
+            f"Accounts Closed: <b>{accounts_closed}</b>\n\n"
+            f"Reason: <b>{reason_display}</b>"
+            f"{entry_line}"
+            f"{close_line}"
+            f"{dur_line}\n\n"
+            f"PnL: <b>{pnl_emoji} {pnl_sign}{pnl_pct:.2f}%</b>\n\n"
+            f"<i>Managed by Protection Engine</i>"
         )
         await self.send(msg)
 
     # ═══════════════════════════════════════════════════════════════════
     # V4: ONE CLEAN FINAL MESSAGE — No Execution
     # ═══════════════════════════════════════════════════════════════════
+
 
     async def send_no_execution(
         self,

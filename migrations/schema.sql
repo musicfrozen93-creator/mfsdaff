@@ -351,3 +351,20 @@ CREATE INDEX IF NOT EXISTS idx_open_positions_account ON open_positions(account_
 CREATE INDEX IF NOT EXISTS idx_open_positions_symbol  ON open_positions(symbol);
 CREATE INDEX IF NOT EXISTS idx_open_positions_status  ON open_positions(status);
 CREATE INDEX IF NOT EXISTS idx_open_positions_opened  ON open_positions(opened_at);
+
+-- =======================================================================
+-- V10 Two-Engine Architecture — Protection Engine lifecycle columns
+-- Added after stripping native TP/SL from the entry engine.
+-- All statements are idempotent (IF NOT EXISTS).
+-- =======================================================================
+
+-- trades: Protection Engine lifecycle tracking
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS protection_status VARCHAR(30) DEFAULT 'PENDING';
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS virtual_sl        FLOAT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS virtual_tp        FLOAT;
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS managed_by        VARCHAR(50) DEFAULT 'external_engine';
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS opened_at         TIMESTAMP DEFAULT NOW();
+
+-- Index for fast Protection Engine queries
+CREATE INDEX IF NOT EXISTS idx_trades_protection ON trades(protection_status);
+

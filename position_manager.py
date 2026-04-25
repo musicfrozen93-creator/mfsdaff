@@ -130,20 +130,33 @@ class PositionManager:
     # ── Account credential management ────────────────────────────────
 
     async def _load_account_credentials(self) -> None:
-        """Load all active accounts' decrypted credentials into memory."""
+        """
+        V10: Load all active accounts' decrypted credentials into memory.
+
+        Uses a direct JOIN instead of ORM lazy-load (which breaks in async context).
+        Mirrors the pattern used in app/routers/executor.py.
+        """
         try:
+            from sqlalchemy import join, text
+            from app.models.user import ApiConnection
+
             async with AsyncSessionFactory() as session:
-                result = await session.execute(
-                    select(Account)
+                # Direct join: accounts + api_connections (same as executor.py)
+                stmt = (
+                    select(Account, ApiConnection)
+                    .join(ApiConnection, ApiConnection.account_id == Account.id)
                     .where(Account.is_active == True)
                     .where(Account.bot_enabled == True)
+                    .where(ApiConnection.is_active == True)
                 )
-                accounts = result.scalars().all()
+                result = await session.execute(stmt)
+                rows = result.all()
 
-            for acc in accounts:
+            loaded = 0
+            for acc, conn in rows:
                 acc_id = acc.id
-                conn = acc.api_connection
-                if not conn or not conn.is_active or not conn.api_key_encrypted:
+                if not conn.api_key_encrypted or not conn.api_secret_encrypted:
+                    logger.warning(f"  Account {acc_id}: missing encrypted keys — skipped")
                     continue
                 try:
                     api_key = decrypt_api_key(conn.api_key_encrypted)
@@ -152,10 +165,11 @@ class PositionManager:
                         "api_key": api_key,
                         "api_secret": api_secret,
                     }
+                    loaded += 1
                 except Exception as e:
                     logger.warning(f"  Failed to decrypt creds for account {acc_id}: {e}")
 
-            # Fallback: master account (id=0)
+            # Fallback: master account from .env (id=0) if no DB accounts
             if settings.BINANCE_API_KEY and 0 not in self._account_credentials:
                 self._account_credentials[0] = {
                     "api_key": settings.BINANCE_API_KEY,
@@ -163,11 +177,12 @@ class PositionManager:
                 }
 
             logger.info(
-                f"  Loaded credentials for {len(self._account_credentials)} accounts"
+                f"  [PM] Credentials loaded: {loaded} DB accounts + "
+                f"{'1 master' if 0 in self._account_credentials else '0 master'} fallback"
             )
 
         except Exception as e:
-            logger.error(f"Failed to load account credentials: {e}")
+            logger.error(f"[PM] Failed to load account credentials: {e}")
 
     def _get_close_engine(self, account_id: int) -> Optional[CloseEngine]:
         """Return (cached) CloseEngine for this account, or None if no creds."""
@@ -439,6 +454,7 @@ class PositionManager:
                     db_pos.lowest_price = pos.lowest_price
 
                 # Update trades table (link via trade_id)
+                # V10: Also update protection_status -> CLOSED and managed_by
                 if pos.trade_id:
                     db_trade = await session.get(Trade, pos.trade_id)
                     if db_trade:
@@ -448,19 +464,23 @@ class PositionManager:
                         db_trade.pnl_pct = pnl_pct
                         db_trade.close_reason = close_reason
                         db_trade.closed_at = now
+                        # V10: Protection Engine lifecycle
+                        db_trade.protection_status = "CLOSED"
+                        db_trade.managed_by = "external_engine"
 
                 await session.commit()
                 logger.info(
-                    f"  📝 DB updated: {pos.symbol} closed "
-                    f"pnl={pnl_usdt:+.4f} reason={close_reason}"
+                    f"  [PM] DB updated: {pos.symbol} closed "
+                    f"pnl={pnl_usdt:+.4f} reason={close_reason} "
+                    f"[protection_status=CLOSED]"
                 )
         except Exception as e:
-            logger.error(f"  ❌ Failed to update DB for {pos.symbol}: {e}")
+            logger.error(f"  [PM] Failed to update DB for {pos.symbol}: {e}")
 
     async def _update_position_price(
         self, pos: OpenPosition, current_price: float
     ) -> None:
-        """Update last_price and check_count in DB (non-blocking best-effort)."""
+        """Update last_price, check_count, and set protection_status=ACTIVE in DB."""
         try:
             async with AsyncSessionFactory() as session:
                 db_pos = await session.get(OpenPosition, pos.id)
@@ -473,6 +493,17 @@ class PositionManager:
                     db_pos.highest_price = pos.highest_price
                     db_pos.lowest_price = pos.lowest_price
                     await session.commit()
+
+                # V10: Also mark trades.protection_status = ACTIVE on first pick-up
+                if pos.trade_id and db_pos:
+                    db_trade = await session.get(Trade, pos.trade_id)
+                    if db_trade and getattr(db_trade, 'protection_status', None) == 'PENDING':
+                        db_trade.protection_status = 'ACTIVE'
+                        await session.commit()
+                        logger.debug(
+                            f"  [PM] {pos.symbol} trade_id={pos.trade_id}: "
+                            f"protection_status PENDING -> ACTIVE"
+                        )
         except Exception:
             pass  # Best-effort, don't interrupt main loop
 
@@ -618,8 +649,9 @@ class PositionManager:
                 open_positions = await self._load_open_positions()
 
                 if not open_positions:
-                    # Nothing to watch — sleep quietly
-                    await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+                    # V10: No open positions -- sleep quietly to avoid DB hammering
+                    logger.debug(f"[PM] No open positions -- sleeping 5s (tick={self._tick})")
+                    await asyncio.sleep(5.0)
                     continue
 
                 # ── Process each position ─────────────────────────────
@@ -642,7 +674,8 @@ class PositionManager:
                 # Log summary every 60 ticks
                 if self._tick % 60 == 0:
                     logger.info(
-                        f"📊 Monitoring {len(open_positions)} positions | "
+                        f"[PM] Monitoring {len(open_positions)} positions | "
+                        f"accounts={len(self._account_credentials)} | "
                         f"tick={self._tick} | "
                         f"prices_cached={len(self.price_stream.all_prices())}"
                     )
