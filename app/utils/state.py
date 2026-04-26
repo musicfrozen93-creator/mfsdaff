@@ -32,6 +32,10 @@ class TradeState:
     # Per-coin cooldown: { "XRPUSDT": [timestamp1, timestamp2], ... }
     coin_trade_times: Dict[str, List[float]] = field(default_factory=dict)
 
+    # V10: Per-coin post-close cooldown: { "XRPUSDT": unix_timestamp_until }
+    # Separate from open-trade cooldown so scalp/swing can have different durations
+    post_close_cooldown_until: Dict[str, float] = field(default_factory=dict)
+
     # Hourly rate limit: list of unix timestamps of recent trades
     hourly_trade_timestamps: List[float] = field(default_factory=list)
 
@@ -196,6 +200,33 @@ class StateManager:
     def record_ai_call(self):
         """Record an AI API call."""
         self.state.ai_usage_count += 1
+
+    # V10: Post-close per-coin cooldown ──────────────────────────────
+
+    def record_post_close_cooldown(self, symbol: str, cooldown_minutes: int):
+        """
+        V10: Apply a post-CLOSE cooldown to a coin.
+        Prevents re-entering the same coin too quickly after a trade exits.
+        Called by /positions/close endpoint after successful close.
+        Separate from open-trade cooldown (which uses COIN_COOLDOWN_MINUTES).
+        """
+        until = time.time() + cooldown_minutes * 60
+        self.state.post_close_cooldown_until[symbol] = until
+        logger.info(
+            f"[Cooldown] Post-close cooldown set for {symbol}: "
+            f"{cooldown_minutes}m (until {until:.0f})"
+        )
+
+    def is_post_close_cooldown_active(self, symbol: str) -> tuple[bool, int]:
+        """
+        V10: Check if a coin is in post-close cooldown.
+        Returns (is_active, remaining_seconds).
+        """
+        now = time.time()
+        until = self.state.post_close_cooldown_until.get(symbol, 0.0)
+        if until > now:
+            return True, int(until - now)
+        return False, 0
 
     # ─── Stats ────────────────────────────────────────────────────────
 

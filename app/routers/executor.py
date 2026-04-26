@@ -297,6 +297,39 @@ async def execute_multi_account(req: MultiExecuteRequest):
     if on_cooldown:
         return {"status": "skipped", "reason": f"Cooldown active for {symbol}"}
 
+    # V10: Post-close cooldown check (fires after a trade on this coin was closed)
+    post_cd_active, post_cd_remaining = state_manager.is_post_close_cooldown_active(symbol)
+    if post_cd_active:
+        return {
+            "status": "skipped",
+            "reason": f"Post-close cooldown active for {symbol} — {post_cd_remaining // 60}m {post_cd_remaining % 60}s remaining",
+        }
+
+    # V10: Concurrent trade limit check (scalp and swing caps)
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(OpenPosition).where(OpenPosition.status.in_(["open", "closing"]))
+            )
+            open_positions = result.scalars().all()
+
+        is_scalp = req.strategy_type.startswith(("scalp", "sniper"))
+        scalp_open = sum(1 for p in open_positions if (p.strategy_type or "").startswith(("scalp", "sniper")))
+        swing_open = len(open_positions) - scalp_open
+
+        if is_scalp and scalp_open >= settings.MAX_CONCURRENT_SCALP_TRADES:
+            return {
+                "status": "skipped",
+                "reason": f"Scalp concurrent limit reached: {scalp_open}/{settings.MAX_CONCURRENT_SCALP_TRADES} open scalp trades",
+            }
+        if not is_scalp and swing_open >= settings.MAX_CONCURRENT_SWING_TRADES:
+            return {
+                "status": "skipped",
+                "reason": f"Swing concurrent limit reached: {swing_open}/{settings.MAX_CONCURRENT_SWING_TRADES} open swing trades",
+            }
+    except Exception as cl_err:
+        logger.warning(f"Concurrent limit check failed (non-critical): {cl_err}")
+
     # ── Save signal to DB ────────────────────────────────────────────
     signal_id = None
     try:
@@ -1028,3 +1061,355 @@ async def validate_tpsl(req: ValidateTpSlRequest):
         logger.error(f"validate-tpsl error for {symbol}: {e}")
         return {"valid": False, "reason": f"Validation error: {str(e)[:200]}", "symbol": symbol}
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# V10 POSITION MANAGER ENDPOINTS — called by n8n Position Manager workflow
+# ═══════════════════════════════════════════════════════════════════════
+
+class LockPositionRequest(BaseModel):
+    position_id: int
+
+
+class ClosePositionRequest(BaseModel):
+    position_id: int
+    close_reason: str  # tp_hit | sl_hit | trailing_exit
+
+
+class HeartbeatRequest(BaseModel):
+    position_id: int
+    current_price: float
+
+
+# ── GET /positions/open ──────────────────────────────────────────────
+
+@router.get("/positions/open")
+async def get_open_positions(type: Optional[str] = None):
+    """
+    V10: Return all open positions for n8n PM to monitor.
+
+    Query param:
+      type=scalp  → only positions whose strategy_type starts with 'scalp' or 'sniper'
+      type=swing  → only positions whose strategy_type starts with 'swing'
+      (omit)      → all open positions
+
+    Also enforces concurrent trade limits — returns count metadata
+    so n8n can skip execution when limits are hit.
+    """
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(OpenPosition).where(OpenPosition.status == "open")
+            )
+            positions = result.scalars().all()
+
+        def _trade_mode(p: OpenPosition) -> str:
+            st = (p.strategy_type or "").lower()
+            if st.startswith("scalp") or st.startswith("sniper"):
+                return "scalp"
+            return "swing"
+
+        all_open = [
+            {
+                "id": p.id,
+                "trade_id": p.trade_id,
+                "account_id": p.account_id,
+                "symbol": p.symbol,
+                "side": p.side,
+                "entry_price": p.entry_price,
+                "quantity": p.quantity,
+                "leverage": p.leverage,
+                "strategy_type": p.strategy_type or "",
+                "trade_mode": _trade_mode(p),
+                "timeframe": p.timeframe or "",
+                "confidence": p.confidence or 0,
+                "tp_price": p.tp_price,
+                "sl_price": p.sl_price,
+                "tp_pct": p.tp_pct or 0,
+                "sl_pct": p.sl_pct or 0,
+                "trailing_active": p.trailing_active,
+                "trailing_sl_price": p.trailing_sl_price,
+                "trailing_trigger_pct": p.trailing_trigger_pct or 0,
+                "highest_price": p.highest_price or p.entry_price,
+                "lowest_price": p.lowest_price or p.entry_price,
+                "is_hedge_mode": p.is_hedge_mode,
+                "position_side": p.position_side or "BOTH",
+                "status": p.status,
+                "opened_at": p.opened_at.isoformat() if p.opened_at else None,
+                "last_price": p.last_price,
+                "check_count": p.check_count or 0,
+            }
+            for p in positions
+        ]
+
+        # Filter by type if requested
+        if type == "scalp":
+            filtered = [p for p in all_open if p["trade_mode"] == "scalp"]
+        elif type == "swing":
+            filtered = [p for p in all_open if p["trade_mode"] == "swing"]
+        else:
+            filtered = all_open
+
+        scalp_count = sum(1 for p in all_open if p["trade_mode"] == "scalp")
+        swing_count = sum(1 for p in all_open if p["trade_mode"] == "swing")
+
+        return {
+            "status": "ok",
+            "count": len(filtered),
+            "scalp_open": scalp_count,
+            "swing_open": swing_count,
+            "scalp_limit": settings.MAX_CONCURRENT_SCALP_TRADES,
+            "swing_limit": settings.MAX_CONCURRENT_SWING_TRADES,
+            "positions": filtered,
+        }
+    except Exception as e:
+        logger.error(f"[positions/open] Error: {e}")
+        return {"status": "error", "message": str(e), "count": 0, "positions": []}
+
+
+# ── POST /positions/lock ─────────────────────────────────────────────
+
+@router.post("/positions/lock")
+async def lock_position(req: LockPositionRequest):
+    """
+    V10: Atomically set position status='closing' to prevent duplicate closes.
+
+    Returns already_locked=true if position is already being closed by
+    another process (Python PM or a concurrent n8n execution).
+    """
+    try:
+        async with async_session() as session:
+            pos = await session.get(OpenPosition, req.position_id)
+            if not pos:
+                return {"locked": False, "already_locked": False, "reason": "Position not found"}
+            if pos.status != "open":
+                return {
+                    "locked": False,
+                    "already_locked": pos.status in ("closing", "closed"),
+                    "reason": f"Position status is already '{pos.status}'",
+                    "current_status": pos.status,
+                }
+            pos.status = "closing"
+            await session.commit()
+            logger.info(f"[PM Lock] Position {req.position_id} ({pos.symbol}) locked → 'closing'")
+            return {"locked": True, "already_locked": False, "position_id": req.position_id, "symbol": pos.symbol}
+    except Exception as e:
+        logger.error(f"[positions/lock] Error: {e}")
+        return {"locked": False, "already_locked": False, "reason": str(e)}
+
+
+# ── POST /positions/close ────────────────────────────────────────────
+
+@router.post("/positions/close")
+async def close_position_api(req: ClosePositionRequest):
+    """
+    V10: Execute market close for a position (called by n8n PM after lock).
+
+    Steps:
+      1. Load position + account credentials
+      2. Call CloseEngine.market_close()
+      3. Update open_positions + trades tables
+      4. Apply post-close per-coin cooldown
+      5. Return PnL result for Telegram message building
+
+    Duplicate-safe: expects status='closing' (set by /positions/lock).
+    If status is not 'closing', returns error to prevent accidental double-close.
+    """
+    from datetime import datetime, timezone
+    from app.modules.close_engine import CloseEngine
+    from app.modules.crypto_utils import decrypt_api_key
+    from app.models.user import ApiConnection
+    from sqlalchemy import text
+
+    try:
+        async with async_session() as session:
+            pos = await session.get(OpenPosition, req.position_id)
+            if not pos:
+                return {"success": False, "error": "Position not found"}
+            if pos.status != "closing":
+                return {
+                    "success": False,
+                    "error": f"Position not in 'closing' state (current: {pos.status}). Lock first.",
+                }
+
+            # Load account credentials
+            stmt = (
+                select(ApiConnection)
+                .where(ApiConnection.account_id == pos.account_id)
+                .where(ApiConnection.is_active == True)  # noqa: E712
+            )
+            result = await session.execute(stmt)
+            conn = result.scalars().first()
+
+        # Build CloseEngine
+        if conn and conn.api_key_encrypted and conn.api_secret_encrypted:
+            try:
+                api_key = decrypt_api_key(conn.api_key_encrypted)
+                api_secret = decrypt_api_key(conn.api_secret_encrypted)
+            except Exception:
+                api_key = settings.BINANCE_API_KEY
+                api_secret = settings.BINANCE_SECRET_KEY
+        else:
+            api_key = settings.BINANCE_API_KEY
+            api_secret = settings.BINANCE_SECRET_KEY
+
+        close_engine = CloseEngine(
+            api_key=api_key,
+            secret_key=api_secret,
+            testnet=settings.BINANCE_TESTNET,
+        )
+
+        close_result = await close_engine.market_close(
+            symbol=pos.symbol,
+            side=pos.side,
+            quantity=pos.quantity,
+            entry_price=pos.entry_price,
+            close_reason=req.close_reason,
+            is_hedge_mode=pos.is_hedge_mode,
+            position_side=pos.position_side or "BOTH",
+        )
+
+        now = datetime.now(timezone.utc)
+
+        if close_result.success:
+            # Update DB
+            async with async_session() as session:
+                db_pos = await session.get(OpenPosition, req.position_id)
+                if db_pos:
+                    db_pos.status = "closed"
+                    db_pos.close_price = close_result.close_price
+                    db_pos.close_reason = req.close_reason
+                    db_pos.pnl_usdt = close_result.pnl_usdt
+                    db_pos.pnl_pct = close_result.pnl_pct
+                    db_pos.closed_at = now
+                    db_pos.last_checked_at = now
+
+                if pos.trade_id:
+                    db_trade = await session.get(Trade, pos.trade_id)
+                    if db_trade:
+                        db_trade.status = "closed"
+                        db_trade.close_price = close_result.close_price
+                        db_trade.pnl = close_result.pnl_usdt
+                        db_trade.pnl_pct = close_result.pnl_pct
+                        db_trade.close_reason = req.close_reason
+                        db_trade.closed_at = now
+                        db_trade.protection_status = "CLOSED"
+                        db_trade.managed_by = "n8n_pm"
+
+                await session.commit()
+
+            # V10: Apply post-close per-coin cooldown
+            trade_mode = "scalp" if (pos.strategy_type or "").startswith(("scalp", "sniper")) else "swing"
+            cooldown_mins = (
+                settings.SCALP_CLOSE_COOLDOWN_MINUTES if trade_mode == "scalp"
+                else settings.SWING_CLOSE_COOLDOWN_MINUTES
+            )
+            state_manager.record_post_close_cooldown(pos.symbol, cooldown_mins)
+
+            logger.info(
+                f"[PM Close] {pos.symbol} {pos.side} closed. "
+                f"reason={req.close_reason} pnl={close_result.pnl_usdt:+.4f} "
+                f"cooldown={cooldown_mins}m"
+            )
+
+            # Duration
+            opened_at = pos.opened_at
+            if opened_at and opened_at.tzinfo is None:
+                opened_at = opened_at.replace(tzinfo=timezone.utc)
+            duration_mins = int((now - opened_at).total_seconds() / 60) if opened_at else 0
+
+            return {
+                "success": True,
+                "symbol": pos.symbol,
+                "side": pos.side,
+                "strategy_type": pos.strategy_type or "",
+                "trade_mode": trade_mode,
+                "close_reason": req.close_reason,
+                "entry_price": pos.entry_price,
+                "close_price": close_result.close_price,
+                "pnl_usdt": round(close_result.pnl_usdt, 4),
+                "pnl_pct": round(close_result.pnl_pct, 2),
+                "tp_price": pos.tp_price,
+                "sl_price": pos.sl_price,
+                "confidence": pos.confidence or 0,
+                "duration_minutes": duration_mins,
+                "peak_price": pos.highest_price or 0,
+            }
+        else:
+            # Close failed — revert status back to 'open' so next cycle retries
+            async with async_session() as session:
+                db_pos = await session.get(OpenPosition, req.position_id)
+                if db_pos and db_pos.status == "closing":
+                    db_pos.status = "open"
+                    await session.commit()
+            logger.error(f"[PM Close] Close FAILED for {pos.symbol}: {close_result.error}")
+            return {"success": False, "error": close_result.error or "Unknown close error", "symbol": pos.symbol}
+
+    except Exception as e:
+        logger.error(f"[positions/close] Error: {e}", exc_info=True)
+        # Best-effort revert
+        try:
+            async with async_session() as session:
+                db_pos = await session.get(OpenPosition, req.position_id)
+                if db_pos and db_pos.status == "closing":
+                    db_pos.status = "open"
+                    await session.commit()
+        except Exception:
+            pass
+        return {"success": False, "error": str(e)}
+
+
+# ── POST /positions/heartbeat ────────────────────────────────────────
+
+@router.post("/positions/heartbeat")
+async def heartbeat_position(req: HeartbeatRequest):
+    """
+    V10: Update last_price and check_count for a position (no close logic).
+    Called by n8n PM on every cycle for positions that did NOT trigger close.
+    """
+    from datetime import datetime, timezone
+    try:
+        async with async_session() as session:
+            pos = await session.get(OpenPosition, req.position_id)
+            if pos and pos.status == "open":
+                pos.last_price = req.current_price
+                pos.last_checked_at = datetime.now(timezone.utc)
+                pos.check_count = (pos.check_count or 0) + 1
+                await session.commit()
+        return {"ok": True, "position_id": req.position_id, "last_price": req.current_price}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ── GET /positions/count ─────────────────────────────────────────────
+
+@router.get("/positions/count")
+async def count_open_positions():
+    """
+    V10: Return counts of open scalp and swing positions for concurrent limit checks.
+    Called by execute-multi before opening a new trade.
+    """
+    try:
+        async with async_session() as session:
+            result = await session.execute(
+                select(OpenPosition).where(OpenPosition.status.in_(["open", "closing"]))
+            )
+            positions = result.scalars().all()
+
+        scalp = sum(
+            1 for p in positions
+            if (p.strategy_type or "").startswith(("scalp", "sniper"))
+        )
+        swing = len(positions) - scalp
+
+        return {
+            "scalp_open": scalp,
+            "swing_open": swing,
+            "total_open": len(positions),
+            "scalp_limit": settings.MAX_CONCURRENT_SCALP_TRADES,
+            "swing_limit": settings.MAX_CONCURRENT_SWING_TRADES,
+            "scalp_slots_available": max(0, settings.MAX_CONCURRENT_SCALP_TRADES - scalp),
+            "swing_slots_available": max(0, settings.MAX_CONCURRENT_SWING_TRADES - swing),
+        }
+    except Exception as e:
+        logger.error(f"[positions/count] Error: {e}")
+        return {"scalp_open": 0, "swing_open": 0, "total_open": 0, "error": str(e)}

@@ -121,7 +121,7 @@ class Settings:
     # ── V5 External APIs (free) ──────────────────────────────────────
     CRYPTOPANIC_API_KEY: str = os.getenv("CRYPTOPANIC_API_KEY", "")
 
-    # ── V7 Settings ──────────────────────────────────────────────────
+    # ── V7 Settings ──────────────────────────────────────────────────────
     V7_MAX_LEVERAGE: int = int(os.getenv("V7_MAX_LEVERAGE", "7"))             # Max leverage cap
     V7_PER_COIN_COOLDOWN_LOSSES: int = int(os.getenv("V7_PER_COIN_COOLDOWN_LOSSES", "3"))
     V7_PER_COIN_COOLDOWN_HOURS: int = int(os.getenv("V7_PER_COIN_COOLDOWN_HOURS", "48"))
@@ -135,6 +135,32 @@ class Settings:
     V7_LEVERAGE_HIGH: int = int(os.getenv("V7_LEVERAGE_HIGH", "7"))           # Confidence 85+ → 7x
     # V7: Daily profit lock
     DAILY_PROFIT_LOCK_PCT: float = float(os.getenv("DAILY_PROFIT_LOCK_PCT", "3.0"))  # Lock gains at +3%
+
+    # ── V10 Split Confidence System ──────────────────────────────────────
+    # Scalp confidence gates (lower than swing — scalp signals are inherently faster)
+    SCALP_MIN_CONFIDENCE: int = int(os.getenv("SCALP_MIN_CONFIDENCE", "65"))          # Execute threshold
+    SCALP_WATCHLIST_CONFIDENCE: int = int(os.getenv("SCALP_WATCHLIST_CONFIDENCE", "55"))  # Near-miss alert
+    # Swing confidence gates
+    SWING_MIN_CONFIDENCE_EXECUTE: int = int(os.getenv("SWING_MIN_CONFIDENCE_EXECUTE", "80"))  # Execute threshold
+    SWING_WATCHLIST_CONFIDENCE: int = int(os.getenv("SWING_WATCHLIST_CONFIDENCE", "50"))      # Watchlist threshold
+
+    # ── V10 Trigger Zone Tolerance ───────────────────────────────────────
+    # Prevents missing near-price entries due to tick-level mismatch
+    SCALP_TRIGGER_TOLERANCE: float = float(os.getenv("SCALP_TRIGGER_TOLERANCE", "0.002"))  # 0.2%
+    SWING_TRIGGER_TOLERANCE: float = float(os.getenv("SWING_TRIGGER_TOLERANCE", "0.005"))  # 0.5%
+
+    # ── V10 Concurrent Trade Limits ──────────────────────────────────────
+    MAX_CONCURRENT_SCALP_TRADES: int = int(os.getenv("MAX_CONCURRENT_SCALP_TRADES", "5"))
+    MAX_CONCURRENT_SWING_TRADES: int = int(os.getenv("MAX_CONCURRENT_SWING_TRADES", "3"))
+
+    # ── V10 Per-Coin Post-Close Cooldown ─────────────────────────────────
+    # Cooldown applied after a position is CLOSED (not just opened)
+    SCALP_CLOSE_COOLDOWN_MINUTES: int = int(os.getenv("SCALP_CLOSE_COOLDOWN_MINUTES", "10"))
+    SWING_CLOSE_COOLDOWN_MINUTES: int = int(os.getenv("SWING_CLOSE_COOLDOWN_MINUTES", "60"))
+
+    # ── V10 Position Manager Control ─────────────────────────────────────
+    # Set PYTHON_PM_ENABLED=false once n8n PM is stable to disable Python PM
+    PYTHON_PM_ENABLED: bool = os.getenv("PYTHON_PM_ENABLED", "true").lower() == "true"
 
     def __post_init__(self):
         self.EXCLUDED_COINS = []

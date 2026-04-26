@@ -725,4 +725,10 @@ async def main():
 
 
 if __name__ == "__main__":
+    # V10: Kill switch — set PYTHON_PM_ENABLED=false in .env once n8n PM is stable
+    from app.config import settings as _cfg
+    if not _cfg.PYTHON_PM_ENABLED:
+        logger.warning("🛑 PYTHON_PM_ENABLED=false — Python Position Manager is DISABLED.")
+        logger.warning("   The n8n Position Manager workflow is the active exit engine.")
+        sys.exit(0)
     asyncio.run(main())
