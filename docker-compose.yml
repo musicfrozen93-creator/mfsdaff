@@ -123,9 +123,9 @@ services:
         condition: service_healthy
       trading-bot:
         condition: service_started
-    # ── Healthcheck: process-based (not HTTP — this is a loop script, not a server)
+    # ── Healthcheck: process-based (ps is universal — pgrep not available in slim images)
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f position_manager.py || exit 1"]
+      test: ["CMD-SHELL", "ps aux | grep position_manager.py | grep -v grep || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
