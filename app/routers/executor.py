@@ -768,86 +768,112 @@ async def execute_multi_account(req: MultiExecuteRequest):
                 result = await executor.execute_trade(trade_params, telegram_notifier=telegram)
 
                 if result.success:
-                    # Save trade to DB
+                    # V12: DB save with 3-attempt retry + urgent Telegram on permanent failure
                     trade_db_id = None
-                    try:
-                        async with async_session() as session:
-                            trade = Trade(
-                                signal_id=signal_id, account_id=acc_id,
-                                symbol=symbol, side=side,
-                                entry_price=result.fill_price or entry_price,
-                                quantity=trade_params.quantity,
-                                position_size_usdt=trade_params.position_size_usdt,
-                                leverage=trade_params.leverage,
-                                take_profit=trade_params.take_profit,
-                                stop_loss=trade_params.stop_loss,
-                                risk_pct=trade_params.risk_pct,
-                                confidence=req.confidence,
-                                order_id=str(result.order_id),
-                                sl_order_id=None,   # V10: No native SL placed -- Protection Engine manages
-                                tp_order_id=None,   # V10: No native TP placed -- Protection Engine manages
-                                status="open",
-                                strategy_type=req.strategy_type,
-                                regime=req.regime,
-                                # V10: Protection Engine lifecycle
-                                protection_status="PENDING",
-                                virtual_sl=trade_params.stop_loss,
-                                virtual_tp=trade_params.take_profit,
-                                managed_by="external_engine",
-                            )
-                            session.add(trade)
-                            await session.commit()
-                            await session.refresh(trade)
-                            trade_db_id = trade.id
+                    _save_success = False
+                    for _attempt in range(1, 4):
+                        try:
+                            async with async_session() as session:
+                                trade = Trade(
+                                    signal_id=signal_id, account_id=acc_id,
+                                    symbol=symbol, side=side,
+                                    entry_price=result.fill_price or entry_price,
+                                    quantity=trade_params.quantity,
+                                    position_size_usdt=trade_params.position_size_usdt,
+                                    leverage=trade_params.leverage,
+                                    take_profit=trade_params.take_profit,
+                                    stop_loss=trade_params.stop_loss,
+                                    risk_pct=trade_params.risk_pct,
+                                    confidence=req.confidence,
+                                    order_id=str(result.order_id),
+                                    sl_order_id=None,
+                                    tp_order_id=None,
+                                    status="open",
+                                    strategy_type=req.strategy_type,
+                                    regime=req.regime,
+                                    protection_status="PENDING",
+                                    virtual_sl=trade_params.stop_loss,
+                                    virtual_tp=trade_params.take_profit,
+                                    managed_by="external_engine",
+                                )
+                                session.add(trade)
+                                await session.commit()
+                                await session.refresh(trade)
+                                trade_db_id = trade.id
 
-                            # ── V9: Write OpenPosition for Position Manager ──
-                            # Read hedge mode + position_side from executor result
-                            _is_hedge = result.is_hedge_mode
-                            _pos_side = result.position_side
-                            # Determine timeframe from strategy type
-                            _timeframe = (
-                                "4h" if req.strategy_type.startswith("swing")
-                                else ("15m" if req.strategy_type.startswith("sniper") else "1m")
+                                # V12: Explicit trade_mode tag at creation time
+                                _is_scalp = req.strategy_type.lower().startswith(("scalp", "sniper", "breakout", "range", "trend"))
+                                _trade_mode = "scalp" if _is_scalp else "swing"
+
+                                # V9: Write OpenPosition for Position Manager
+                                _is_hedge = result.is_hedge_mode
+                                _pos_side = result.position_side
+                                _timeframe = (
+                                    "4h" if req.strategy_type.startswith("swing")
+                                    else ("15m" if req.strategy_type.startswith("sniper") else "1m")
+                                )
+                                from app.config import settings as _s
+                                open_pos = OpenPosition(
+                                    account_id=acc_id,
+                                    trade_id=trade_db_id,
+                                    symbol=symbol,
+                                    side=side,
+                                    entry_price=result.fill_price or entry_price,
+                                    quantity=trade_params.quantity,
+                                    leverage=trade_params.leverage,
+                                    position_size_usdt=trade_params.position_size_usdt,
+                                    strategy_type=req.strategy_type,
+                                    trade_mode=_trade_mode,   # V12: explicit tag
+                                    timeframe=_timeframe,
+                                    confidence=req.confidence,
+                                    regime=req.regime,
+                                    tp_price=trade_params.take_profit,
+                                    sl_price=trade_params.stop_loss,
+                                    tp_pct=trade_params.tp_pct,
+                                    sl_pct=trade_params.sl_pct,
+                                    trailing_trigger_pct=_s.BREAK_EVEN_TRIGGER_PCT,
+                                    entry_order_id=str(result.order_id) if result.order_id else None,
+                                    is_hedge_mode=_is_hedge,
+                                    position_side=_pos_side,
+                                    status="open",
+                                    last_price=result.fill_price or entry_price,
+                                    highest_price=result.fill_price or entry_price,
+                                    lowest_price=result.fill_price or entry_price,
+                                    entry_reason=req.reason[:500] if req.reason else None,
+                                )
+                                session.add(open_pos)
+                                await session.commit()
+                                _save_success = True
+                                logger.info(
+                                    f"  📌 [{internal_label}] OpenPosition saved (attempt {_attempt}): "
+                                    f"{symbol} {side} mode={_trade_mode} TP={trade_params.take_profit} "
+                                    f"SL={trade_params.stop_loss} strategy={req.strategy_type}"
+                                )
+                                break  # Success — exit retry loop
+
+                        except Exception as dbe:
+                            logger.warning(
+                                f"  [{internal_label}] DB save attempt {_attempt}/3 failed: {dbe}"
                             )
-                            # Trailing trigger = BREAK_EVEN_TRIGGER_PCT from settings
-                            from app.config import settings as _s
-                            open_pos = OpenPosition(
-                                account_id=acc_id,
-                                trade_id=trade_db_id,
-                                symbol=symbol,
-                                side=side,
-                                entry_price=result.fill_price or entry_price,
-                                quantity=trade_params.quantity,
-                                leverage=trade_params.leverage,
-                                position_size_usdt=trade_params.position_size_usdt,
-                                strategy_type=req.strategy_type,
-                                timeframe=_timeframe,
-                                confidence=req.confidence,
-                                regime=req.regime,
-                                tp_price=trade_params.take_profit,
-                                sl_price=trade_params.stop_loss,
-                                tp_pct=trade_params.tp_pct,
-                                sl_pct=trade_params.sl_pct,
-                                trailing_trigger_pct=_s.BREAK_EVEN_TRIGGER_PCT,
-                                entry_order_id=str(result.order_id) if result.order_id else None,
-                                is_hedge_mode=_is_hedge,
-                                position_side=_pos_side,
-                                status="open",
-                                last_price=result.fill_price or entry_price,
-                                highest_price=result.fill_price or entry_price,
-                                lowest_price=result.fill_price or entry_price,
-                                # V11: entry_reason for traceability
-                                entry_reason=req.reason[:500] if req.reason else None,
+                            if _attempt < 3:
+                                await asyncio.sleep(1.0)
+
+                    if not _save_success:
+                        logger.error(
+                            f"  [{internal_label}] PERMANENT DB SAVE FAILURE after 3 attempts "
+                            f"for {symbol} — trade IS open on Binance but not recorded in DB!"
+                        )
+                        # Send urgent Telegram alert (non-blocking)
+                        try:
+                            await telegram.send_message(
+                                f"🚨 CRITICAL: DB SAVE FAILED for {symbol} {side}\n"
+                                f"Trade IS OPEN on Binance (order #{result.order_id}) "
+                                f"but NOT recorded in database after 3 attempts.\n"
+                                f"Manual sync required — run Binance sync immediately!",
+                                parse_mode="HTML",
                             )
-                            session.add(open_pos)
-                            await session.commit()
-                            logger.info(
-                                f"  📌 [{internal_label}] OpenPosition saved: "
-                                f"{symbol} {side} TP={trade_params.take_profit} "
-                                f"SL={trade_params.stop_loss} strategy={req.strategy_type}"
-                            )
-                    except Exception as dbe:
-                        logger.warning(f"  [{internal_label}] Failed to save trade to DB: {dbe}")
+                        except Exception:
+                            pass
 
                     # V7: Notify learning engine — trade opened
                     try:
@@ -1147,7 +1173,10 @@ async def validate_tpsl(req: ValidateTpSlRequest):
 # ═══════════════════════════════════════════════════════════════════════
 
 class LockPositionRequest(BaseModel):
-    position_id: int
+    position_id: int = 0          # 0 = null/unknown — will search by symbol+side+account
+    symbol: Optional[str] = None  # V12: fallback search fields
+    side: Optional[str] = None
+    account_id: Optional[int] = None
 
 
 class ClosePositionRequest(BaseModel):
@@ -1415,27 +1444,103 @@ async def get_open_positions(type: Optional[str] = None):
 @router.post("/positions/lock")
 async def lock_position(req: LockPositionRequest):
     """
-    V10: Atomically set position status='closing' to prevent duplicate closes.
+    V12: Atomically set position status='closing' to prevent duplicate closes.
 
+    Null-id resilience: if position_id is 0/null, searches DB by symbol+side+account_id.
+    If still not found (Binance-only position), creates a minimal recovery row before locking.
     Returns already_locked=true if position is already being closed by
     another process (Python PM or a concurrent n8n execution).
     """
+    from datetime import datetime, timezone
+
     try:
+        pos = None
+
+        # ── Path A: direct lookup by position_id ────────────────────────
+        if req.position_id and req.position_id > 0:
+            async with async_session() as session:
+                pos = await session.get(OpenPosition, req.position_id)
+
+        # ── Path B: fallback — search by symbol + side + account_id ─────
+        if pos is None and req.symbol and req.side:
+            logger.info(
+                f"[PM Lock] position_id={req.position_id} missing/null — "
+                f"searching by symbol={req.symbol} side={req.side} account={req.account_id}"
+            )
+            async with async_session() as session:
+                stmt = select(OpenPosition).where(
+                    OpenPosition.symbol == req.symbol.upper(),
+                    OpenPosition.side == req.side.upper(),
+                    OpenPosition.status == "open",
+                )
+                if req.account_id:
+                    stmt = stmt.where(OpenPosition.account_id == req.account_id)
+                result = await session.execute(stmt)
+                pos = result.scalars().first()
+
+        # ── Path C: create minimal recovery row (Binance-only position) ──
+        if pos is None and req.symbol and req.side:
+            logger.warning(
+                f"[PM Lock] No DB row found for {req.symbol}/{req.side} — "
+                f"creating minimal recovery row so lock can proceed"
+            )
+            now = datetime.now(timezone.utc)
+            try:
+                async with async_session() as session:
+                    recovery = OpenPosition(
+                        account_id=req.account_id or 0,
+                        symbol=req.symbol.upper(),
+                        side=req.side.upper(),
+                        entry_price=0.0,
+                        quantity=0.0,
+                        tp_price=0.0,
+                        sl_price=0.0,
+                        strategy_type="lock_recovery",
+                        trade_mode="scalp",
+                        status="open",
+                        entry_reason="created_by_lock_fallback",
+                        opened_at=now,
+                    )
+                    session.add(recovery)
+                    await session.commit()
+                    await session.refresh(recovery)
+                    pos = recovery
+                    logger.info(
+                        f"[PM Lock] Recovery row created: id={pos.id} {pos.symbol} {pos.side}"
+                    )
+            except Exception as create_err:
+                logger.error(f"[PM Lock] Recovery row creation failed: {create_err}")
+                return {"locked": False, "already_locked": False, "reason": f"Recovery creation failed: {create_err}"}
+
+        if pos is None:
+            return {"locked": False, "already_locked": False, "reason": "Position not found (no symbol+side fallback provided)"}
+
+        # ── Lock the found/created row ───────────────────────────────────
+        if pos.status != "open":
+            return {
+                "locked": False,
+                "already_locked": pos.status in ("closing", "closed"),
+                "reason": f"Position status is already '{pos.status}'",
+                "current_status": pos.status,
+            }
+
         async with async_session() as session:
-            pos = await session.get(OpenPosition, req.position_id)
-            if not pos:
-                return {"locked": False, "already_locked": False, "reason": "Position not found"}
-            if pos.status != "open":
+            db_pos = await session.get(OpenPosition, pos.id)
+            if db_pos and db_pos.status == "open":
+                db_pos.status = "closing"
+                await session.commit()
+                logger.info(f"[PM Lock] Position {pos.id} ({pos.symbol}) locked → 'closing'")
+                return {"locked": True, "already_locked": False, "position_id": pos.id, "symbol": pos.symbol}
+            elif db_pos:
                 return {
                     "locked": False,
-                    "already_locked": pos.status in ("closing", "closed"),
-                    "reason": f"Position status is already '{pos.status}'",
-                    "current_status": pos.status,
+                    "already_locked": db_pos.status in ("closing", "closed"),
+                    "reason": f"Position status is already '{db_pos.status}'",
+                    "current_status": db_pos.status,
                 }
-            pos.status = "closing"
-            await session.commit()
-            logger.info(f"[PM Lock] Position {req.position_id} ({pos.symbol}) locked → 'closing'")
-            return {"locked": True, "already_locked": False, "position_id": req.position_id, "symbol": pos.symbol}
+            else:
+                return {"locked": False, "already_locked": False, "reason": "Position disappeared during lock"}
+
     except Exception as e:
         logger.error(f"[positions/lock] Error: {e}")
         return {"locked": False, "already_locked": False, "reason": str(e)}
@@ -1629,9 +1734,23 @@ async def heartbeat_position(req: HeartbeatRequest):
 @router.get("/positions/count")
 async def count_open_positions():
     """
-    V10: Return counts of open scalp and swing positions for concurrent limit checks.
-    Called by execute-multi before opening a new trade.
+    V12: Return counts of open scalp and swing positions for concurrent limit checks.
+    Truth source = Binance live positions (via count_all_live_positions).
+    Falls back to DB if Binance fetch fails.
     """
+    binance_live_total = None
+    truth_source = "db"
+
+    # ── Primary: Binance live count ───────────────────────────────────
+    if settings.BINANCE_TRUTH_SOURCE:
+        try:
+            binance_live_total = await count_all_live_positions()
+            truth_source = "binance_live"
+            logger.info(f"[positions/count] Binance live total={binance_live_total}")
+        except Exception as bnc_err:
+            logger.warning(f"[positions/count] Binance fetch failed — DB fallback: {bnc_err}")
+
+    # ── Fallback / detailed breakdown: DB ────────────────────────────
     try:
         async with async_session() as session:
             result = await session.execute(
@@ -1641,14 +1760,24 @@ async def count_open_positions():
 
         scalp = sum(
             1 for p in positions
-            if (p.strategy_type or "").startswith(("scalp", "sniper"))
+            if (p.trade_mode or (p.strategy_type or "")).startswith(("scalp", "sniper", "breakout", "range", "trend"))
         )
-        swing = len(positions) - scalp
+        swing = sum(
+            1 for p in positions
+            if (p.trade_mode == "swing") or (p.trade_mode is None and (p.strategy_type or "").startswith("swing"))
+        )
+        db_total = len(positions)
+
+        # If Binance live total available, use it as the authoritative total
+        total = binance_live_total if binance_live_total is not None else db_total
 
         return {
             "scalp_open": scalp,
             "swing_open": swing,
-            "total_open": len(positions),
+            "total_open": total,
+            "db_open_count": db_total,
+            "binance_live_count": binance_live_total,
+            "truth_source": truth_source,
             "scalp_limit": settings.MAX_CONCURRENT_SCALP_TRADES,
             "swing_limit": settings.MAX_CONCURRENT_SWING_TRADES,
             "scalp_slots_available": max(0, settings.MAX_CONCURRENT_SCALP_TRADES - scalp),
@@ -1656,4 +1785,8 @@ async def count_open_positions():
         }
     except Exception as e:
         logger.error(f"[positions/count] Error: {e}")
-        return {"scalp_open": 0, "swing_open": 0, "total_open": 0, "error": str(e)}
+        return {
+            "scalp_open": 0, "swing_open": 0, "total_open": binance_live_total or 0,
+            "binance_live_count": binance_live_total, "truth_source": truth_source,
+            "error": str(e),
+        }

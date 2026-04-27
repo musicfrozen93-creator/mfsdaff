@@ -189,6 +189,7 @@ async def sync_db_with_binance(api_key: str, api_secret: str, account_id: int) -
                 f"pos_id={db_pos.id} — in DB but NOT on Binance → marking closed"
             )
             try:
+                # Fix: open_position update in first session
                 async with factory() as session:
                     pos = await session.get(OpenPosition, db_pos.id)
                     if pos and pos.status == "open":
@@ -198,14 +199,15 @@ async def sync_db_with_binance(api_key: str, api_secret: str, account_id: int) -
                         pos.last_checked_at = now
                         await session.commit()
 
-                    # Also update the trades table if linked
-                    if db_pos.trade_id:
-                        trade = await session.get(Trade, db_pos.trade_id)
+                # Fix: Trade update in a SEPARATE fresh session (avoids committed-session bug)
+                if db_pos.trade_id:
+                    async with factory() as trade_session:
+                        trade = await trade_session.get(Trade, db_pos.trade_id)
                         if trade and trade.status == "open":
                             trade.status = "closed"
                             trade.close_reason = settings.BINANCE_GHOST_CLOSE_REASON
                             trade.closed_at = now
-                            await session.commit()
+                            await trade_session.commit()
 
                 result["ghosts"] += 1
                 logger.info(f"[BinanceSync] ✅ Ghost closed: {sym} (pos_id={db_pos.id})")
@@ -219,13 +221,28 @@ async def sync_db_with_binance(api_key: str, api_secret: str, account_id: int) -
             if sym not in db_symbols:
                 amt = float(live_pos.get("positionAmt", 0))
                 entry = float(live_pos.get("entryPrice", 0))
+                mark = float(live_pos.get("markPrice", entry))
                 leverage = int(live_pos.get("leverage", 1))
                 pos_side = live_pos.get("positionSide", "BOTH")
                 side = "BUY" if amt > 0 else "SELL"
 
+                # V12: Generate emergency TP/SL so PM can manage orphaned positions
+                if entry > 0:
+                    if side == "BUY":
+                        emerg_tp = round(entry * 1.030, 8)
+                        emerg_sl = round(entry * 0.985, 8)
+                    else:
+                        emerg_tp = round(entry * 0.970, 8)
+                        emerg_sl = round(entry * 1.015, 8)
+                    emerg_tp_pct, emerg_sl_pct = 3.0, 1.5
+                else:
+                    emerg_tp = emerg_sl = 0.0
+                    emerg_tp_pct = emerg_sl_pct = 0.0
+
                 logger.warning(
                     f"[BinanceSync] ORPHAN POSITION: {sym} account={account_id} "
-                    f"side={side} entry={entry} amt={amt} — on Binance but NOT in DB → creating record"
+                    f"side={side} entry={entry} amt={amt} — on Binance but NOT in DB → creating record "
+                    f"emergency TP={emerg_tp} SL={emerg_sl}"
                 )
                 try:
                     async with factory() as session:
@@ -239,26 +256,27 @@ async def sync_db_with_binance(api_key: str, api_secret: str, account_id: int) -
                             leverage=leverage,
                             position_size_usdt=abs(amt) * entry,
                             strategy_type="binance_sync",
+                            trade_mode="scalp",
                             timeframe="unknown",
                             confidence=0,
                             regime="",
-                            tp_price=0.0,
-                            sl_price=0.0,
-                            tp_pct=0.0,
-                            sl_pct=0.0,
+                            tp_price=emerg_tp,
+                            sl_price=emerg_sl,
+                            tp_pct=emerg_tp_pct,
+                            sl_pct=emerg_sl_pct,
                             is_hedge_mode=(pos_side in ("LONG", "SHORT")),
                             position_side=pos_side,
                             status="open",
-                            last_price=entry,
-                            highest_price=entry,
-                            lowest_price=entry,
+                            last_price=mark,
+                            highest_price=max(entry, mark),
+                            lowest_price=min(entry, mark),
                             opened_at=now,
                             entry_reason="binance_sync_recovery",
                         )
                         session.add(new_pos)
                         await session.commit()
                     result["orphans"] += 1
-                    logger.info(f"[BinanceSync] ✅ Orphan recovered: {sym} (account={account_id})")
+                    logger.info(f"[BinanceSync] ✅ Orphan recovered: {sym} (account={account_id}) TP={emerg_tp} SL={emerg_sl}")
                 except Exception as e:
                     logger.error(f"[BinanceSync] Failed to create orphan record {sym}: {e}")
                     result["errors"].append(f"orphan_{sym}: {e}")
@@ -285,12 +303,13 @@ async def sync_db_with_binance(api_key: str, api_secret: str, account_id: int) -
             except Exception as e:
                 logger.debug(f"[BinanceSync] last_price update failed for {sym}: {e}")
 
-    if result["ghosts"] or result["orphans"]:
-        logger.info(
-            f"[BinanceSync] Account {account_id}: "
-            f"ghosts={result['ghosts']} orphans={result['orphans']} "
-            f"synced={result['synced']} errors={len(result['errors'])}"
-        )
+    # V12: Always emit a cycle summary log (not just when ghosts/orphans found)
+    logger.info(
+        f"[BinanceSync ⏰ {now.strftime('%H:%M:%S')}] account={account_id} "
+        f"binance_live={len(live_symbols)} db_open={len(db_symbols)} | "
+        f"ghosts_closed={result['ghosts']} orphans_recovered={result['orphans']} "
+        f"synced={result['synced']} errors={len(result['errors'])}"
+    )
 
     return result
 

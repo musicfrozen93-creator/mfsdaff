@@ -340,6 +340,12 @@ class OpenPosition(Base):
     pnl_usdt = Column(Float, nullable=True)
     pnl_pct = Column(Float, nullable=True)
 
+    # ── Trade mode (explicit tag — avoids strategy_type normalisation issues) ──
+    trade_mode = Column(String(10), nullable=True, index=True)  # scalp | swing
+
+    # ── Entry metadata ────────────────────────────────────────────────
+    entry_reason = Column(Text, nullable=True)           # Signal reason / notes for traceability
+
     # ── Monitoring metadata ───────────────────────────────────────────
     last_checked_at = Column(DateTime, nullable=True)
     last_price = Column(Float, nullable=True)            # Last known market price

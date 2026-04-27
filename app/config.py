@@ -140,11 +140,11 @@ class Settings:
 
     # ── V10 Split Confidence System ──────────────────────────────────────
     # Scalp confidence gates (lower than swing — scalp signals are inherently faster)
-    SCALP_MIN_CONFIDENCE: int = int(os.getenv("SCALP_MIN_CONFIDENCE", "65"))          # Execute threshold
+    SCALP_MIN_CONFIDENCE: int = int(os.getenv("SCALP_MIN_CONFIDENCE", "75"))          # Execute threshold
     SCALP_WATCHLIST_CONFIDENCE: int = int(os.getenv("SCALP_WATCHLIST_CONFIDENCE", "55"))  # Near-miss alert
     # Swing confidence gates
     SWING_MIN_CONFIDENCE_EXECUTE: int = int(os.getenv("SWING_MIN_CONFIDENCE_EXECUTE", "80"))  # Execute threshold
-    SWING_WATCHLIST_CONFIDENCE: int = int(os.getenv("SWING_WATCHLIST_CONFIDENCE", "50"))      # Watchlist threshold
+    SWING_WATCHLIST_CONFIDENCE: int = int(os.getenv("SWING_WATCHLIST_CONFIDENCE", "70"))      # Watchlist threshold
 
     # ── V10 Trigger Zone Tolerance ───────────────────────────────────────
     # Prevents missing near-price entries due to tick-level mismatch

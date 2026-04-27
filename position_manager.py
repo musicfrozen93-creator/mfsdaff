@@ -53,7 +53,7 @@ PRICE_STALE_MAX_SECONDS = 10.0
 SYMBOL_REFRESH_INTERVAL = 30
 TRAILING_SL_PCT_SCALP   = 0.4
 TRAILING_SL_PCT_SWING   = 0.5
-POSITION_MANAGER_VERSION = "V11"
+POSITION_MANAGER_VERSION = "V12"
 
 # ── DB ────────────────────────────────────────────────────────────────
 engine = create_async_engine(settings.DATABASE_URL, echo=False)
@@ -625,9 +625,17 @@ class PositionManager:
                 await asyncio.gather(*[process_guarded(p) for p in open_positions], return_exceptions=True)
 
                 if self._tick % 60 == 0:
+                    # V12: Per-cycle summary — Binance live count + DB open + accounts
+                    try:
+                        from app.modules.binance_sync import count_all_live_positions as _count_live
+                        _live_count = await _count_live()
+                    except Exception:
+                        _live_count = "?"
                     logger.info(
-                        f"[PM] Monitoring {len(open_positions)} positions | "
-                        f"accounts={len(self._account_credentials)} | tick={self._tick}"
+                        f"[PM V12 ⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
+                        f"tick={self._tick} | accounts={len(self._account_credentials)} | "
+                        f"db_open={len(open_positions)} | binance_live={_live_count} | "
+                        f"monitoring {len(open_positions)} position(s)"
                     )
 
             except Exception as e:

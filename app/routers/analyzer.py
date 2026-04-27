@@ -230,19 +230,23 @@ async def analyze_batch(req: BatchAnalyzeRequest):
             await swing_engine.save_to_watchlist(new_setups)
             logger.info(f"  🔭 {len(new_setups)} new swing setups saved to watchlist")
 
-            # V7: Telegram alerts for new watchlist entries (best 3 only)
+            # V12: ONE batched Telegram message for new watchlist entries (replaces per-coin spam)
             try:
                 telegram = TelegramNotifier()
-                for setup in new_setups[:3]:
-                    await telegram.send_watchlisted(
-                        symbol=setup.symbol,
-                        side=setup.side,
-                        setup_type=setup.setup_type,
-                        confidence=setup.confidence,
-                        trigger_price=setup.trigger_price,
-                        current_price=setup.current_price,
-                        reason=setup.reason,
-                    )
+                batch = [
+                    {
+                        "symbol": s.symbol,
+                        "action": s.side,
+                        "side": s.side,
+                        "confidence": s.confidence,
+                        "setup_type": s.setup_type,
+                        "trigger_price": s.trigger_price,
+                        "current_price": s.current_price,
+                        "strategy_type": f"swing_{s.setup_type}",
+                    }
+                    for s in new_setups[:10]
+                ]
+                await telegram.send_swing_watchlist(batch)
             except Exception as tw_err:
                 logger.debug(f"  Watchlist telegram failed (non-critical): {tw_err}")
 
