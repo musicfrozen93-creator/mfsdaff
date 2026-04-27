@@ -45,7 +45,7 @@ class Settings:
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # ── Trading parameters ───────────────────────────────────────────
-    MIN_CONFIDENCE: int = int(os.getenv("MIN_CONFIDENCE", "70"))
+    MIN_CONFIDENCE: int = int(os.getenv("MIN_CONFIDENCE", "60"))  # V12: lowered from 70 to 60 — allows scalp grades C/D
 
     # ── Scanner filters ──────────────────────────────────────────────
     MIN_VOLUME_24H: float = 3_000_000.0
@@ -78,15 +78,17 @@ class Settings:
     CONSECUTIVE_LOSS_PAUSE_MINUTES: int = int(os.getenv("CONSECUTIVE_LOSS_PAUSE_MINUTES", "60"))
 
     # ── V3 Pre-entry checks ──────────────────────────────────────────
-    MAX_SPREAD_ENTRY_PCT: float = float(os.getenv("MAX_SPREAD_ENTRY_PCT", "0.10"))
+    # V12: relaxed from 0.10% to 0.20% — scalps on volatile coins need wider spread tolerance
+    MAX_SPREAD_ENTRY_PCT: float = float(os.getenv("MAX_SPREAD_ENTRY_PCT", "0.20"))
 
     # ── V4 Order execution ───────────────────────────────────────────
     LIMIT_ORDER_WAIT_SECONDS: int = int(os.getenv("LIMIT_ORDER_WAIT_SECONDS", "3"))
     MIN_POSITION_USDT: float = float(os.getenv("MIN_POSITION_USDT", "6.0"))
     ENABLE_LIMIT_FALLBACK: bool = os.getenv("ENABLE_LIMIT_FALLBACK", "true").lower() == "true"
 
-    # ── V5 Multi-Strategy Settings ───────────────────────────────────
-    MAX_TRADES_PER_CYCLE: int = int(os.getenv("MAX_TRADES_PER_CYCLE", "3"))
+    # V12: raised from 3 to 10 — prevents scalps being cut off when swing takes the slots
+    MAX_TRADES_PER_CYCLE: int = int(os.getenv("MAX_TRADES_PER_CYCLE", "10"))
+
 
     # ── V5 Scalp TP/SL (tighter for scalping) ───────────────────────
     SCALP_TP_PCT: float = float(os.getenv("SCALP_TP_PCT", "2.0"))

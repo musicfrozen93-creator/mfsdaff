@@ -75,6 +75,8 @@ class ConfidenceEngine:
             else:
                 details.append("EMA against")
 
+
+
             # Price above both EMAs
             if price > ema_fast and price > ema_slow:
                 score += 5.0
@@ -430,13 +432,13 @@ class ConfidenceEngine:
 
         # ── Hard Rejects ─────────────────────────────────────────────
 
-        # 1. Candle overextended (body > 2.5×ATR)
-        if atr > 0 and body > atr * 2.5:
-            return False, f"Overextended candle: body={body:.4f} > 2.5×ATR={atr*2.5:.4f}", 0
+        # 1. Candle overextended (body > 4×ATR — relaxed from 2.5x for scalp compatibility)
+        if atr > 0 and body > atr * 4.0:
+            return False, f"Overextended candle: body={body:.4f} > 4×ATR={atr*4.0:.4f}", 0
 
-        # 2. Spread too wide (> 0.12%)
-        if spread_pct > 0.12:
-            return False, f"Spread too wide: {spread_pct:.3f}% > 0.12%", 0
+        # 2. Spread too wide (> 0.20% — relaxed from 0.12% to allow more scalp opportunities)
+        if spread_pct > 0.20:
+            return False, f"Spread too wide: {spread_pct:.3f}% > 0.20%", 0
 
         # 3. Extreme volatility
         if atr_pct > 5.0:
@@ -450,13 +452,13 @@ class ConfidenceEngine:
             if lower_wick > body * 3:
                 return False, "Fake dump: massive lower wick (bounce)", 0
 
-        # 5. Low volume move (volume < 0.5x average)
-        if volume_ratio < 0.5:
-            return False, f"Low volume move: {volume_ratio:.1f}x < 0.5x avg", 0
+        # 5. Low volume move (volume < 0.3x average — relaxed from 0.5x)
+        if volume_ratio < 0.3:
+            return False, f"Very low volume: {volume_ratio:.1f}x < 0.3x avg", 0
 
-        # 6. Sideways chop (EMA distance < 0.05%)
-        if ema_dist_pct < 0.05:
-            return False, f"Sideways chop: EMA dist={ema_dist_pct:.3f}% < 0.05%", 0
+        # 6. Sideways chop (EMA distance < 0.02% — tightened from 0.05% to reduce over-rejection)
+        if ema_dist_pct < 0.02:
+            return False, f"Extreme chop: EMA dist={ema_dist_pct:.3f}% < 0.02%", 0
 
         # ── Soft Penalties (reduce confidence but don't reject) ───────
 

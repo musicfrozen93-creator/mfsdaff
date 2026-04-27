@@ -415,10 +415,13 @@ class MarketRegimeRouter:
             if regime == "HIGH_VOLATILITY" and not strategy.startswith("sniper"):
                 continue
 
-            # SIDEWAYS: only allow range reversal scalp
-            if regime == "SIDEWAYS_RANGE" and strategy not in ("range_reversal", "scalp_range_reversal"):
-                if not strategy.startswith("swing"):  # Allow swing through
+            # SIDEWAYS: only block pure breakout scalp — range+trend scalps still valid
+            # V12: removed over-restriction that blocked ALL scalps in sideways
+            if regime == "SIDEWAYS_RANGE" and not strategy.startswith("swing"):
+                if strategy in ("breakout_momentum", "scalp_breakout"):  # Only block breakout
+                    logger.debug(f"  Sideways: blocking breakout scalp {sym}")
                     continue
+                # range_reversal, trend_pullback, and all other scalps = ALLOWED
 
             allowed.append(sig)
 
@@ -447,9 +450,9 @@ class MarketRegimeRouter:
         # New York session (13:00-21:00 UTC)
         elif 13 <= hour < 21:
             return 1.0
-        # Asia session (00:00-08:00 UTC)
+        # Asia session (00:00-08:00 UTC) — floor raised to 0.92 to prevent confidence kills
         elif 0 <= hour < 8:
-            return 0.85
-        # Dead hours (21:00-00:00 UTC)
+            return 0.92
+        # Dead hours (21:00-00:00 UTC) — floor raised to 0.90
         else:
-            return 0.7
+            return 0.90

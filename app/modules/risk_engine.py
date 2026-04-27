@@ -109,10 +109,10 @@ class RiskEngine:
         max_leverage: int = 8, strategy_type: str = "trend_pullback",
     ) -> int:
         """
-        V5.5 Deterministic leverage — 10x REMOVED, max 8x elite scalp.
-        Scalp: 4/5/6/8. Swing: 2/3/4/5. Sniper: 3/3/4/4.
+        V12: Lowered gate from 70 to 60 to match MIN_CONFIDENCE.
+        Scalp: 3/4/5/6/8. Swing: 2/2/3/4/5. Sniper: 3/3/4/4.
         """
-        if confidence < 70:
+        if confidence < 60:
             return 0  # NO TRADE
 
         # Strategy-specific leverage tiers
@@ -123,17 +123,20 @@ class RiskEngine:
                 return min(4, max_leverage)
             elif confidence >= 81:
                 return min(3, max_leverage)
-            else:
+            elif confidence >= 70:
                 return min(2, max_leverage)
+            else:
+                return min(2, max_leverage)  # 60-69: 2x swing
 
         elif strategy_type.startswith("sniper"):
-            # Sniper: capped at 4x always
             if confidence >= 91:
                 return min(4, max_leverage)
             elif confidence >= 81:
                 return min(4, max_leverage)
-            else:
+            elif confidence >= 70:
                 return min(3, max_leverage)
+            else:
+                return min(3, max_leverage)  # 60-69: 3x sniper
 
         else:
             # Scalp: 8x max for elite only, no 10x ever
@@ -143,8 +146,10 @@ class RiskEngine:
                 return min(6, max_leverage)
             elif confidence >= 81:
                 return min(5, max_leverage)
-            else:
+            elif confidence >= 70:
                 return min(4, max_leverage)
+            else:
+                return min(3, max_leverage)  # V12: 60-69 gets 3x (was 0/rejected)
 
     # ─── V5.5 TP/SL — Wider TP + ATR-Dynamic SL ──────────────────────
 
@@ -283,7 +288,7 @@ class RiskEngine:
                 entry_price=entry_price, stop_loss=0, take_profit=0,
                 risk_reward=0, risk_pct=0, confidence=confidence,
                 approved=False,
-                reject_reason=f"Confidence {confidence} below minimum {settings.MIN_CONFIDENCE}",
+                reject_reason=f"Confidence {confidence} below minimum {settings.MIN_CONFIDENCE} [SCALP GATE]",
                 setup_grade=setup_grade,
             )
 

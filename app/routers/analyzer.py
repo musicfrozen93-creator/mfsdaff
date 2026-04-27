@@ -144,7 +144,14 @@ async def analyze_batch(req: BatchAnalyzeRequest):
                     symbol, spread_pct=spread,
                     regime=regime, regime_weights=regime_weights,
                 )
-                return symbol, engine.to_dict(decision)
+                d = engine.to_dict(decision)
+                # V12: Log exact rejection reason for HOLD signals — scalp transparency
+                if d.get("action") == "HOLD":
+                    logger.info(
+                        f"  [SCALP SKIP] {symbol}: HOLD | conf={d.get('confidence',0)} | "
+                        f"reason={d.get('reason','?')[:120]}"
+                    )
+                return symbol, d
             except Exception as e:
                 logger.warning(f"Analysis failed for {symbol}: {e}")
                 return symbol, None
