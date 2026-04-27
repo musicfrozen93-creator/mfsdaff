@@ -37,6 +37,7 @@ from app.modules.close_engine import CloseEngine, CloseResult
 from app.modules.crypto_utils import decrypt_api_key
 from app.modules.price_stream import PriceStream
 from app.modules.telegram import TelegramNotifier
+from app.modules.binance_sync import sync_all_accounts, get_binance_live_positions  # V12
 from app.utils.state import state_manager
 
 logging.basicConfig(
@@ -555,8 +556,19 @@ class PositionManager:
 
         await self._load_account_credentials()
 
-        # V11: Orphan sync on startup
+        # V12: Orphan sync on startup
         await self._orphan_sync()
+
+        # V12: Initial Binance→DB sync on startup
+        try:
+            logger.info("[PM V12] Running initial Binance→DB sync...")
+            sync_result = await sync_all_accounts()
+            logger.info(
+                f"[PM V12] Initial sync: ghosts={sync_result['ghosts']} "
+                f"orphans={sync_result['orphans']} synced={sync_result['synced']}"
+            )
+        except Exception as se:
+            logger.warning(f"[PM V12] Initial sync failed (non-critical): {se}")
 
         symbols = await self._get_tracked_symbols()
         if symbols:
@@ -564,6 +576,7 @@ class PositionManager:
         await self.price_stream.start(symbols or [])
 
         last_symbol_refresh = 0
+        last_binance_sync = 0  # V12: track sync ticks
 
         while self._running:
             loop_start = time.time()
@@ -576,6 +589,23 @@ class PositionManager:
                     await self._load_account_credentials()
                     last_symbol_refresh = self._tick
 
+                # V12: Periodic Binance→DB sync
+                sync_ticks = max(1, settings.BINANCE_SYNC_INTERVAL)  # default 60s = 60 ticks
+                if self._tick - last_binance_sync >= sync_ticks:
+                    try:
+                        sync_result = await sync_all_accounts()
+                        if sync_result["ghosts"] > 0 or sync_result["orphans"] > 0:
+                            logger.info(
+                                f"[PM V12] Sync: ghosts={sync_result['ghosts']} "
+                                f"orphans={sync_result['orphans']} "
+                                f"synced={sync_result['synced']}"
+                            )
+                    except Exception as se:
+                        logger.debug(f"[PM V12] Periodic sync error (non-critical): {se}")
+                    last_binance_sync = self._tick
+
+                # V12: Load open positions for monitoring
+                # DB records drive the loop; sync above keeps them accurate.
                 open_positions = await self._load_open_positions()
 
                 if not open_positions:

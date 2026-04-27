@@ -150,8 +150,10 @@ class Settings:
     SWING_TRIGGER_TOLERANCE: float = float(os.getenv("SWING_TRIGGER_TOLERANCE", "0.005"))  # 0.5%
 
     # ── V10 Concurrent Trade Limits ──────────────────────────────────────
-    MAX_CONCURRENT_SCALP_TRADES: int = int(os.getenv("MAX_CONCURRENT_SCALP_TRADES", "5"))
-    MAX_CONCURRENT_SWING_TRADES: int = int(os.getenv("MAX_CONCURRENT_SWING_TRADES", "3"))
+    # V12: Set to 99999 — effectively unlimited. Binance live positions are the
+    # truth source. DB counts are NOT used to block entries.
+    MAX_CONCURRENT_SCALP_TRADES: int = int(os.getenv("MAX_CONCURRENT_SCALP_TRADES", "99999"))
+    MAX_CONCURRENT_SWING_TRADES: int = int(os.getenv("MAX_CONCURRENT_SWING_TRADES", "99999"))
 
     # ── V10 Per-Coin Post-Close Cooldown ─────────────────────────────────
     # Cooldown applied after a position is CLOSED (not just opened)
@@ -163,14 +165,26 @@ class Settings:
     PYTHON_PM_ENABLED: bool = os.getenv("PYTHON_PM_ENABLED", "true").lower() == "true"
 
     # ── V11 Smart Position Limits ─────────────────────────────────────────
-    # Global open position cap (scalp + swing combined)
-    MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
+    # V12: All position caps set to 99999 (unlimited).
+    # Entry decisions use Binance LIVE positions, NOT DB counts.
+    MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "99999"))
     # Block new entries if daily loss hits this %  (e.g. -8.0 = -8%)
     V11_DAILY_LOSS_GATE_PCT: float = float(os.getenv("V11_DAILY_LOSS_GATE_PCT", "-8.0"))
     # Lock new entries when daily profit reaches this % (e.g. 12.0 = +12%)
     V11_DAILY_PROFIT_LOCK_PCT: float = float(os.getenv("V11_DAILY_PROFIT_LOCK_PCT", "12.0"))
-    # Block same symbol if already open on any account
+    # Block same symbol if already open: check Binance live, not DB
     MAX_SAME_SYMBOL_OPEN: int = int(os.getenv("MAX_SAME_SYMBOL_OPEN", "1"))
+
+    # ── V12 Binance Truth Source ──────────────────────────────────────────
+    # When True: use Binance live positions as truth for entry decisions.
+    # DB open_positions is treated as mirror / analytics only.
+    BINANCE_TRUTH_SOURCE: bool = os.getenv("BINANCE_TRUTH_SOURCE", "true").lower() == "true"
+    # Auto-sync interval in seconds (PM syncs Binance → DB every N seconds)
+    BINANCE_SYNC_INTERVAL: int = int(os.getenv("BINANCE_SYNC_INTERVAL", "60"))
+    # If a DB trade is open but missing from Binance → mark as closed with reason
+    BINANCE_GHOST_CLOSE_REASON: str = os.getenv("BINANCE_GHOST_CLOSE_REASON", "externally_closed")
+    # Create DB records for Binance positions that don't exist in DB
+    BINANCE_CREATE_MISSING_RECORDS: bool = os.getenv("BINANCE_CREATE_MISSING_RECORDS", "true").lower() == "true"
 
     # ── V11 Scalp TP/SL targets ──────────────────────────────────────────
     # Overrides SCALP_TP_PCT / SCALP_SL_PCT for the new scalp engine

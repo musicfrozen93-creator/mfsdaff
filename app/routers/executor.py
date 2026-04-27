@@ -29,6 +29,7 @@ from app.modules.crypto_utils import decrypt_api_key
 from app.modules.daily_guard import daily_guard
 from app.modules.strategy_tracker import strategy_tracker  # V7: per-coin cooldown
 from app.modules.learning_engine import learning_engine      # V7: adaptive learning
+from app.modules.binance_sync import get_binance_live_positions, count_all_live_positions  # V12
 from app.utils.state import state_manager
 from app.config import settings
 from app.database import async_session
@@ -305,63 +306,94 @@ async def execute_multi_account(req: MultiExecuteRequest):
             "reason": f"Post-close cooldown active for {symbol} — {post_cd_remaining // 60}m {post_cd_remaining % 60}s remaining",
         }
 
-    # V10: Concurrent trade limit check (scalp and swing caps)
-    try:
-        async with async_session() as session:
-            result = await session.execute(
-                select(OpenPosition).where(OpenPosition.status.in_(["open", "closing"]))
-            )
-            open_positions = result.scalars().all()
+    # V12: Concurrent position check — uses BINANCE LIVE POSITIONS as truth source.
+    # DB open_positions is NOT used to gate entries (stale counts cause freezes).
+    # MAX_CONCURRENT_SCALP_TRADES and MAX_CONCURRENT_SWING_TRADES are set to 99999
+    # (effectively unlimited). This block only runs same-symbol check.
+    is_scalp = req.strategy_type.startswith(("scalp", "sniper"))
+    live_count = 0
+    live_symbol_count = 0
 
-        is_scalp = req.strategy_type.startswith(("scalp", "sniper"))
-        scalp_open = sum(1 for p in open_positions if (p.strategy_type or "").startswith(("scalp", "sniper")))
-        swing_open = len(open_positions) - scalp_open
-
-        if is_scalp and scalp_open >= settings.MAX_CONCURRENT_SCALP_TRADES:
+    if settings.BINANCE_TRUTH_SOURCE:
+        try:
+            # Fetch live count from Binance (all accounts combined)
+            live_count = await count_all_live_positions()
             logger.info(
-                f"[V11 GATE] {symbol} BLOCKED — scalp concurrent limit "
-                f"{scalp_open}/{settings.MAX_CONCURRENT_SCALP_TRADES}"
+                f"[V12 LIVE COUNT] {symbol}: Binance live positions = {live_count} | "
+                f"limits: scalp={settings.MAX_CONCURRENT_SCALP_TRADES} "
+                f"swing={settings.MAX_CONCURRENT_SWING_TRADES} "
+                f"global={settings.MAX_OPEN_POSITIONS} (all 99999=unlimited)"
             )
-            return {
-                "status": "skipped",
-                "reason": f"Scalp concurrent limit reached: {scalp_open}/{settings.MAX_CONCURRENT_SCALP_TRADES} open scalp trades",
-            }
-        if not is_scalp and swing_open >= settings.MAX_CONCURRENT_SWING_TRADES:
-            logger.info(
-                f"[V11 GATE] {symbol} BLOCKED — swing concurrent limit "
-                f"{swing_open}/{settings.MAX_CONCURRENT_SWING_TRADES}"
-            )
-            return {
-                "status": "skipped",
-                "reason": f"Swing concurrent limit reached: {swing_open}/{settings.MAX_CONCURRENT_SWING_TRADES} open swing trades",
-            }
 
-        # V11: Global MAX_OPEN_POSITIONS cap (scalp + swing combined)
-        total_open = len(open_positions)
-        if total_open >= settings.MAX_OPEN_POSITIONS:
-            logger.info(
-                f"[V11 GATE] {symbol} BLOCKED — global position cap "
-                f"{total_open}/{settings.MAX_OPEN_POSITIONS}"
-            )
-            return {
-                "status": "skipped",
-                "reason": f"V11: Max open positions reached ({total_open}/{settings.MAX_OPEN_POSITIONS})",
-            }
+            # Same-symbol live check (still enforce — prevent stacking same coin)
+            # Use first available account credentials for symbol check
+            async with async_session() as session:
+                stmt = (
+                    select(Account, ApiConnection)
+                    .join(ApiConnection, ApiConnection.account_id == Account.id)
+                    .where(Account.is_active == True)
+                    .where(Account.bot_enabled == True)
+                    .where(ApiConnection.is_active == True)
+                )
+                result = await session.execute(stmt)
+                rows = result.all()
 
-        # V11: Same-symbol block (prevent duplicate open positions on the same coin)
-        same_symbol_open = [p for p in open_positions if p.symbol == symbol]
-        if len(same_symbol_open) >= settings.MAX_SAME_SYMBOL_OPEN:
-            logger.info(
-                f"[V11 GATE] {symbol} BLOCKED — same-symbol already open "
-                f"({len(same_symbol_open)} positions)"
-            )
-            return {
-                "status": "skipped",
-                "reason": f"V11: {symbol} already has {len(same_symbol_open)} open position(s)",
-            }
+            for acc_row, conn_row in rows[:1]:  # Check first account only
+                if conn_row.api_key_encrypted and conn_row.api_secret_encrypted:
+                    try:
+                        _ak = decrypt_api_key(conn_row.api_key_encrypted)
+                        _ask = decrypt_api_key(conn_row.api_secret_encrypted)
+                        live_positions = await get_binance_live_positions(_ak, _ask)
+                        live_symbol_count = sum(1 for p in live_positions if p.get("symbol") == symbol)
+                    except Exception:
+                        live_symbol_count = 0
+                    break
 
-    except Exception as cl_err:
-        logger.warning(f"Concurrent limit check failed (non-critical): {cl_err}")
+            if live_symbol_count >= settings.MAX_SAME_SYMBOL_OPEN:
+                logger.info(
+                    f"[V12 GATE] {symbol} BLOCKED — live same-symbol positions: "
+                    f"{live_symbol_count}/{settings.MAX_SAME_SYMBOL_OPEN}"
+                )
+                return {
+                    "status": "skipped",
+                    "reason": f"V12: {symbol} already has {live_symbol_count} live Binance position(s)",
+                }
+
+        except Exception as live_err:
+            logger.warning(
+                f"[V12] Binance live count failed — falling back to DB count: {live_err}"
+            )
+            # Fallback to DB count if Binance fetch fails
+            try:
+                async with async_session() as session:
+                    result = await session.execute(
+                        select(OpenPosition).where(OpenPosition.status.in_(["open", "closing"]))
+                    )
+                    open_positions = result.scalars().all()
+                same_symbol_open = [p for p in open_positions if p.symbol == symbol]
+                if len(same_symbol_open) >= settings.MAX_SAME_SYMBOL_OPEN:
+                    return {
+                        "status": "skipped",
+                        "reason": f"[DB fallback] {symbol} already has {len(same_symbol_open)} open position(s)",
+                    }
+            except Exception:
+                pass  # Non-critical — don't block on fallback failure
+    else:
+        # BINANCE_TRUTH_SOURCE=false: use DB count (legacy behavior)
+        try:
+            async with async_session() as session:
+                result = await session.execute(
+                    select(OpenPosition).where(OpenPosition.status.in_(["open", "closing"]))
+                )
+                open_positions = result.scalars().all()
+            same_symbol_open = [p for p in open_positions if p.symbol == symbol]
+            if len(same_symbol_open) >= settings.MAX_SAME_SYMBOL_OPEN:
+                return {
+                    "status": "skipped",
+                    "reason": f"[DB] {symbol} already has {len(same_symbol_open)} open position(s)",
+                }
+        except Exception as db_err:
+            logger.warning(f"DB concurrent check failed: {db_err}")
 
     # V11: Global daily P&L entry gate
     v11_gate = state_manager.check_v11_entry_gate()
@@ -369,14 +401,11 @@ async def execute_multi_account(req: MultiExecuteRequest):
         logger.info(f"[V11 GATE] {symbol} BLOCKED — daily P&L gate: {v11_gate['reason']}")
         return {"status": "skipped", "reason": v11_gate["reason"]}
 
-    # V11: Verbose gate log (always shown — helps debug scalp execution issues)
+    # V12: Verbose gate pass log
     logger.info(
-        f"[V11 GATE PASS] {symbol} {side} conf={req.confidence} strategy={req.strategy_type}\n"
-        f"  HOURLY_LIMIT: OK | DAILY_LIMIT: OK | COIN_CD: OK | POST_CD: OK\n"
-        f"  CONCURRENT: scalp={scalp_open if 'scalp_open' in dir() else '?'}/ "
-        f"swing={swing_open if 'swing_open' in dir() else '?'} | "
-        f"GLOBAL: {total_open if 'total_open' in dir() else '?'}/{settings.MAX_OPEN_POSITIONS} | "
-        f"V11_GATE: PASS"
+        f"[V12 GATE PASS] {symbol} {side} conf={req.confidence} strategy={req.strategy_type} | "
+        f"Binance live count={live_count} | same-symbol live={live_symbol_count} | "
+        f"daily P&L gate: OK | truth_source={'BINANCE' if settings.BINANCE_TRUTH_SOURCE else 'DB'}"
     )
 
     # ── Save signal to DB ────────────────────────────────────────────
