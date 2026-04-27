@@ -1165,31 +1165,129 @@ class HeartbeatRequest(BaseModel):
 @router.get("/positions/open")
 async def get_open_positions(type: Optional[str] = None):
     """
-    V10: Return all open positions for n8n PM to monitor.
+    V12: Binance-first open positions endpoint.
+
+    Truth source = Binance live futures positions (positionAmt != 0).
+    DB is treated as a mirror only — auto-synced every call:
+      - Binance open  + DB missing  → create DB row  (orphan recovery)
+      - Binance closed + DB open    → mark DB closed  (ghost cleanup)
+      - Both match                  → update last_price in DB
 
     Query param:
-      type=scalp  → only positions whose strategy_type starts with 'scalp' or 'sniper'
-      type=swing  → only positions whose strategy_type starts with 'swing'
-      (omit)      → all open positions
+      type=scalp  → only scalp/sniper positions
+      type=swing  → only swing positions
+      (omit)      → all positions
 
-    Also enforces concurrent trade limits — returns count metadata
-    so n8n can skip execution when limits are hit.
+    Always returns count=len(positions) based on LIVE Binance data.
     """
+    import time as _time
+    from datetime import datetime, timezone
+    from app.modules.binance_sync import get_binance_live_positions, sync_all_accounts
+    from app.modules.crypto_utils import decrypt_api_key
+
+    now = datetime.now(timezone.utc)
+    cycle_start = _time.monotonic()
+
+    # ── Helper: normalise strategy_type to trade_mode ─────────────────
+    def _trade_mode(strategy: str) -> str:
+        """V12: normalise all scalp/sniper variants to 'scalp'."""
+        st = (strategy or "").strip().lower()
+        if st.startswith(("scalp", "sniper", "breakout", "range_reversal", "trend_pullback", "binance_sync")):
+            return "scalp"
+        if st.startswith("swing"):
+            return "swing"
+        # Fallback: default to scalp so nothing is accidentally hidden
+        return "scalp"
+
     try:
+        # ── STEP 1: Fetch Binance live positions for ALL accounts ─────
+        binance_live: list[dict] = []
+        try:
+            async with async_session() as session:
+                from sqlalchemy import select as _select
+                from app.models.user import Account, ApiConnection
+                stmt = (
+                    _select(Account, ApiConnection)
+                    .join(ApiConnection, ApiConnection.account_id == Account.id)
+                    .where(Account.is_active == True)
+                    .where(Account.bot_enabled == True)
+                    .where(ApiConnection.is_active == True)
+                )
+                acc_result = await session.execute(stmt)
+                acc_rows = acc_result.all()
+
+            tasks = []
+            acc_ids = []
+            for acc, conn in acc_rows:
+                if not conn.api_key_encrypted or not conn.api_secret_encrypted:
+                    continue
+                try:
+                    ak = decrypt_api_key(conn.api_key_encrypted)
+                    ask = decrypt_api_key(conn.api_secret_encrypted)
+                    tasks.append(get_binance_live_positions(ak, ask))
+                    acc_ids.append(acc.id)
+                except Exception:
+                    pass
+
+            # Fallback: master key if no accounts configured
+            if not tasks and settings.BINANCE_API_KEY:
+                tasks.append(get_binance_live_positions(
+                    settings.BINANCE_API_KEY, settings.BINANCE_SECRET_KEY
+                ))
+                acc_ids.append(0)
+
+            if tasks:
+                raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+                for res in raw_results:
+                    if isinstance(res, list):
+                        binance_live.extend(res)
+
+        except Exception as bnc_err:
+            logger.error(f"[positions/open] Binance fetch failed: {bnc_err}")
+
+        binance_symbols = {p.get("symbol"): p for p in binance_live}
+        logger.info(
+            f"[positions/open] Binance live count={len(binance_live)} | "
+            f"symbols={list(binance_symbols.keys())[:10]}"
+        )
+
+        # ── STEP 2: Trigger async DB sync (non-blocking background) ─────
+        try:
+            await sync_all_accounts()
+        except Exception as sync_err:
+            logger.debug(f"[positions/open] DB sync error (non-critical): {sync_err}")
+
+        # ── STEP 3: Fetch DB open positions ──────────────────────────────
         async with async_session() as session:
-            result = await session.execute(
+            db_result = await session.execute(
                 select(OpenPosition).where(OpenPosition.status == "open")
             )
-            positions = result.scalars().all()
+            db_positions = db_result.scalars().all()
 
-        def _trade_mode(p: OpenPosition) -> str:
-            st = (p.strategy_type or "").lower()
-            if st.startswith("scalp") or st.startswith("sniper"):
-                return "scalp"
-            return "swing"
+        db_symbols = {p.symbol: p for p in db_positions}
+        logger.info(
+            f"[positions/open] DB open count={len(db_positions)} | "
+            f"symbols={list(db_symbols.keys())[:10]}"
+        )
 
-        all_open = [
-            {
+        # ── STEP 4: Build merged position list ───────────────────────────
+        # Primary: DB rows (now synced). Fill in live price from Binance.
+        all_open = []
+
+        for p in db_positions:
+            live = binance_symbols.get(p.symbol)
+            mode = _trade_mode(p.strategy_type)
+
+            # Use Binance mark price if available
+            live_price = float(live.get("markPrice", 0)) if live else 0
+            last_price = live_price if live_price > 0 else (p.last_price or p.entry_price or 0)
+
+            logger.debug(
+                f"  [TYPE MAP] {p.symbol}: strategy_type={p.strategy_type!r} → trade_mode={mode} "
+                f"| binance_live={live is not None}"
+            )
+
+            all_open.append({
                 "id": p.id,
                 "trade_id": p.trade_id,
                 "account_id": p.account_id,
@@ -1199,7 +1297,7 @@ async def get_open_positions(type: Optional[str] = None):
                 "quantity": p.quantity,
                 "leverage": p.leverage,
                 "strategy_type": p.strategy_type or "",
-                "trade_mode": _trade_mode(p),
+                "trade_mode": mode,
                 "timeframe": p.timeframe or "",
                 "confidence": p.confidence or 0,
                 "tp_price": p.tp_price,
@@ -1215,13 +1313,63 @@ async def get_open_positions(type: Optional[str] = None):
                 "position_side": p.position_side or "BOTH",
                 "status": p.status,
                 "opened_at": p.opened_at.isoformat() if p.opened_at else None,
-                "last_price": p.last_price,
+                "last_price": last_price,
                 "check_count": p.check_count or 0,
-            }
-            for p in positions
-        ]
+                # V12: indicate live Binance confirmation
+                "binance_confirmed": live is not None,
+                "binance_unrealized_pnl": float(live.get("unrealizedProfit", 0)) if live else None,
+                "binance_source": True,
+            })
 
-        # Filter by type if requested
+        # ── STEP 5: Add Binance positions missing from DB ─────────────────
+        # These survived sync (new positions opened since last sync tick)
+        for sym, live in binance_symbols.items():
+            if sym not in db_symbols:
+                amt = float(live.get("positionAmt", 0))
+                side = "BUY" if amt > 0 else "SELL"
+                entry = float(live.get("entryPrice", 0))
+                mark = float(live.get("markPrice", entry))
+                mode = "scalp"  # Default unknown Binance positions to scalp
+
+                logger.warning(
+                    f"[positions/open] LIVE-ONLY position {sym} (not in DB yet) "
+                    f"side={side} entry={entry} amt={amt} — adding to response"
+                )
+
+                all_open.append({
+                    "id": None,
+                    "trade_id": None,
+                    "account_id": None,
+                    "symbol": sym,
+                    "side": side,
+                    "entry_price": entry,
+                    "quantity": abs(amt),
+                    "leverage": int(live.get("leverage", 1)),
+                    "strategy_type": "binance_sync",
+                    "trade_mode": mode,
+                    "timeframe": "unknown",
+                    "confidence": 0,
+                    "tp_price": 0,
+                    "sl_price": 0,
+                    "tp_pct": 0,
+                    "sl_pct": 0,
+                    "trailing_active": False,
+                    "trailing_sl_price": None,
+                    "trailing_trigger_pct": 0,
+                    "highest_price": mark,
+                    "lowest_price": mark,
+                    "is_hedge_mode": live.get("positionSide", "BOTH") in ("LONG", "SHORT"),
+                    "position_side": live.get("positionSide", "BOTH"),
+                    "status": "open",
+                    "opened_at": now.isoformat(),
+                    "last_price": mark,
+                    "check_count": 0,
+                    "binance_confirmed": True,
+                    "binance_unrealized_pnl": float(live.get("unrealizedProfit", 0)),
+                    "binance_source": True,
+                })
+
+        # ── STEP 6: Filter by type ────────────────────────────────────────
         if type == "scalp":
             filtered = [p for p in all_open if p["trade_mode"] == "scalp"]
         elif type == "swing":
@@ -1232,17 +1380,33 @@ async def get_open_positions(type: Optional[str] = None):
         scalp_count = sum(1 for p in all_open if p["trade_mode"] == "scalp")
         swing_count = sum(1 for p in all_open if p["trade_mode"] == "swing")
 
+        elapsed_ms = int((_time.monotonic() - cycle_start) * 1000)
+
+        logger.info(
+            f"[positions/open] FINAL: total={len(all_open)} scalp={scalp_count} swing={swing_count} "
+            f"returned={len(filtered)} type_filter={type!r} | "
+            f"binance_live={len(binance_live)} db_open={len(db_positions)} | {elapsed_ms}ms"
+        )
+
         return {
             "status": "ok",
             "count": len(filtered),
+            "total_open": len(all_open),
             "scalp_open": scalp_count,
             "swing_open": swing_count,
+            "binance_live_count": len(binance_live),
+            "db_open_count": len(db_positions),
             "scalp_limit": settings.MAX_CONCURRENT_SCALP_TRADES,
             "swing_limit": settings.MAX_CONCURRENT_SWING_TRADES,
             "positions": filtered,
+            # V12 debug fields
+            "type_filter": type,
+            "elapsed_ms": elapsed_ms,
+            "truth_source": "binance_live",
         }
+
     except Exception as e:
-        logger.error(f"[positions/open] Error: {e}")
+        logger.error(f"[positions/open] Error: {e}", exc_info=True)
         return {"status": "error", "message": str(e), "count": 0, "positions": []}
 
 

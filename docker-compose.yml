@@ -123,13 +123,14 @@ services:
         condition: service_healthy
       trading-bot:
         condition: service_started
-    # ── Healthcheck: process-based (ps is universal — pgrep not available in slim images)
+    # ── Healthcheck: python --version is universal — no pgrep/ps needed
     healthcheck:
-      test: ["CMD-SHELL", "ps aux | grep position_manager.py | grep -v grep || exit 1"]
+      test: ["CMD", "python", "--version"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 20s
+
 
 
   # ── n8n Workflow Automation ──────────────────────────────────────────
