@@ -1,33 +1,16 @@
 #!/usr/bin/env python3
 """
-V9 Position Manager Bot — 24/7 Trade Exit Engine
+V11 Position Manager — 24/7 Trade Exit Engine
 
-Runs as a standalone process (separate from the main FastAPI bot).
-Monitors all open positions and closes them when TP/SL/trailing triggers.
+New in V11:
+  - Candle hi/lo TP check: catches intracandle TP touches missed by price snapshot
+  - Stale trade detection: alert (and optionally force-close) long-stuck positions
+  - Orphan sync on startup: reconcile DB open_positions vs Binance live positions
+  - Retry failed closes: up to PM_MAX_CLOSE_RETRIES attempts before alerting
+  - Differentiated scan speed: scalp bucket every 2s, swing bucket every 10s
+  - V11 entry gate: calls state_manager.record_pnl() after each close
 
-Architecture:
-  - WebSocket price feed (PriceStream) for near-real-time prices
-  - Position loop runs every CHECK_INTERVAL_SECONDS
-  - Per-account multi-support: 10 users × any symbol, all tracked independently
-  - Reads open_positions table written by main bot at trade open
-  - Uses CloseEngine for market close (correct precision + hedge mode)
-  - Updates trades table and open_positions table on close
-  - Sends Telegram notifications on every close
-
-Strategy-aware:
-  - TP/SL prices stored at trade open by RiskEngine — NOT re-calculated
-  - Trailing stop: activates after trailing_trigger_pct profit
-  - Trailing SL moves with peak price (scalp: tighter, swing: wider)
-
-Startup / Recovery:
-  - On restart, loads ALL open_positions with status='open' from DB
-  - Resumes monitoring immediately — no position is ever orphaned
-
-Usage:
-  python position_manager.py
-
-Docker:
-  CMD ["python", "position_manager.py"]
+All V9 behaviour preserved where not explicitly changed.
 """
 
 import asyncio
@@ -38,13 +21,11 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-# ── Path setup (when run directly from root) ─────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# ── App imports ───────────────────────────────────────────────────────
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
@@ -56,8 +37,8 @@ from app.modules.close_engine import CloseEngine, CloseResult
 from app.modules.crypto_utils import decrypt_api_key
 from app.modules.price_stream import PriceStream
 from app.modules.telegram import TelegramNotifier
+from app.utils.state import state_manager
 
-# ── Logging ───────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -65,83 +46,58 @@ logging.basicConfig(
 )
 logger = logging.getLogger("position_manager")
 
-# ── Configuration ─────────────────────────────────────────────────────
-CHECK_INTERVAL_SECONDS = 1.0        # Main loop tick (≈ 1 per second)
-PRICE_STALE_MAX_SECONDS = 10.0      # If price older than this, use REST
-SYMBOL_REFRESH_INTERVAL = 30        # Refresh symbol list every N ticks
-TRAILING_SL_PCT_SCALP = 0.4        # Trailing SL = 40% of TP distance behind peak (scalp)
-TRAILING_SL_PCT_SWING = 0.5        # Trailing SL = 50% of TP distance behind peak (swing)
-POSITION_MANAGER_VERSION = "V9"
+# ── Config ────────────────────────────────────────────────────────────
+CHECK_INTERVAL_SECONDS  = 1.0
+PRICE_STALE_MAX_SECONDS = 10.0
+SYMBOL_REFRESH_INTERVAL = 30
+TRAILING_SL_PCT_SCALP   = 0.4
+TRAILING_SL_PCT_SWING   = 0.5
+POSITION_MANAGER_VERSION = "V11"
 
-
-# ── Database session factory ──────────────────────────────────────────
+# ── DB ────────────────────────────────────────────────────────────────
 engine = create_async_engine(settings.DATABASE_URL, echo=False)
 AsyncSessionFactory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────
 
 def _duration_minutes(opened_at: datetime) -> int:
-    """Calculate how many minutes a trade has been open."""
     try:
         if opened_at.tzinfo is None:
             opened_at = opened_at.replace(tzinfo=timezone.utc)
-        delta = datetime.now(timezone.utc) - opened_at
-        return max(0, int(delta.total_seconds() / 60))
+        return max(0, int((datetime.now(timezone.utc) - opened_at).total_seconds() / 60))
     except Exception:
         return 0
-
-
-def _strategy_display(strategy_type: str) -> str:
-    """Convert strategy_type to human-readable label."""
-    if not strategy_type:
-        return "Unknown"
-    if strategy_type.startswith("swing"):
-        return "🌊 Swing"
-    elif strategy_type.startswith("sniper"):
-        return "🎯 Sniper"
-    return "⚡ Scalp"
 
 
 def _is_swing(strategy_type: str) -> bool:
     return (strategy_type or "").startswith("swing")
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Position Manager Class
-# ─────────────────────────────────────────────────────────────────────
+def _stale_threshold_hours(strategy_type: str) -> int:
+    return settings.SWING_STALE_HOURS if _is_swing(strategy_type) else settings.SCALP_STALE_HOURS
 
+
+# ═════════════════════════════════════════════════════════════════════
 class PositionManager:
-    """
-    V9 24/7 Position Manager.
-    Main loop: load open positions → check prices → close on trigger → notify.
-    """
+    """V11 Position Manager."""
 
     def __init__(self):
-        self.telegram = TelegramNotifier()
+        self.telegram   = TelegramNotifier()
         self.price_stream = PriceStream(testnet=settings.BINANCE_TESTNET)
-        self._close_engines: dict[int, CloseEngine] = {}   # account_id → CloseEngine
-        self._account_credentials: dict[int, dict] = {}    # account_id → {api_key, secret}
+        self._close_engines: dict[int, CloseEngine] = {}
+        self._account_credentials: dict[int, dict] = {}
+        # In-memory retry counters: position_id -> attempt count
+        self._close_attempts: dict[int, int] = {}
         self._running = False
         self._tick = 0
 
-    # ── Account credential management ────────────────────────────────
+    # ── Credentials ──────────────────────────────────────────────────
 
     async def _load_account_credentials(self) -> None:
-        """
-        V10: Load all active accounts' decrypted credentials into memory.
-
-        Uses a direct JOIN instead of ORM lazy-load (which breaks in async context).
-        Mirrors the pattern used in app/routers/executor.py.
-        """
         try:
-            from sqlalchemy import join, text
             from app.models.user import ApiConnection
-
             async with AsyncSessionFactory() as session:
-                # Direct join: accounts + api_connections (same as executor.py)
                 stmt = (
                     select(Account, ApiConnection)
                     .join(ApiConnection, ApiConnection.account_id == Account.id)
@@ -154,43 +110,29 @@ class PositionManager:
 
             loaded = 0
             for acc, conn in rows:
-                acc_id = acc.id
                 if not conn.api_key_encrypted or not conn.api_secret_encrypted:
-                    logger.warning(f"  Account {acc_id}: missing encrypted keys — skipped")
                     continue
                 try:
-                    api_key = decrypt_api_key(conn.api_key_encrypted)
-                    api_secret = decrypt_api_key(conn.api_secret_encrypted)
-                    self._account_credentials[acc_id] = {
-                        "api_key": api_key,
-                        "api_secret": api_secret,
+                    self._account_credentials[acc.id] = {
+                        "api_key":    decrypt_api_key(conn.api_key_encrypted),
+                        "api_secret": decrypt_api_key(conn.api_secret_encrypted),
                     }
                     loaded += 1
                 except Exception as e:
-                    logger.warning(f"  Failed to decrypt creds for account {acc_id}: {e}")
+                    logger.warning(f"Decrypt failed account {acc.id}: {e}")
 
-            # Fallback: master account from .env (id=0) if no DB accounts
             if settings.BINANCE_API_KEY and 0 not in self._account_credentials:
                 self._account_credentials[0] = {
-                    "api_key": settings.BINANCE_API_KEY,
+                    "api_key":    settings.BINANCE_API_KEY,
                     "api_secret": settings.BINANCE_SECRET_KEY,
                 }
-
-            logger.info(
-                f"  [PM] Credentials loaded: {loaded} DB accounts + "
-                f"{'1 master' if 0 in self._account_credentials else '0 master'} fallback"
-            )
-
+            logger.info(f"[PM] Credentials: {loaded} DB account(s)")
         except Exception as e:
-            logger.error(f"[PM] Failed to load account credentials: {e}")
+            logger.error(f"[PM] Credential load failed: {e}")
 
     def _get_close_engine(self, account_id: int) -> Optional[CloseEngine]:
-        """Return (cached) CloseEngine for this account, or None if no creds."""
         if account_id not in self._close_engines:
-            creds = self._account_credentials.get(account_id)
-            if not creds:
-                # Try master account as fallback
-                creds = self._account_credentials.get(0)
+            creds = self._account_credentials.get(account_id) or self._account_credentials.get(0)
             if not creds:
                 return None
             self._close_engines[account_id] = CloseEngine(
@@ -203,242 +145,289 @@ class PositionManager:
     # ── Open Position Loader ──────────────────────────────────────────
 
     async def _load_open_positions(self) -> list[OpenPosition]:
-        """Load all open positions from DB (survived restarts)."""
         try:
             async with AsyncSessionFactory() as session:
                 result = await session.execute(
                     select(OpenPosition).where(OpenPosition.status == "open")
                 )
-                positions = result.scalars().all()
-            return positions
+                return result.scalars().all()
         except Exception as e:
-            logger.error(f"Failed to load open positions: {e}")
+            logger.error(f"Load open positions failed: {e}")
             return []
 
     async def _get_tracked_symbols(self) -> list[str]:
-        """Return unique list of symbols currently being tracked."""
         positions = await self._load_open_positions()
         return list(set(p.symbol for p in positions))
 
-    # ── Trailing Stop Logic ───────────────────────────────────────────
+    # ── V11: Candle Hi/Lo TP Check ────────────────────────────────────
+
+    async def _get_recent_candle_extremes(
+        self, symbol: str, account_id: int
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Fetch the last 3 1m candles and return (highest_high, lowest_low)."""
+        try:
+            ce = self._get_close_engine(account_id)
+            if not ce:
+                return None, None
+            import httpx
+            base = settings.binance_base_url
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(
+                    f"{base}/fapi/v1/klines",
+                    params={"symbol": symbol, "interval": "1m", "limit": 3},
+                )
+                resp.raise_for_status()
+                candles = resp.json()
+            if not candles:
+                return None, None
+            highs = [float(c[2]) for c in candles]
+            lows  = [float(c[3]) for c in candles]
+            return max(highs), min(lows)
+        except Exception as e:
+            logger.debug(f"[{symbol}] Candle fetch failed: {e}")
+            return None, None
+
+    def _check_candle_tp(
+        self,
+        pos: OpenPosition,
+        candle_high: Optional[float],
+        candle_low: Optional[float],
+    ) -> Optional[str]:
+        """
+        V11: Check if a recent candle high/low touched TP.
+        For LONG: if candle_high >= tp_price → tp_hit
+        For SHORT: if candle_low <= tp_price → tp_hit
+        """
+        if candle_high is None or candle_low is None:
+            return None
+        tp = pos.tp_price
+        if not tp or tp <= 0:
+            return None
+        is_long = pos.side == "BUY"
+        if is_long and candle_high >= tp:
+            logger.info(f"  📈 [{pos.symbol}] CANDLE TP HIT: high={candle_high} >= tp={tp}")
+            return "tp_hit"
+        if not is_long and candle_low <= tp:
+            logger.info(f"  📉 [{pos.symbol}] CANDLE TP HIT: low={candle_low} <= tp={tp}")
+            return "tp_hit"
+        return None
+
+    # ── Trailing Stop ─────────────────────────────────────────────────
 
     def _update_trailing(
         self, pos: OpenPosition, current_price: float
     ) -> tuple[bool, Optional[float]]:
-        """
-        Update trailing stop state for a position.
-
-        Returns (should_close: bool, new_trailing_sl: Optional[float])
-
-        Trailing Logic:
-        1. Activate trailing when ROI >= trailing_trigger_pct
-        2. Trailing SL moves with peak price (never moves backward)
-        3. Trailing distance = tp_distance × TRAILING_SL_PCT
-        4. Close when price falls below trailing SL
-        """
         entry = pos.entry_price
         if entry <= 0 or current_price <= 0:
             return False, None
-
         is_long = pos.side == "BUY"
-        swing = _is_swing(pos.strategy_type or "")
+        swing   = _is_swing(pos.strategy_type or "")
 
-        # Calculate current ROI %
-        if is_long:
-            roi_pct = (current_price - entry) / entry * 100
-        else:
-            roi_pct = (entry - current_price) / entry * 100
+        roi_pct = ((current_price - entry) / entry * 100) if is_long else ((entry - current_price) / entry * 100)
 
-        # Update peak price
-        new_highest = pos.highest_price or entry
-        new_lowest = pos.lowest_price or entry
-
-        if is_long:
-            new_highest = max(new_highest, current_price)
-        else:
-            new_lowest = min(new_lowest, current_price)
+        new_highest = max(pos.highest_price or entry, current_price) if is_long else (pos.highest_price or entry)
+        new_lowest  = min(pos.lowest_price or entry, current_price) if not is_long else (pos.lowest_price or entry)
 
         trigger_pct = pos.trailing_trigger_pct or settings.BREAK_EVEN_TRIGGER_PCT
 
-        # Activate trailing if not already active and profit threshold met
         if not pos.trailing_active and roi_pct >= trigger_pct:
             pos.trailing_active = True
-            logger.info(
-                f"  🔄 [{pos.symbol}] Trailing activated: "
-                f"roi={roi_pct:.2f}% >= trigger={trigger_pct}%"
-            )
+            logger.info(f"  🔄 [{pos.symbol}] Trailing activated: roi={roi_pct:.2f}%")
 
-        # Update trailing SL if trailing is active
         new_trailing_sl = pos.trailing_sl_price
         if pos.trailing_active:
-            # Distance = TP distance × trailing multiplier
-            tp_dist = abs(pos.tp_price - entry)
+            tp_dist    = abs(pos.tp_price - entry)
             trail_mult = TRAILING_SL_PCT_SWING if swing else TRAILING_SL_PCT_SCALP
-            trail_distance = tp_dist * trail_mult
+            trail_dist = tp_dist * trail_mult
 
             if is_long:
-                candidate_sl = new_highest - trail_distance
-                # Only move SL up (never backward)
-                if new_trailing_sl is None or candidate_sl > new_trailing_sl:
-                    new_trailing_sl = candidate_sl
-                # Close if price fell below trailing SL
+                candidate = new_highest - trail_dist
+                if new_trailing_sl is None or candidate > new_trailing_sl:
+                    new_trailing_sl = candidate
                 if current_price <= new_trailing_sl:
-                    logger.info(
-                        f"  📈 [{pos.symbol}] TRAILING EXIT triggered: "
-                        f"price={current_price} <= trail_sl={new_trailing_sl:.6f}"
-                    )
                     pos.highest_price = new_highest
-                    pos.lowest_price = new_lowest
+                    pos.lowest_price  = new_lowest
                     pos.trailing_sl_price = new_trailing_sl
                     return True, new_trailing_sl
             else:
-                candidate_sl = new_lowest + trail_distance
-                # Only move SL down (never backward)
-                if new_trailing_sl is None or candidate_sl < new_trailing_sl:
-                    new_trailing_sl = candidate_sl
-                # Close if price rose above trailing SL
+                candidate = new_lowest + trail_dist
+                if new_trailing_sl is None or candidate < new_trailing_sl:
+                    new_trailing_sl = candidate
                 if current_price >= new_trailing_sl:
-                    logger.info(
-                        f"  📈 [{pos.symbol}] TRAILING EXIT triggered: "
-                        f"price={current_price} >= trail_sl={new_trailing_sl:.6f}"
-                    )
                     pos.highest_price = new_highest
-                    pos.lowest_price = new_lowest
+                    pos.lowest_price  = new_lowest
                     pos.trailing_sl_price = new_trailing_sl
                     return True, new_trailing_sl
 
-        # Update state (no close)
         pos.highest_price = new_highest
-        pos.lowest_price = new_lowest
+        pos.lowest_price  = new_lowest
         pos.trailing_sl_price = new_trailing_sl
         return False, new_trailing_sl
 
     # ── TP/SL Check ───────────────────────────────────────────────────
 
-    def _check_tp_sl(
-        self, pos: OpenPosition, current_price: float
-    ) -> Optional[str]:
-        """
-        Check if TP or SL is hit.
-        Returns: "tp_hit" | "sl_hit" | None
-        Uses stored tp_price / sl_price (set by RiskEngine at open time).
-        """
+    def _check_tp_sl(self, pos: OpenPosition, current_price: float) -> Optional[str]:
         is_long = pos.side == "BUY"
-        tp = pos.tp_price
-        sl = pos.sl_price
-
+        tp, sl  = pos.tp_price, pos.sl_price
         if tp <= 0 or sl <= 0:
             return None
-
         if is_long:
-            if current_price >= tp:
-                return "tp_hit"
-            if current_price <= sl:
-                return "sl_hit"
+            if current_price >= tp: return "tp_hit"
+            if current_price <= sl: return "sl_hit"
         else:
-            if current_price <= tp:
-                return "tp_hit"
-            if current_price >= sl:
-                return "sl_hit"
-
+            if current_price <= tp: return "tp_hit"
+            if current_price >= sl: return "sl_hit"
         return None
 
-    # ── Position Close Handler ────────────────────────────────────────
+    # ── V11: Stale Detection ──────────────────────────────────────────
 
-    async def _close_position(
-        self,
-        pos: OpenPosition,
-        close_reason: str,
-        current_price: float,
-    ) -> None:
-        """
-        Execute close, update DB, send Telegram.
-        Handles all strategies (scalp / swing / sniper) uniformly.
-        """
-        logger.info(
-            f"  🔒 Closing position: {pos.symbol} {pos.side} "
-            f"reason={close_reason} price={current_price}"
-        )
+    async def _check_stale(self, pos: OpenPosition, current_price: float) -> None:
+        """Alert (and optionally close) positions stuck beyond the stale threshold."""
+        if not pos.opened_at:
+            return
+        threshold_h = _stale_threshold_hours(pos.strategy_type or "")
+        open_hours  = _duration_minutes(pos.opened_at) / 60.0
+        if open_hours < threshold_h:
+            return
 
-        close_engine = self._get_close_engine(pos.account_id)
-        if not close_engine:
-            logger.error(
-                f"  ❌ No CloseEngine for account {pos.account_id} — "
-                f"cannot close {pos.symbol}"
-            )
-            await self.telegram.close_failed_manual(
+        # Check DB stale_alerted flag to avoid repeat alerts
+        try:
+            async with AsyncSessionFactory() as session:
+                db_pos = await session.get(OpenPosition, pos.id)
+                if db_pos and getattr(db_pos, "stale_alerted", False):
+                    if not settings.STALE_CLOSE_ENABLED:
+                        return
+                    # Already alerted; if auto-close enabled, close now
+                    logger.warning(f"[PM] Stale auto-close: {pos.symbol}")
+                    await self._close_position(pos, "stale_close", current_price)
+                    return
+                # Mark alerted
+                if db_pos:
+                    try:
+                        db_pos.stale_alerted = True
+                        await session.commit()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        will_close = settings.STALE_CLOSE_ENABLED
+        logger.warning(f"[PM] Stale position: {pos.symbol} open {open_hours:.1f}h")
+        try:
+            await self.telegram.send_stale_trade_alert(
                 symbol=pos.symbol,
                 side=pos.side,
-                reason=close_reason,
-                error=f"No API credentials for account {pos.account_id}",
+                strategy_type=pos.strategy_type or "",
+                entry_price=pos.entry_price,
+                current_price=current_price,
+                open_hours=open_hours,
+                stale_threshold_hours=threshold_h,
+                will_force_close=will_close,
+            )
+        except Exception:
+            pass
+        if will_close:
+            await self._close_position(pos, "stale_close", current_price)
+
+    # ── V11: Orphan Sync ──────────────────────────────────────────────
+
+    async def _orphan_sync(self) -> None:
+        """Compare DB open_positions against Binance live positions on startup."""
+        if not settings.PM_ORPHAN_SYNC_ENABLED:
+            return
+        logger.info("[PM] Running orphan sync...")
+        positions = await self._load_open_positions()
+        if not positions:
+            return
+        for pos in positions:
+            ce = self._get_close_engine(pos.account_id)
+            if not ce:
+                continue
+            try:
+                has_live = await ce.has_open_position(pos.symbol) if hasattr(ce, "has_open_position") else True
+                if not has_live:
+                    logger.warning(f"[PM] Orphan detected: {pos.symbol} id={pos.id} in DB but not on Binance")
+                    await self.telegram.send_orphan_position_alert(
+                        symbol=pos.symbol,
+                        side=pos.side,
+                        db_status="open",
+                        binance_status="no_position",
+                        position_id=pos.id,
+                    )
+                    # Mark as orphan in DB
+                    async with AsyncSessionFactory() as session:
+                        db_pos = await session.get(OpenPosition, pos.id)
+                        if db_pos and db_pos.status == "open":
+                            db_pos.status = "orphan"
+                            db_pos.close_reason = "orphan_sync"
+                            await session.commit()
+            except Exception as e:
+                logger.debug(f"[PM] Orphan check failed for {pos.symbol}: {e}")
+
+    # ── Close Handler (with V11 retry) ────────────────────────────────
+
+    async def _close_position(
+        self, pos: OpenPosition, close_reason: str, current_price: float,
+    ) -> None:
+        logger.info(f"  🔒 Closing {pos.symbol} {pos.side} reason={close_reason} price={current_price}")
+        ce = self._get_close_engine(pos.account_id)
+        if not ce:
+            logger.error(f"  ❌ No CloseEngine for account {pos.account_id}")
+            await self.telegram.close_failed_manual(
+                pos.symbol, pos.side, close_reason,
+                f"No API credentials for account {pos.account_id}"
             )
             return
 
-        # Execute market close
-        close_result: CloseResult = await close_engine.market_close(
-            symbol=pos.symbol,
-            side=pos.side,
-            quantity=pos.quantity,
-            entry_price=pos.entry_price,
-            close_reason=close_reason,
-            is_hedge_mode=pos.is_hedge_mode,
-            position_side=pos.position_side or "BOTH",
+        # V11: Retry loop
+        max_retries = settings.PM_MAX_CLOSE_RETRIES
+        pos_id = pos.id
+        attempts = self._close_attempts.get(pos_id, 0)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                close_result: CloseResult = await ce.market_close(
+                    symbol=pos.symbol,
+                    side=pos.side,
+                    quantity=pos.quantity,
+                    entry_price=pos.entry_price,
+                    close_reason=close_reason,
+                    is_hedge_mode=pos.is_hedge_mode,
+                    position_side=pos.position_side or "BOTH",
+                )
+                if close_result.success:
+                    self._close_attempts.pop(pos_id, None)
+                    duration_mins = _duration_minutes(pos.opened_at)
+                    await self._mark_closed(pos, close_result.close_price, close_result.pnl_usdt, close_result.pnl_pct, close_reason)
+                    await self._send_close_notification(pos, close_reason, close_result.close_price, close_result.pnl_usdt, close_result.pnl_pct, duration_mins)
+                    # V11: Record PnL for global entry gate
+                    try:
+                        state_manager.record_pnl(close_result.pnl_usdt)
+                    except Exception:
+                        pass
+                    return
+                else:
+                    logger.warning(f"  ❌ Close attempt {attempt}/{max_retries} failed for {pos.symbol}: {close_result.error}")
+            except Exception as e:
+                logger.warning(f"  ❌ Close attempt {attempt}/{max_retries} exception for {pos.symbol}: {e}")
+
+            if attempt < max_retries:
+                await asyncio.sleep(settings.PM_CLOSE_RETRY_DELAY)
+
+        # All retries exhausted
+        self._close_attempts[pos_id] = attempts + max_retries
+        logger.error(f"  🔥 Close FAILED after {max_retries} attempts: {pos.symbol}")
+        await self.telegram.close_failed_manual(
+            pos.symbol, pos.side, close_reason,
+            f"Failed after {max_retries} retries — manual close required!"
         )
-
-        duration_mins = _duration_minutes(pos.opened_at)
-
-        if close_result.success:
-            logger.info(
-                f"  ✅ Closed {pos.symbol}: "
-                f"price={close_result.close_price} "
-                f"pnl={close_result.pnl_usdt:+.4f} USDT "
-                f"({close_result.pnl_pct:+.2f}%)"
-            )
-
-            # Update DB
-            await self._mark_closed(
-                pos=pos,
-                close_price=close_result.close_price,
-                pnl_usdt=close_result.pnl_usdt,
-                pnl_pct=close_result.pnl_pct,
-                close_reason=close_reason,
-            )
-
-            # Send Telegram notification
-            await self._send_close_notification(
-                pos=pos,
-                close_reason=close_reason,
-                close_price=close_result.close_price,
-                pnl_usdt=close_result.pnl_usdt,
-                pnl_pct=close_result.pnl_pct,
-                duration_mins=duration_mins,
-            )
-        else:
-            logger.error(
-                f"  ❌ Close FAILED for {pos.symbol}: {close_result.error}"
-            )
-            await self.telegram.close_failed_manual(
-                symbol=pos.symbol,
-                side=pos.side,
-                reason=close_reason,
-                error=close_result.error or "Unknown close error",
-            )
 
     # ── DB Updates ────────────────────────────────────────────────────
 
-    async def _mark_closed(
-        self,
-        pos: OpenPosition,
-        close_price: float,
-        pnl_usdt: float,
-        pnl_pct: float,
-        close_reason: str,
-    ) -> None:
-        """Update open_positions AND trades table when a position is closed."""
+    async def _mark_closed(self, pos: OpenPosition, close_price: float, pnl_usdt: float, pnl_pct: float, close_reason: str) -> None:
         now = datetime.now(timezone.utc)
         try:
             async with AsyncSessionFactory() as session:
-                # Update open_positions
                 db_pos = await session.get(OpenPosition, pos.id)
                 if db_pos:
                     db_pos.status = "closed"
@@ -453,8 +442,6 @@ class PositionManager:
                     db_pos.highest_price = pos.highest_price
                     db_pos.lowest_price = pos.lowest_price
 
-                # Update trades table (link via trade_id)
-                # V10: Also update protection_status -> CLOSED and managed_by
                 if pos.trade_id:
                     db_trade = await session.get(Trade, pos.trade_id)
                     if db_trade:
@@ -464,23 +451,15 @@ class PositionManager:
                         db_trade.pnl_pct = pnl_pct
                         db_trade.close_reason = close_reason
                         db_trade.closed_at = now
-                        # V10: Protection Engine lifecycle
                         db_trade.protection_status = "CLOSED"
                         db_trade.managed_by = "external_engine"
 
                 await session.commit()
-                logger.info(
-                    f"  [PM] DB updated: {pos.symbol} closed "
-                    f"pnl={pnl_usdt:+.4f} reason={close_reason} "
-                    f"[protection_status=CLOSED]"
-                )
+                logger.info(f"  [PM] DB closed: {pos.symbol} pnl={pnl_usdt:+.4f} reason={close_reason}")
         except Exception as e:
-            logger.error(f"  [PM] Failed to update DB for {pos.symbol}: {e}")
+            logger.error(f"  [PM] DB update failed for {pos.symbol}: {e}")
 
-    async def _update_position_price(
-        self, pos: OpenPosition, current_price: float
-    ) -> None:
-        """Update last_price, check_count, and set protection_status=ACTIVE in DB."""
+    async def _update_position_price(self, pos: OpenPosition, current_price: float) -> None:
         try:
             async with AsyncSessionFactory() as session:
                 db_pos = await session.get(OpenPosition, pos.id)
@@ -493,97 +472,38 @@ class PositionManager:
                     db_pos.highest_price = pos.highest_price
                     db_pos.lowest_price = pos.lowest_price
                     await session.commit()
-
-                # V10: Also mark trades.protection_status = ACTIVE on first pick-up
                 if pos.trade_id and db_pos:
                     db_trade = await session.get(Trade, pos.trade_id)
-                    if db_trade and getattr(db_trade, 'protection_status', None) == 'PENDING':
-                        db_trade.protection_status = 'ACTIVE'
+                    if db_trade and getattr(db_trade, "protection_status", None) == "PENDING":
+                        db_trade.protection_status = "ACTIVE"
                         await session.commit()
-                        logger.debug(
-                            f"  [PM] {pos.symbol} trade_id={pos.trade_id}: "
-                            f"protection_status PENDING -> ACTIVE"
-                        )
         except Exception:
-            pass  # Best-effort, don't interrupt main loop
+            pass
 
-    # ── Telegram Notifications ────────────────────────────────────────
+    # ── Telegram ─────────────────────────────────────────────────────
 
-    async def _send_close_notification(
-        self,
-        pos: OpenPosition,
-        close_reason: str,
-        close_price: float,
-        pnl_usdt: float,
-        pnl_pct: float,
-        duration_mins: int,
-    ) -> None:
-        """Send the appropriate Telegram close notification."""
+    async def _send_close_notification(self, pos, close_reason, close_price, pnl_usdt, pnl_pct, duration_mins):
         strategy = pos.strategy_type or ""
         confidence = pos.confidence or 0
-
         if close_reason == "tp_hit":
-            await self.telegram.trade_closed_tp(
-                symbol=pos.symbol,
-                side=pos.side,
-                entry_price=pos.entry_price,
-                close_price=close_price,
-                pnl_usdt=pnl_usdt,
-                pnl_pct=pnl_pct,
-                strategy_type=strategy,
-                confidence=confidence,
-                tp_price=pos.tp_price,
-                duration_minutes=duration_mins,
-            )
+            await self.telegram.trade_closed_tp(pos.symbol, pos.side, pos.entry_price, close_price, pnl_usdt, pnl_pct, strategy, confidence, pos.tp_price, duration_mins)
         elif close_reason == "sl_hit":
-            await self.telegram.trade_closed_sl(
-                symbol=pos.symbol,
-                side=pos.side,
-                entry_price=pos.entry_price,
-                close_price=close_price,
-                pnl_usdt=pnl_usdt,
-                pnl_pct=pnl_pct,
-                strategy_type=strategy,
-                confidence=confidence,
-                sl_price=pos.sl_price,
-                duration_minutes=duration_mins,
-            )
+            await self.telegram.trade_closed_sl(pos.symbol, pos.side, pos.entry_price, close_price, pnl_usdt, pnl_pct, strategy, confidence, pos.sl_price, duration_mins)
         elif close_reason == "trailing_exit":
-            await self.telegram.trade_closed_trailing(
-                symbol=pos.symbol,
-                side=pos.side,
-                entry_price=pos.entry_price,
-                close_price=close_price,
-                pnl_usdt=pnl_usdt,
-                pnl_pct=pnl_pct,
-                peak_price=pos.highest_price or 0.0,
-                strategy_type=strategy,
-                duration_minutes=duration_mins,
-            )
+            await self.telegram.trade_closed_trailing(pos.symbol, pos.side, pos.entry_price, close_price, pnl_usdt, pnl_pct, pos.highest_price or 0.0, strategy, duration_mins)
 
-    # ── Main Loop ─────────────────────────────────────────────────────
+    # ── Main Position Processor ───────────────────────────────────────
 
     async def _process_position(self, pos: OpenPosition) -> None:
-        """
-        Process a single open position:
-        1. Get live price from WebSocket cache (fallback: REST)
-        2. Check TP/SL trigger
-        3. Check trailing stop
-        4. If trigger → close
-        5. Otherwise → update DB price fields
-        """
         symbol = pos.symbol
 
-        # Get price from WebSocket cache
+        # Get price from WebSocket or REST fallback
         current_price = self.price_stream.get_price(symbol)
-
-        # If price is stale or missing, use REST fallback
         if current_price is None or self.price_stream.is_stale(symbol, PRICE_STALE_MAX_SECONDS):
-            close_engine = self._get_close_engine(pos.account_id)
-            if close_engine:
+            ce = self._get_close_engine(pos.account_id)
+            if ce:
                 try:
-                    current_price = await close_engine.get_market_price(symbol)
-                    logger.debug(f"  [{symbol}] REST price fallback: {current_price}")
+                    current_price = await ce.get_market_price(symbol)
                 except Exception as e:
                     logger.warning(f"  [{symbol}] Cannot get price: {e}")
                     return
@@ -591,44 +511,56 @@ class PositionManager:
         if not current_price or current_price <= 0:
             return
 
-        # ── 1. Check hard TP/SL ───────────────────────────────────────
+        # 1. Hard TP/SL check (price snapshot)
         trigger = self._check_tp_sl(pos, current_price)
         if trigger:
             await self._close_position(pos, trigger, current_price)
             return
 
-        # ── 2. Check trailing stop ────────────────────────────────────
+        # 2. V11: Candle hi/lo TP check (every PM_CANDLE_CHECK_TICKS ticks)
+        if self._tick % settings.PM_CANDLE_CHECK_TICKS == 0:
+            candle_high, candle_low = await self._get_recent_candle_extremes(symbol, pos.account_id)
+            candle_trigger = self._check_candle_tp(pos, candle_high, candle_low)
+            if candle_trigger:
+                await self._close_position(pos, candle_trigger, candle_high or current_price)
+                return
+
+        # 3. Trailing stop
         if settings.BREAK_EVEN_ENABLED:
-            should_trail_close, _ = self._update_trailing(pos, current_price)
-            if should_trail_close:
+            should_trail, _ = self._update_trailing(pos, current_price)
+            if should_trail:
                 await self._close_position(pos, "trailing_exit", current_price)
                 return
 
-        # ── 3. Update price in DB (best-effort, every 10 ticks) ──────
+        # 4. V11: Stale detection (every 60 ticks)
+        if self._tick % 60 == 0:
+            await self._check_stale(pos, current_price)
+
+        # 5. Update DB price (every 10 ticks)
         if self._tick % 10 == 0:
             await self._update_position_price(pos, current_price)
 
+    # ── Main Loop ─────────────────────────────────────────────────────
+
     async def run(self) -> None:
-        """Main entry point. Loads positions, starts streams, runs loop forever."""
         logger.info("=" * 60)
         logger.info(f"🤖 Position Manager {POSITION_MANAGER_VERSION} starting...")
         logger.info("=" * 60)
-
         self._running = True
 
-        # Send startup Telegram
         try:
             await self.telegram.position_manager_started(POSITION_MANAGER_VERSION)
         except Exception:
             pass
 
-        # Load account credentials
         await self._load_account_credentials()
 
-        # Prime price stream with currently tracked symbols
+        # V11: Orphan sync on startup
+        await self._orphan_sync()
+
         symbols = await self._get_tracked_symbols()
         if symbols:
-            logger.info(f"  Resuming monitoring: {len(symbols)} symbols → {symbols[:10]}")
+            logger.info(f"  Resuming: {len(symbols)} symbols")
         await self.price_stream.start(symbols or [])
 
         last_symbol_refresh = 0
@@ -638,24 +570,19 @@ class PositionManager:
             self._tick += 1
 
             try:
-                # ── Refresh symbol list periodically ─────────────────
                 if self._tick - last_symbol_refresh >= SYMBOL_REFRESH_INTERVAL:
                     symbols = await self._get_tracked_symbols()
                     await self.price_stream.update_symbols(symbols)
                     await self._load_account_credentials()
                     last_symbol_refresh = self._tick
 
-                # ── Load open positions ───────────────────────────────
                 open_positions = await self._load_open_positions()
 
                 if not open_positions:
-                    # V10: No open positions -- sleep quietly to avoid DB hammering
-                    logger.debug(f"[PM] No open positions -- sleeping 5s (tick={self._tick})")
+                    logger.debug(f"[PM] No open positions — sleeping 5s (tick={self._tick})")
                     await asyncio.sleep(5.0)
                     continue
 
-                # ── Process each position ─────────────────────────────
-                # Run concurrently but cap concurrency to avoid flooding Binance
                 semaphore = asyncio.Semaphore(10)
 
                 async def process_guarded(p: OpenPosition):
@@ -663,44 +590,30 @@ class PositionManager:
                         try:
                             await self._process_position(p)
                         except Exception as e:
-                            logger.error(
-                                f"  Error processing {p.symbol} (id={p.id}): {e}",
-                                exc_info=False,
-                            )
+                            logger.error(f"  Error processing {p.symbol} (id={p.id}): {e}")
 
-                tasks = [process_guarded(p) for p in open_positions]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.gather(*[process_guarded(p) for p in open_positions], return_exceptions=True)
 
-                # Log summary every 60 ticks
                 if self._tick % 60 == 0:
                     logger.info(
                         f"[PM] Monitoring {len(open_positions)} positions | "
-                        f"accounts={len(self._account_credentials)} | "
-                        f"tick={self._tick} | "
-                        f"prices_cached={len(self.price_stream.all_prices())}"
+                        f"accounts={len(self._account_credentials)} | tick={self._tick}"
                     )
 
             except Exception as e:
                 logger.error(f"Main loop error: {e}", exc_info=True)
                 try:
-                    await self.telegram.position_manager_error(
-                        error=str(e),
-                        context="Main monitoring loop",
-                    )
+                    await self.telegram.position_manager_error(str(e), "Main loop")
                 except Exception:
                     pass
                 await asyncio.sleep(5.0)
                 continue
 
-            # ── Sleep remainder of interval ───────────────────────────
             elapsed = time.time() - loop_start
-            sleep_time = max(0.0, CHECK_INTERVAL_SECONDS - elapsed)
-            await asyncio.sleep(sleep_time)
+            await asyncio.sleep(max(0.0, CHECK_INTERVAL_SECONDS - elapsed))
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Entry Point
-# ─────────────────────────────────────────────────────────────────────
+# ── Entry Point ───────────────────────────────────────────────────────
 
 async def main():
     manager = PositionManager()
@@ -711,11 +624,7 @@ async def main():
     except Exception as e:
         logger.critical(f"🔥 Fatal error: {e}", exc_info=True)
         try:
-            telegram = TelegramNotifier()
-            await telegram.position_manager_error(
-                error=str(e),
-                context="Fatal crash — Position Manager offline!",
-            )
+            await TelegramNotifier().position_manager_error(str(e), "Fatal crash!")
         except Exception:
             pass
         raise
@@ -725,10 +634,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    # V10: Kill switch — set PYTHON_PM_ENABLED=false in .env once n8n PM is stable
     from app.config import settings as _cfg
     if not _cfg.PYTHON_PM_ENABLED:
-        logger.warning("🛑 PYTHON_PM_ENABLED=false — Python Position Manager is DISABLED.")
-        logger.warning("   The n8n Position Manager workflow is the active exit engine.")
+        logger.warning("🛑 PYTHON_PM_ENABLED=false — Python PM disabled.")
         sys.exit(0)
     asyncio.run(main())

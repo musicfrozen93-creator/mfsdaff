@@ -318,17 +318,66 @@ async def execute_multi_account(req: MultiExecuteRequest):
         swing_open = len(open_positions) - scalp_open
 
         if is_scalp and scalp_open >= settings.MAX_CONCURRENT_SCALP_TRADES:
+            logger.info(
+                f"[V11 GATE] {symbol} BLOCKED — scalp concurrent limit "
+                f"{scalp_open}/{settings.MAX_CONCURRENT_SCALP_TRADES}"
+            )
             return {
                 "status": "skipped",
                 "reason": f"Scalp concurrent limit reached: {scalp_open}/{settings.MAX_CONCURRENT_SCALP_TRADES} open scalp trades",
             }
         if not is_scalp and swing_open >= settings.MAX_CONCURRENT_SWING_TRADES:
+            logger.info(
+                f"[V11 GATE] {symbol} BLOCKED — swing concurrent limit "
+                f"{swing_open}/{settings.MAX_CONCURRENT_SWING_TRADES}"
+            )
             return {
                 "status": "skipped",
                 "reason": f"Swing concurrent limit reached: {swing_open}/{settings.MAX_CONCURRENT_SWING_TRADES} open swing trades",
             }
+
+        # V11: Global MAX_OPEN_POSITIONS cap (scalp + swing combined)
+        total_open = len(open_positions)
+        if total_open >= settings.MAX_OPEN_POSITIONS:
+            logger.info(
+                f"[V11 GATE] {symbol} BLOCKED — global position cap "
+                f"{total_open}/{settings.MAX_OPEN_POSITIONS}"
+            )
+            return {
+                "status": "skipped",
+                "reason": f"V11: Max open positions reached ({total_open}/{settings.MAX_OPEN_POSITIONS})",
+            }
+
+        # V11: Same-symbol block (prevent duplicate open positions on the same coin)
+        same_symbol_open = [p for p in open_positions if p.symbol == symbol]
+        if len(same_symbol_open) >= settings.MAX_SAME_SYMBOL_OPEN:
+            logger.info(
+                f"[V11 GATE] {symbol} BLOCKED — same-symbol already open "
+                f"({len(same_symbol_open)} positions)"
+            )
+            return {
+                "status": "skipped",
+                "reason": f"V11: {symbol} already has {len(same_symbol_open)} open position(s)",
+            }
+
     except Exception as cl_err:
         logger.warning(f"Concurrent limit check failed (non-critical): {cl_err}")
+
+    # V11: Global daily P&L entry gate
+    v11_gate = state_manager.check_v11_entry_gate()
+    if not v11_gate["allowed"]:
+        logger.info(f"[V11 GATE] {symbol} BLOCKED — daily P&L gate: {v11_gate['reason']}")
+        return {"status": "skipped", "reason": v11_gate["reason"]}
+
+    # V11: Verbose gate log (always shown — helps debug scalp execution issues)
+    logger.info(
+        f"[V11 GATE PASS] {symbol} {side} conf={req.confidence} strategy={req.strategy_type}\n"
+        f"  HOURLY_LIMIT: OK | DAILY_LIMIT: OK | COIN_CD: OK | POST_CD: OK\n"
+        f"  CONCURRENT: scalp={scalp_open if 'scalp_open' in dir() else '?'}/ "
+        f"swing={swing_open if 'swing_open' in dir() else '?'} | "
+        f"GLOBAL: {total_open if 'total_open' in dir() else '?'}/{settings.MAX_OPEN_POSITIONS} | "
+        f"V11_GATE: PASS"
+    )
 
     # ── Save signal to DB ────────────────────────────────────────────
     signal_id = None
@@ -758,6 +807,8 @@ async def execute_multi_account(req: MultiExecuteRequest):
                                 last_price=result.fill_price or entry_price,
                                 highest_price=result.fill_price or entry_price,
                                 lowest_price=result.fill_price or entry_price,
+                                # V11: entry_reason for traceability
+                                entry_reason=req.reason[:500] if req.reason else None,
                             )
                             session.add(open_pos)
                             await session.commit()

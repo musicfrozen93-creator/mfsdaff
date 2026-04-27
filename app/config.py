@@ -162,6 +162,39 @@ class Settings:
     # Set PYTHON_PM_ENABLED=false once n8n PM is stable to disable Python PM
     PYTHON_PM_ENABLED: bool = os.getenv("PYTHON_PM_ENABLED", "true").lower() == "true"
 
+    # ── V11 Smart Position Limits ─────────────────────────────────────────
+    # Global open position cap (scalp + swing combined)
+    MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "5"))
+    # Block new entries if daily loss hits this %  (e.g. -8.0 = -8%)
+    V11_DAILY_LOSS_GATE_PCT: float = float(os.getenv("V11_DAILY_LOSS_GATE_PCT", "-8.0"))
+    # Lock new entries when daily profit reaches this % (e.g. 12.0 = +12%)
+    V11_DAILY_PROFIT_LOCK_PCT: float = float(os.getenv("V11_DAILY_PROFIT_LOCK_PCT", "12.0"))
+    # Block same symbol if already open on any account
+    MAX_SAME_SYMBOL_OPEN: int = int(os.getenv("MAX_SAME_SYMBOL_OPEN", "1"))
+
+    # ── V11 Scalp TP/SL targets ──────────────────────────────────────────
+    # Overrides SCALP_TP_PCT / SCALP_SL_PCT for the new scalp engine
+    V11_SCALP_TP_MIN_PCT: float = float(os.getenv("V11_SCALP_TP_MIN_PCT", "4.0"))   # min TP%
+    V11_SCALP_TP_MAX_PCT: float = float(os.getenv("V11_SCALP_TP_MAX_PCT", "10.0"))  # max TP%
+    V11_SCALP_SL_MIN_PCT: float = float(os.getenv("V11_SCALP_SL_MIN_PCT", "2.0"))   # min SL%
+    V11_SCALP_SL_MAX_PCT: float = float(os.getenv("V11_SCALP_SL_MAX_PCT", "4.0"))   # max SL%
+
+    # ── V11 Stale Trade Detection ─────────────────────────────────────────
+    # After this many hours with no TP/SL hit, trade is flagged as stale
+    STALE_CLOSE_ENABLED: bool = os.getenv("STALE_CLOSE_ENABLED", "false").lower() == "true"
+    SCALP_STALE_HOURS: int = int(os.getenv("SCALP_STALE_HOURS", "4"))
+    SWING_STALE_HOURS: int = int(os.getenv("SWING_STALE_HOURS", "72"))
+
+    # ── V11 Position Manager Reliability ─────────────────────────────────
+    # Check candle hi/lo for intracandle TP every N position-manager ticks
+    PM_CANDLE_CHECK_TICKS: int = int(os.getenv("PM_CANDLE_CHECK_TICKS", "30"))
+    # Max close retry attempts before alerting manual action required
+    PM_MAX_CLOSE_RETRIES: int = int(os.getenv("PM_MAX_CLOSE_RETRIES", "3"))
+    # Seconds between retry attempts
+    PM_CLOSE_RETRY_DELAY: int = int(os.getenv("PM_CLOSE_RETRY_DELAY", "5"))
+    # Orphan sync: compare DB open_positions vs Binance on startup
+    PM_ORPHAN_SYNC_ENABLED: bool = os.getenv("PM_ORPHAN_SYNC_ENABLED", "true").lower() == "true"
+
     def __post_init__(self):
         self.EXCLUDED_COINS = []
 

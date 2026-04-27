@@ -1,5 +1,5 @@
 """
-V4 State Manager — DB-backed with in-memory cache.
+V11 State Manager — DB-backed with in-memory cache.
 Tracks trade limits, cooldowns, and rate limiting.
 Designed for multi-account operation.
 
@@ -8,6 +8,10 @@ V4 Changes:
   - Removed duplicate daily P&L tracking (per-account daily_guard handles it)
   - Kept: hourly rate limits, coin cooldowns, trade counts (global, valid)
   - Simplified check_daily_limits to only check trade count limits
+V11 Changes:
+  - Added daily_pnl_pct tracking for global entry gate
+  - Added check_v11_entry_gate() — blocks new entries at daily loss/profit limits
+  - Preserves per-account daily_guard (not replaced)
 """
 
 import logging
@@ -42,6 +46,13 @@ class TradeState:
     # Consecutive loss tracking (global — per-account is in daily_guard)
     consecutive_losses: int = 0
     loss_cooldown_until: float = 0.0  # Unix timestamp
+
+    # V11: Global daily P&L gate (aggregated across accounts — rough estimate)
+    # Per-account precision is still handled by daily_guard. This is a safety net.
+    daily_pnl_usdt: float = 0.0          # Running today's realised P&L in USDT
+    daily_starting_equity: float = 0.0   # Set on first trade of the day
+    v11_entry_blocked: bool = False       # Set True when daily gate fires
+    v11_block_reason: str = ""           # Reason string for the block
 
     # Stats
     total_trades: int = 0
@@ -80,6 +91,10 @@ class StateManager:
             self.state.consecutive_losses = 0
             self.state.loss_cooldown_until = 0.0
             self.state.skipped_trades_today = 0
+            # V11: Reset daily P&L gate
+            self.state.daily_pnl_usdt = 0.0
+            self.state.v11_entry_blocked = False
+            self.state.v11_block_reason = ""
 
     # ─── Daily Limits Check ───────────────────────────────────────────
 
@@ -196,6 +211,64 @@ class StateManager:
     def record_skip(self):
         """Record that a trade was skipped."""
         self.state.skipped_trades_today += 1
+
+    # ── V11: Global Daily P&L Entry Gate ─────────────────────────────
+
+    def record_pnl(self, pnl_usdt: float, equity: float = 0.0):
+        """
+        V11: Record realised P&L (called after a position closes).
+        Updates global daily P&L used by check_v11_entry_gate().
+        Does NOT replace per-account daily_guard — this is a global safety net.
+        """
+        self._check_daily_reset(equity)
+        self.state.daily_pnl_usdt += pnl_usdt
+        if equity > 0 and self.state.daily_starting_equity <= 0:
+            self.state.daily_starting_equity = equity
+
+    def check_v11_entry_gate(self, current_equity: float = 0.0) -> dict:
+        """
+        V11: Global entry gate — blocks NEW trade entries when daily P&L
+        limits are breached. Position manager still runs (closes active trades).
+
+        Returns:
+            {"allowed": bool, "reason": str}
+        """
+        self._check_daily_reset(current_equity)
+
+        # If already blocked this session
+        if self.state.v11_entry_blocked:
+            return {"allowed": False, "reason": self.state.v11_block_reason}
+
+        # Calculate daily P&L %
+        equity = self.state.daily_starting_equity or current_equity
+        if equity <= 0:
+            return {"allowed": True, "reason": ""}
+
+        pnl_pct = (self.state.daily_pnl_usdt / equity) * 100
+
+        # Check daily loss gate
+        if pnl_pct <= settings.V11_DAILY_LOSS_GATE_PCT:
+            reason = (
+                f"V11 Daily loss gate: {pnl_pct:+.2f}% "
+                f"<= {settings.V11_DAILY_LOSS_GATE_PCT}% limit — new entries paused"
+            )
+            self.state.v11_entry_blocked = True
+            self.state.v11_block_reason = reason
+            logger.warning(f"🛑 {reason}")
+            return {"allowed": False, "reason": reason}
+
+        # Check daily profit lock
+        if pnl_pct >= settings.V11_DAILY_PROFIT_LOCK_PCT:
+            reason = (
+                f"V11 Daily profit lock: {pnl_pct:+.2f}% "
+                f">= {settings.V11_DAILY_PROFIT_LOCK_PCT}% — locking in gains, no new entries"
+            )
+            self.state.v11_entry_blocked = True
+            self.state.v11_block_reason = reason
+            logger.info(f"🔒 {reason}")
+            return {"allowed": False, "reason": reason}
+
+        return {"allowed": True, "reason": ""}
 
     def record_ai_call(self):
         """Record an AI API call."""

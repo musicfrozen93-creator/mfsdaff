@@ -793,3 +793,113 @@ class TelegramNotifier:
         )
         await self.send(msg)
 
+
+    # =================================================================
+    # V11: Grouped Watchlist Messages (replaces per-coin spam)
+    # =================================================================
+
+    async def send_scalp_watchlist(self, setups: list) -> bool:
+        """
+        V11: Send ONE grouped SCALP near-miss message instead of per-coin spam.
+        Format:
+            🔥 SCALP WATCHLIST
+            1. BTCUSDT 🟢 LONG 63%
+            2. SOLUSDT 🔴 SHORT 60%
+            Total: 2 | Execute at 65%+
+        """
+        if not setups:
+            return False
+        lines = ["🔥 <b>SCALP WATCHLIST</b>", ""]
+        for i, s in enumerate(setups[:10], 1):
+            sym = s.get("symbol", "?")
+            side_icon = "🟢 LONG" if s.get("action", "") == "BUY" else "🔴 SHORT"
+            conf = s.get("confidence", 0)
+            strat = (s.get("strategy_type", "") or "").replace("scalp_", "").replace("_", " ")
+            lines.append(
+                f"{i}. <b>{sym}</b> {side_icon} <b>{conf}%</b>"
+                + (f" — {strat}" if strat else "")
+            )
+        lines += ["", f"Total: <b>{len(setups)}</b> near-miss setup(s)"]
+        lines += ["<i>Will execute at 65%+ confidence on next scan.</i>"]
+        return await self.send("\n".join(lines))
+
+    async def send_swing_watchlist(self, setups: list) -> bool:
+        """
+        V11: Send ONE grouped SWING watchlist message instead of per-coin spam.
+        Format:
+            🌊 SWING WATCHLIST
+            1. ETHUSDT 🟢 LONG 78% — ema20 pullback
+            2. LINKUSDT 🔴 SHORT 75% — breakout retest
+            Total: 2 | Execute at 80%+
+        """
+        if not setups:
+            return False
+        lines = ["🌊 <b>SWING WATCHLIST</b>", ""]
+        for i, s in enumerate(setups[:15], 1):
+            sym = s.get("symbol", "?")
+            raw_side = s.get("action") or s.get("side", "BUY")
+            side_icon = "🟢 LONG" if raw_side == "BUY" else "🔴 SHORT"
+            conf = s.get("confidence", 0)
+            setup = (s.get("setup_type") or s.get("strategy_type") or "").replace("swing_", "").replace("_", " ")
+            trigger = s.get("trigger_price", 0)
+            t_str = f" | trigger ${trigger:,.4f}" if trigger > 0 else ""
+            lines.append(
+                f"{i}. <b>{sym}</b> {side_icon} <b>{conf}%</b>"
+                + (f" — {setup}" if setup else "")
+                + t_str
+            )
+        lines += ["", f"Total: <b>{len(setups)}</b> swing setup(s)"]
+        lines += ["<i>Will execute when confidence >= 80% and trigger is hit.</i>"]
+        return await self.send("\n".join(lines))
+
+    async def send_stale_trade_alert(
+        self,
+        symbol: str,
+        side: str,
+        strategy_type: str,
+        entry_price: float,
+        current_price: float,
+        open_hours: float,
+        stale_threshold_hours: int,
+        will_force_close: bool = False,
+    ) -> bool:
+        """V11: Alert when a position has been open too long without hitting TP/SL."""
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        action_line = (
+            "⚠️ <b>Force-closing stale position now.</b>"
+            if will_force_close
+            else "⚠️ <b>Review manually — position has not moved to TP/SL.</b>"
+        )
+        msg = (
+            f"⏰ <b>STALE TRADE DETECTED</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Type: <b>{strategy_type}</b>\n\n"
+            f"Entry: <b>${entry_price:,.6f}</b>\n"
+            f"Current: <b>${current_price:,.6f}</b>\n"
+            f"Open: <b>{open_hours:.1f}h</b> (limit: {stale_threshold_hours}h)\n\n"
+            f"{action_line}"
+        )
+        return await self.send(msg)
+
+    async def send_orphan_position_alert(
+        self,
+        symbol: str,
+        side: str,
+        db_status: str,
+        binance_status: str,
+        position_id: int,
+    ) -> bool:
+        """V11: Alert when DB open_positions row does not match Binance live state."""
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        msg = (
+            f"🔍 <b>ORPHAN POSITION DETECTED</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Position ID: <code>{position_id}</code>\n\n"
+            f"DB Status: <b>{db_status}</b>\n"
+            f"Binance: <b>{binance_status}</b>\n\n"
+            f"⚠️ <b>DB and Binance are out of sync.</b>\n"
+            f"<i>Position Manager will attempt to reconcile automatically.</i>"
+        )
+        return await self.send(msg)
