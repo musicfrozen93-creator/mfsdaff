@@ -92,6 +92,26 @@ services:
       - BREAK_EVEN_ENABLED=${BREAK_EVEN_ENABLED:-true}
       - BREAK_EVEN_TRIGGER_PCT=${BREAK_EVEN_TRIGGER_PCT:-3.0}
       - BREAK_EVEN_BUFFER_PCT=${BREAK_EVEN_BUFFER_PCT:-0.1}
+      # V12: Binance as truth source
+      - BINANCE_TRUTH_SOURCE=${BINANCE_TRUTH_SOURCE:-true}
+      - BINANCE_SYNC_INTERVAL=${BINANCE_SYNC_INTERVAL:-60}
+      - BINANCE_GHOST_CLOSE_REASON=${BINANCE_GHOST_CLOSE_REASON:-externally_closed}
+      - BINANCE_CREATE_MISSING_RECORDS=${BINANCE_CREATE_MISSING_RECORDS:-true}
+      # V12: Position limits (99999 = unlimited — Binance live is the gate)
+      - MAX_OPEN_POSITIONS=${MAX_OPEN_POSITIONS:-99999}
+      - MAX_CONCURRENT_SCALP_TRADES=${MAX_CONCURRENT_SCALP_TRADES:-99999}
+      - MAX_CONCURRENT_SWING_TRADES=${MAX_CONCURRENT_SWING_TRADES:-99999}
+      - MAX_SAME_SYMBOL_OPEN=${MAX_SAME_SYMBOL_OPEN:-1}
+      # V11: Stale detection
+      - STALE_CLOSE_ENABLED=${STALE_CLOSE_ENABLED:-false}
+      - SCALP_STALE_HOURS=${SCALP_STALE_HOURS:-4}
+      - SWING_STALE_HOURS=${SWING_STALE_HOURS:-72}
+      # V11: PM reliability
+      - PM_CANDLE_CHECK_TICKS=${PM_CANDLE_CHECK_TICKS:-30}
+      - PM_MAX_CLOSE_RETRIES=${PM_MAX_CLOSE_RETRIES:-3}
+      - PM_CLOSE_RETRY_DELAY=${PM_CLOSE_RETRY_DELAY:-5}
+      - PM_ORPHAN_SYNC_ENABLED=${PM_ORPHAN_SYNC_ENABLED:-true}
+      - PYTHON_PM_ENABLED=${PYTHON_PM_ENABLED:-true}
     volumes:
       - ./logs:/app/logs
     # ALWAYS restart — this must never go down
@@ -103,6 +123,14 @@ services:
         condition: service_healthy
       trading-bot:
         condition: service_started
+    # ── Healthcheck: process-based (not HTTP — this is a loop script, not a server)
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f position_manager.py || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
 
   # ── n8n Workflow Automation ──────────────────────────────────────────
   n8n:
