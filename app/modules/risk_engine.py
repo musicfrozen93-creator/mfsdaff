@@ -1,39 +1,24 @@
 """
-V13 Dynamic Risk Engine — Smarter Leverage + Margin + ROI-Based TP/SL
+V13 Dynamic Risk Engine — Fixed TP/SL math + Safe Margin Tiers
 
-Changes from V5.5:
-  - Confidence-tiered leverage per mode (7/10/12/15x)
-  - Balance-tier margin with confidence boosts (Strong+2%, Elite+3%)
-  - Dynamic scalp TP by confidence (15/18/20/22% ROI)
-  - ROI% converted to price% via leverage (makes TP meaningful at any leverage)
-  - ATR volatility dampener: cap leverage at 10x when ATR%>3%
-  - Fee/slippage profitability filter
-  - Better <$30 account sizing (15% margin, max $4)
+TP/SL Formula (FIXED):
+  price_move_pct = target_roi_pct / leverage / 100   (decimal, e.g. 0.018)
+  LONG:  TP = entry * (1 + move)   SL = entry * (1 - sl_move)
+  SHORT: TP = entry * (1 - move)   SL = entry * (1 + sl_move)
 
-Margin Tiers:
-  <$10:       hard skip (MIN_TRADE_BALANCE)
-  $10-$30:    15% margin, max $4
-  $30-$50:    12% margin, max $6
-  $50-$200:    8% margin
-  $200-$1000:  5% margin
-  $1000+:      5% margin
+Margin Tiers (V13 Final):
+  <$30:       Normal 5% / Strong 7% / Elite 10%  — hard cap $2.50 / $2.50 / $3.00
+  $30-$100:   Normal 6% / Strong 8% / Elite 10%  — hard cap $10
+  $100-$500:  Normal 5% / Strong 7% / Elite  9%  — hard cap $35
+  $500+:      Normal 4% / Strong 6% / Elite  8%  — hard cap balance*pct
 
-Confidence Boost (applied AFTER tier calc, Patch 5 — explicit caps):
-  Grade C (72-84):  no boost — base only
-  Grade B (85-88):  +2% margin  (hard cap: tier_base_pct + 2%, never >15% abs)
-  Grade A (89+):    +3% margin  (hard cap: tier_base_pct + 3%, never >15% abs)
-
-Leverage (V13 tiers):
-  SCALP:  72-76=7x | 77-82=10x | 83-88=12x | 89+=15x
-  SWING:  75-80=7x | 81-86=10x | 87+=12x
-  SNIPER: 90+=15x max
-  ATR%>3% → cap at 10x
-
-TP/SL (ROI %  → converted to price % by dividing by leverage):
-  SCALP TP ROI: 72-76=15% | 77-82=18% | 83-88=20% | 89+=22%
-  SCALP SL ROI: 9% (fixed)
-  SWING TP ROI: 35% | SL ROI: 12%
-  SNIPER TP ROI: 50% | SL ROI: 15%
+TP/SL ROI Targets:
+  SCALP  Normal (72-79):  TP +12% ROI / SL -6%
+  SCALP  Strong (80-89):  TP +18% ROI / SL -8%
+  SCALP  Elite  (90+):    TP +25% ROI / SL -10%
+  SWING  Normal (75-84):  TP +20% ROI / SL -8%
+  SWING  Strong (85-89):  TP +35% ROI / SL -12%
+  SWING  Elite  (90+):    TP +50% ROI / SL -15%
 """
 
 import logging
@@ -94,48 +79,62 @@ class RiskEngine:
     @staticmethod
     def get_margin_pct(balance: float, confidence: int) -> tuple[float, float]:
         """
-        Returns (margin_pct, max_margin_usdt).
-        Patch 1: better <$30 sizing.
-        Patch 5: explicit confidence boost caps.
+        Returns (margin_pct, max_margin_usdt) using strict per-tier rules.
 
-        Grade C (72-84): base only
-        Grade B (85-88): +V13_BOOST_STRONG_ADD_PCT (capped at abs 15%)
-        Grade A (89+):   +V13_BOOST_ELITE_ADD_PCT  (capped at abs 15%)
+        Grade mapping:
+          Normal  = confidence 72-79  (no boost beyond base)
+          Strong  = confidence 80-89  (+mid tier %)
+          Elite   = confidence 90+    (+top tier %)
+
+        Tiers:
+          <$30:      Normal 5% / Strong 7% / Elite 10%  — cap $2.50 / $2.50 / $3.00
+          $30-$100:  Normal 6% / Strong 8% / Elite 10%  — cap $10
+          $100-$500: Normal 5% / Strong 7% / Elite  9%  — cap $35
+          $500+:     Normal 4% / Strong 6% / Elite  8%  — uncapped (balance*pct)
         """
-        # Determine base tier %
         if balance < settings.V13_MIN_TRADE_BALANCE:
-            return 0.0, 0.0   # Will be caught by hard skip
+            return 0.0, 0.0  # Hard skip handled upstream
+
+        # Grade from confidence
+        is_elite  = confidence >= 90
+        is_strong = confidence >= 80 and not is_elite
+        # Normal = everything below 80
 
         if balance < 30.0:
-            base_pct = settings.V13_MARGIN_UNDER30_PCT   # 15%
-            abs_cap  = settings.V13_MARGIN_UNDER30_MAX   # $4
-        elif balance < 50.0:
-            base_pct = settings.V13_MARGIN_30_50_PCT     # 12%
-            abs_cap  = settings.V13_MARGIN_30_50_MAX     # $6
-        elif balance < 200.0:
-            base_pct = settings.V13_MARGIN_50_200_PCT    # 8%
-            abs_cap  = balance * (base_pct / 100.0)
-        elif balance < 1000.0:
-            base_pct = settings.V13_MARGIN_200_1000_PCT  # 5%
-            abs_cap  = balance * (base_pct / 100.0)
-        else:
-            base_pct = settings.V13_MARGIN_OVER1000_PCT  # 5%
-            abs_cap  = balance * (base_pct / 100.0)
+            if is_elite:
+                pct, cap = 10.0, 3.00
+            elif is_strong:
+                pct, cap = 7.0,  2.50
+            else:
+                pct, cap = 5.0,  2.50
 
-        # Confidence boost (Patch 5 — explicit, capped)
-        if confidence >= 89:
-            boost = settings.V13_BOOST_ELITE_ADD_PCT   # +3%
-        elif confidence >= 85:
-            boost = settings.V13_BOOST_STRONG_ADD_PCT  # +2%
-        else:
-            boost = 0.0
+        elif balance < 100.0:
+            if is_elite:
+                pct, cap = 10.0, 10.0
+            elif is_strong:
+                pct, cap = 8.0,  10.0
+            else:
+                pct, cap = 6.0,  10.0
 
-        final_pct = min(base_pct + boost, settings.V13_MARGIN_ABSOLUTE_CAP_PCT)
-        max_margin = min(balance * (final_pct / 100.0), abs_cap + balance * (boost / 100.0))
-        # Absolute hard cap: never more than 15% of balance
-        max_margin = min(max_margin, balance * (settings.V13_MARGIN_ABSOLUTE_CAP_PCT / 100.0))
+        elif balance < 500.0:
+            if is_elite:
+                pct, cap = 9.0,  35.0
+            elif is_strong:
+                pct, cap = 7.0,  35.0
+            else:
+                pct, cap = 5.0,  35.0
 
-        return final_pct, max_margin
+        else:  # $500+
+            if is_elite:
+                pct, cap = 8.0,  balance * 0.08
+            elif is_strong:
+                pct, cap = 6.0,  balance * 0.06
+            else:
+                pct, cap = 4.0,  balance * 0.04
+
+        # Margin = min(balance * pct%, hard_dollar_cap)
+        margin = min(balance * (pct / 100.0), cap)
+        return pct, margin
 
     # ─── V13 Leverage ─────────────────────────────────────────────────
 
@@ -198,39 +197,66 @@ class RiskEngine:
     @staticmethod
     def get_tp_sl_roi(
         confidence: int,
-        strategy_type: str = "trend_pullback",
+        strategy_type: str = "scalp_trend_pullback",
     ) -> tuple[float, float]:
         """
-        Returns (tp_roi_pct, sl_roi_pct) — position ROI percentages.
-        Patch 2: dynamic scalp TP by confidence.
+        Returns (tp_roi_pct, sl_roi_pct).
+
+        SCALP:
+          Normal  (72-79): TP +12% / SL -6%
+          Strong  (80-89): TP +18% / SL -8%
+          Elite   (90+):   TP +25% / SL -10%
+
+        SWING:
+          Normal  (75-84): TP +20% / SL -8%
+          Strong  (85-89): TP +35% / SL -12%
+          Elite   (90+):   TP +50% / SL -15%
         """
         is_swing  = strategy_type.startswith("swing")
         is_sniper = strategy_type.startswith("sniper")
 
-        if is_swing:
-            return settings.V13_SWING_TP_ROI, settings.V13_SWING_SL_ROI
-
         if is_sniper:
-            return settings.V13_SNIPER_TP_ROI, settings.V13_SNIPER_SL_ROI
+            # Sniper always elite targets
+            if confidence >= 90:
+                return 50.0, 15.0
+            return 35.0, 12.0
 
-        # Scalp — dynamic TP by confidence
-        if confidence >= 89:
-            tp_roi = settings.V13_SCALP_TP_ROI_89   # 22%
-        elif confidence >= 83:
-            tp_roi = settings.V13_SCALP_TP_ROI_83   # 20%
-        elif confidence >= 77:
-            tp_roi = settings.V13_SCALP_TP_ROI_77   # 18%
+        if is_swing:
+            if confidence >= 90:
+                return 50.0, 15.0
+            elif confidence >= 85:
+                return 35.0, 12.0
+            else:
+                return 20.0, 8.0
+
+        # Scalp (default)
+        if confidence >= 90:
+            return 25.0, 10.0
+        elif confidence >= 80:
+            return 18.0, 8.0
         else:
-            tp_roi = settings.V13_SCALP_TP_ROI_72   # 15%
-
-        return tp_roi, settings.V13_SCALP_SL_ROI
+            return 12.0, 6.0
 
     @staticmethod
     def roi_to_price_pct(roi_pct: float, leverage: int) -> float:
-        """Convert position ROI% to price movement %.  price_pct = roi_pct / leverage."""
+        """
+        Convert position ROI% to price movement as a DECIMAL FACTOR.
+
+        Formula: price_factor = roi_pct / leverage / 100
+
+        Example: 18% ROI at 10x leverage
+          = 18 / 10 / 100 = 0.018  (1.8% coin price move)
+
+        Usage:
+          TP (LONG)  = entry * (1 + 0.018)   # +1.8% price
+          SL (LONG)  = entry * (1 - 0.009)   # -0.9% price
+
+        CRITICAL: The previous implementation returned roi_pct/leverage (= 1.8)
+        which was used as entry*(1+1.8) = 280% move. That was the TP/SL bug.
+        """
         if leverage <= 0:
-            return roi_pct
-        return roi_pct / leverage
+            return roi_pct / 100.0
+        return roi_pct / leverage / 100.0
 
     # ─── V13 Fee Filter (Patch 4) ─────────────────────────────────────
 

@@ -73,6 +73,8 @@ class TelegramNotifier:
         tp_roi_pct: float = 0.0,
         sl_roi_pct: float = 0.0,
         margin_pct: float = 0.0,
+        margin_usdt: float = 0.0,      # V13 Part H: show actual $ margin used
+        account_balance: float = 0.0,  # V13 Part H: balance tier label
         reason: str = "",
         setup_grade: str = "",
         order_method: str = "MARKET",
@@ -176,15 +178,31 @@ class TelegramNotifier:
         if risk_reward > 0:
             rr_line = f"\nR:R = <b>1:{risk_reward:.1f}</b>"
 
-        # V5.5: Partial TP display
-        # V13: ROI-based TP/SL display
-        if tp_roi_pct > 0 and sl_roi_pct > 0:
-            roi_tag = f" [ROI: +{tp_roi_pct:.0f}% / -{sl_roi_pct:.0f}%]"
+        # V13 Part H: Balance tier label
+        if account_balance >= 500:
+            bal_tier = "Large ($500+)"
+        elif account_balance >= 100:
+            bal_tier = "Mid ($100-$500)"
+        elif account_balance >= 30:
+            bal_tier = "Small ($30-$100)"
+        elif account_balance > 0:
+            bal_tier = "Micro (<$30)"
         else:
-            roi_tag = ""
+            bal_tier = ""
+        bal_tier_line = f"\nBalance Tier: <b>{bal_tier}</b>" if bal_tier else ""
 
-        # V13: Margin % display
-        margin_line = f"\nMargin: <b>{margin_pct:.1f}%</b>" if margin_pct > 0 else ""
+        # V13 Part H: Margin $ display
+        margin_usdt_line = ""
+        if margin_usdt > 0 and margin_pct > 0:
+            margin_usdt_line = f"\nMargin: <b>${margin_usdt:.2f} ({margin_pct:.1f}%)</b>"
+        elif margin_pct > 0:
+            margin_usdt_line = f"\nMargin: <b>{margin_pct:.1f}%</b>"
+
+        # V13 Part H: Full TP/SL display with ROI + Price
+        if tp_roi_pct > 0 and sl_roi_pct > 0:
+            roi_line = f"\nTP ROI: <b>+{tp_roi_pct:.0f}%</b> | SL ROI: <b>-{sl_roi_pct:.0f}%</b>"
+        else:
+            roi_line = ""
 
         if partial_tp_enabled and tp1_price > 0:
             tp_block = (
@@ -195,13 +213,15 @@ class TelegramNotifier:
                 f"SL: <b>${stop_loss:,.6f}</b>{sl_pct_str}"
             )
         else:
+            tp_pct_display = f" (+{tp_pct:.2f}% price)" if tp_pct > 0 else ""
+            sl_pct_display = f" (-{sl_pct:.2f}% price)" if sl_pct > 0 else ""
             tp_block = (
-                f"TP: <b>${take_profit:,.6f}</b>{tp_pct_str}{roi_tag}\n"
-                f"SL: <b>${stop_loss:,.6f}</b>{sl_pct_str}"
+                f"TP Price: <b>${take_profit:,.6f}</b>{tp_pct_display}\n"
+                f"SL Price: <b>${stop_loss:,.6f}</b>{sl_pct_display}"
             )
 
         msg = (
-            f"🚀 <b>TRADE OPENED</b>\n\n"
+            f"🚀 <b>TRADE OPENED — V13</b>\n\n"
             f"Coin: <b>{symbol}</b>\n"
             f"Side: <b>{direction}</b>\n"
             f"Confidence: <b>{confidence}%</b>"
@@ -213,7 +233,9 @@ class TelegramNotifier:
             f"Entry: <b>${display_price:,.6f}</b>\n"
             f"Leverage: <b>{leverage}x</b>\n"
             f"Method: <b>{order_method}</b>"
-            f"{margin_line}\n\n"
+            f"{bal_tier_line}"
+            f"{margin_usdt_line}\n\n"
+            f"{roi_line}\n"
             f"{tp_block}"
             f"{rr_line}\n\n"
             f"<b>Protection:</b>\n{tp_sl_status}"

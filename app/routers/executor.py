@@ -733,6 +733,8 @@ async def _execute_multi_inner(req: MultiExecuteRequest):
     best_tp_roi_pct = 0.0
     best_sl_roi_pct = 0.0
     best_margin_pct = 0.0
+    best_margin_usdt = 0.0   # V13 Part H
+    best_balance = 0.0       # V13 Part H
     best_grade = "C"
     best_order_method = "MARKET"
     best_rr = 0.0
@@ -742,7 +744,7 @@ async def _execute_multi_inner(req: MultiExecuteRequest):
     async def execute_for_account(acc_data: dict):
         nonlocal best_fill_price, best_leverage, best_tp, best_sl
         nonlocal best_tp_pct, best_sl_pct, best_grade, best_order_method, best_rr
-        nonlocal best_tp_roi_pct, best_sl_roi_pct, best_margin_pct
+        nonlocal best_tp_roi_pct, best_sl_roi_pct, best_margin_pct, best_margin_usdt, best_balance
 
         async with semaphore:
             acc_id = acc_data["id"]
@@ -1032,6 +1034,8 @@ async def _execute_multi_inner(req: MultiExecuteRequest):
                     best_tp_roi_pct  = getattr(trade_params, 'tp_roi_pct', 0.0)
                     best_sl_roi_pct  = getattr(trade_params, 'sl_roi_pct', 0.0)
                     best_margin_pct  = getattr(trade_params, 'margin_pct', 0.0)
+                    best_margin_usdt = getattr(trade_params, 'safe_margin', 0.0)  # V13 Part H
+                    best_balance     = balance  # V13 Part H
 
 
                     logger.info(
@@ -1168,6 +1172,8 @@ async def _execute_multi_inner(req: MultiExecuteRequest):
             tp_roi_pct=best_tp_roi_pct,
             sl_roi_pct=best_sl_roi_pct,
             margin_pct=best_margin_pct,
+            margin_usdt=best_margin_usdt,       # V13 Part H
+            account_balance=best_balance,        # V13 Part H
             reason=req.reason,
             setup_grade=best_grade,
             order_method=best_order_method,
