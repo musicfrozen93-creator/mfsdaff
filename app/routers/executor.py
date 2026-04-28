@@ -16,8 +16,8 @@ V5 Changes:
 import asyncio
 import logging
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, field_validator
+from typing import Optional, Any
 
 from sqlalchemy import select, true
 
@@ -61,18 +61,99 @@ class FullExecuteRequest(BaseModel):
     atr_pct: float = 0.0
 
 
+# V13 valid strategy_type prefixes — anything starting with these passes
+_VALID_STRATEGY_PREFIXES = (
+    "scalp", "swing", "sniper", "trend", "breakout", "reversal",
+    "range", "vwap", "ema", "liquidation", "funding", "volume", "news",
+)
+
+
 class MultiExecuteRequest(BaseModel):
     symbol: str
     action: str  # BUY | SELL
-    confidence: int
+    confidence: Any = 70          # V13: Any so we can coerce str→int safely
     reason: str = ""
-    current_price: float = 0.0
-    atr_pct: float = 0.0
-    spread_pct: float = 0.0
+    current_price: Any = 0.0      # V13: Any so we can coerce str→float
+    atr_pct: Any = 0.0
+    spread_pct: Any = 0.0
     indicators: dict = {}
-    # V5 additions
-    strategy_type: str = "trend_pullback"
+    strategy_type: str = "scalp_trend_pullback"
     regime: str = ""
+
+    # V13: Coerce numeric fields sent as strings from n8n
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, v):
+        try:
+            return int(float(str(v))) if v is not None else 70
+        except (ValueError, TypeError):
+            return 70
+
+    @field_validator("current_price", mode="before")
+    @classmethod
+    def coerce_current_price(cls, v):
+        try:
+            return float(str(v)) if v is not None else 0.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    @field_validator("atr_pct", mode="before")
+    @classmethod
+    def coerce_atr_pct(cls, v):
+        try:
+            return float(str(v)) if v is not None else 0.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    @field_validator("spread_pct", mode="before")
+    @classmethod
+    def coerce_spread_pct(cls, v):
+        try:
+            return float(str(v)) if v is not None else 0.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    @field_validator("strategy_type", mode="before")
+    @classmethod
+    def normalize_strategy_type(cls, v):
+        """V13: Accept missing/None/empty strategy_type safely."""
+        if not v or not isinstance(v, str):
+            return "scalp_trend_pullback"
+        v = v.strip().lower().replace(" ", "_")
+        # Accept if starts with any known prefix
+        if any(v.startswith(p) for p in _VALID_STRATEGY_PREFIXES):
+            return v
+        # Unknown prefix — treat as generic scalp (don't crash)
+        logger.warning(f"[V13] Unknown strategy_type='{v}' — defaulting to scalp_trend_pullback")
+        return "scalp_trend_pullback"
+
+    @field_validator("indicators", mode="before")
+    @classmethod
+    def coerce_indicators(cls, v):
+        """Accept null/missing indicators as empty dict."""
+        if v is None or v == "{}" or v == "":
+            return {}
+        if isinstance(v, str):
+            import json
+            try:
+                return json.loads(v)
+            except Exception:
+                return {}
+        return v if isinstance(v, dict) else {}
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def normalize_action(cls, v):
+        if not v:
+            return "BUY"
+        return str(v).upper().strip()
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def normalize_symbol(cls, v):
+        if not v:
+            raise ValueError("symbol is required")
+        return str(v).upper().strip()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -264,6 +345,26 @@ async def execute_trade_full(req: FullExecuteRequest):
 
 @router.post("/execute-multi")
 async def execute_multi_account(req: MultiExecuteRequest):
+    """
+    V13 Multi-account execution flow.
+    Fully guarded: all uncaught exceptions return structured JSON, never 500.
+    """
+    try:
+        return await _execute_multi_inner(req)
+    except Exception as exc:
+        logger.error(
+            f"[V13 EXECUTE-MULTI] Unhandled exception for {getattr(req, 'symbol', '?')} "
+            f"{getattr(req, 'action', '?')} conf={getattr(req, 'confidence', '?')}: {exc}",
+            exc_info=True,
+        )
+        return {
+            "status": "error",
+            "message": f"Internal error: {type(exc).__name__}: {str(exc)[:200]}",
+            "symbol": getattr(req, "symbol", "?"),
+        }
+
+
+async def _execute_multi_inner(req: MultiExecuteRequest):
     """
     V4 Multi-account execution flow:
     1. Validate signal + save to DB
@@ -583,10 +684,19 @@ async def execute_multi_account(req: MultiExecuteRequest):
             return {"status": "error", "message": f"Cannot get price for {symbol}"}
 
     # Pre-entry quality check (ONCE for the signal)
-    tp_pct_decimal, _ = risk_engine.get_tp_sl_pct(
-        req.confidence, req.atr_pct, strategy_type=req.strategy_type,
-    )
-    tp_pct_for_check = tp_pct_decimal * 100
+    # V13: ROI-based TP calc via get_tp_sl_roi() + roi_to_price_pct()
+    try:
+        tp_roi_pct, _sl_roi_pct = risk_engine.get_tp_sl_roi(
+            req.confidence, strategy_type=req.strategy_type
+        )
+        leverage_for_check = risk_engine.get_leverage(
+            req.confidence, req.strategy_type, req.atr_pct
+        )
+        # Convert ROI% → price% for the pre_entry_check spread/slippage calculation
+        tp_pct_for_check = risk_engine.roi_to_price_pct(tp_roi_pct, leverage_for_check) * 100
+    except Exception as re_err:
+        logger.warning(f"  [V13] Risk engine pre-calc failed: {re_err} — using 1.0% TP default")
+        tp_pct_for_check = 1.0
 
     pre_check = await scanner_executor.pre_entry_check(
         symbol=symbol, side=side,
@@ -741,13 +851,9 @@ async def execute_multi_account(req: MultiExecuteRequest):
                     strategy_type=req.strategy_type,
                 )
 
-                # ── 5.5 V7: Enforce max leverage cap ─────────────────
-                if trade_params.leverage > settings.V7_MAX_LEVERAGE:
-                    logger.info(
-                        f"  [{internal_label}] V7: Capping leverage "
-                        f"{trade_params.leverage}x → {settings.V7_MAX_LEVERAGE}x"
-                    )
-                    trade_params.leverage = settings.V7_MAX_LEVERAGE
+                # ── 5.5 V13: V7_MAX_LEVERAGE cap removed — V13 tiers handle leverage ──
+                # Previously capped at V7_MAX_LEVERAGE=7, now up to 15x by confidence tier
+                # (ATR volatility dampener in risk_engine handles any excess)
 
                 if not trade_params.approved:
                     # Categorize reject reason
