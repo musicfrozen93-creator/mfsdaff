@@ -210,9 +210,13 @@ async def execute_trade(req: SimpleExecuteRequest):
         state_manager.record_trade_opened(symbol)
 
         await telegram.trade_opened(
-            symbol=symbol, side=action, entry_price=result["price"],
+            symbol=symbol, side=action,
+            entry_price=result.get("price", 0),
+            fill_price=result.get("price", 0),
             leverage=1, position_size=req.usdt_amount,
             take_profit=0, stop_loss=0, confidence=0,
+            strategy_type="scalp_trend_pullback",
+            order_method="MARKET",
         )
 
         return {
@@ -303,12 +307,24 @@ async def execute_trade_full(req: FullExecuteRequest):
         state_manager.record_trade_opened(req.symbol)
 
         await telegram.trade_opened(
-            symbol=req.symbol, side=side, entry_price=entry_price,
-            leverage=trade_params.leverage, position_size=trade_params.position_size_usdt,
-            take_profit=trade_params.take_profit, stop_loss=trade_params.stop_loss,
+            symbol=req.symbol, side=side,
+            entry_price=entry_price,
+            fill_price=result.fill_price or entry_price,
+            leverage=trade_params.leverage,
+            position_size=trade_params.position_size_usdt,
+            take_profit=trade_params.take_profit,
+            stop_loss=trade_params.stop_loss,
             confidence=req.confidence,
-            tp_pct=trade_params.tp_pct, sl_pct=trade_params.sl_pct,
+            tp_pct=trade_params.tp_pct,
+            sl_pct=trade_params.sl_pct,
+            tp_roi_pct=getattr(trade_params, 'tp_roi_pct', 0.0),
+            sl_roi_pct=getattr(trade_params, 'sl_roi_pct', 0.0),
+            risk_reward=trade_params.risk_reward,
             setup_grade=trade_params.setup_grade,
+            strategy_type=getattr(req, 'strategy_type', ''),
+            regime=getattr(req, 'regime', ''),
+            reason=getattr(req, 'reason', ''),
+            order_method=getattr(result, 'order_method', 'MARKET'),
         )
 
         return {

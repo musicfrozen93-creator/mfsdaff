@@ -54,6 +54,181 @@ class TelegramNotifier:
     # V4: ONE CLEAN FINAL MESSAGE — Trade Executed
     # ═══════════════════════════════════════════════════════════════════
 
+    # ═══════════════════════════════════════════════════════════════════
+    # V13 UNIFIED TRADE OPENED BUILDER — used by ALL execution paths
+    # ═══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _build_trade_opened_message(
+        symbol: str,
+        side: str,
+        confidence: int,
+        entry_price: float,
+        fill_price: float,
+        leverage: int,
+        take_profit: float,
+        stop_loss: float,
+        tp_roi_pct: float = 0.0,
+        sl_roi_pct: float = 0.0,
+        tp_pct: float = 0.0,
+        sl_pct: float = 0.0,
+        risk_reward: float = 0.0,
+        setup_grade: str = "",
+        strategy_type: str = "",
+        regime: str = "",
+        reason: str = "",
+        order_method: str = "MARKET",
+        executed_count: int = 1,
+        skipped_count: int = 0,
+        skip_reasons: dict = None,
+        protection_mode: str = "external_engine",
+        sl_attached: bool = True,
+        tp_attached: bool = True,
+        sl_order_id: str = "",
+        tp_order_id: str = "",
+        partial_tp_enabled: bool = False,
+        tp1_price: float = 0.0,
+        tp2_price: float = 0.0,
+    ) -> str:
+        """
+        V13 Unified trade opened message builder.
+        ALL execution paths (execute, execute-full, execute-multi) use this.
+        No margin / balance tier fields shown.
+        """
+        direction = "\U0001f7e2 LONG" if side == "BUY" else "\U0001f534 SHORT"
+
+        # Mode-specific title
+        if strategy_type.startswith("swing"):
+            title = "\U0001f30a <b>SWING TRADE OPENED \u2014 V13</b>"
+        elif strategy_type.startswith("sniper"):
+            title = "\U0001f3af <b>SNIPER TRADE OPENED \u2014 V13</b>"
+        else:
+            title = "\U0001f680 <b>SCALP TRADE OPENED \u2014 V13</b>"
+
+        # Grade line
+        grade_emoji = {"A": "\u2b50", "B": "\U0001f537", "C": "\U0001f538"}.get(setup_grade, "")
+        grade_line = f"\nGrade: <b>{grade_emoji} {setup_grade}</b>" if setup_grade else ""
+
+        # Strategy type line
+        if strategy_type.startswith("swing"):
+            strat_display = "\U0001f30a Swing"
+        elif strategy_type.startswith("sniper"):
+            strat_display = "\U0001f3af Sniper"
+        else:
+            strat_display = "\u26a1 Scalping"
+        strategy_line = f"\nType: <b>{strat_display}</b>"
+
+        # Regime line
+        regime_display = ""
+        if regime:
+            regime_map = {
+                "TRENDING_BULL": "\U0001f7e2 Trending Bull",
+                "TRENDING_BEAR": "\U0001f534 Trending Bear",
+                "SIDEWAYS_RANGE": "\u2194\ufe0f Sideways",
+                "BREAKOUT_EXPANSION": "\U0001f4a5 Breakout",
+                "HIGH_VOLATILITY": "\u26a0\ufe0f High Volatility",
+                "DEAD_MARKET": "\U0001f4a4 Dead Market",
+            }
+            regime_display = regime_map.get(regime, regime)
+        regime_line = f"\nRegime: <b>{regime_display}</b>" if regime_display else ""
+
+        # Accounts block (only for multi-account)
+        if executed_count > 1 or skipped_count > 0:
+            accounts_block = (
+                f"Executed Accounts: <b>{executed_count}</b>\n"
+                f"Skipped Accounts: <b>{skipped_count}</b>\n\n"
+            )
+        else:
+            accounts_block = ""
+
+        # Entry price — prefer fill price, never show zero
+        display_price = fill_price if fill_price > 0 else entry_price
+        entry_str = f"${display_price:,.6f}" if display_price > 0 else "pending..."
+        leverage_str = f"{leverage}x" if leverage > 0 else "auto"
+
+        # TP/SL ROI line
+        if tp_roi_pct > 0 and sl_roi_pct > 0:
+            roi_line = f"\nTP ROI: <b>+{tp_roi_pct:.0f}%</b> | SL ROI: <b>-{sl_roi_pct:.0f}%</b>"
+        else:
+            roi_line = ""
+
+        # TP/SL price block
+        if partial_tp_enabled and tp1_price > 0:
+            tp_block = (
+                f"TP Mode: <b>\U0001f4ca Partial (40/30/30)</b>\n"
+                f"TP1: <b>${tp1_price:,.6f}</b> (close 40%)\n"
+                f"TP2: <b>${tp2_price:,.6f}</b> (close 30%)\n"
+                f"Trail: <b>30%</b> with BE stop\n"
+                f"SL Price: <b>${stop_loss:,.6f}</b>"
+            )
+        elif take_profit > 0 and stop_loss > 0:
+            tp_pct_display = f" (+{tp_pct:.2f}%)" if tp_pct > 0 else ""
+            sl_pct_display = f" (-{sl_pct:.2f}%)" if sl_pct > 0 else ""
+            tp_block = (
+                f"TP Price: <b>${take_profit:,.6f}</b>{tp_pct_display}\n"
+                f"SL Price: <b>${stop_loss:,.6f}</b>{sl_pct_display}"
+            )
+        else:
+            tp_block = "TP/SL: <i>set by Protection Engine</i>"
+
+        # R:R line
+        rr_line = f"\n\nR:R = <b>1:{risk_reward:.1f}</b>" if risk_reward > 0 else ""
+
+        # Protection line
+        if protection_mode == "external_engine":
+            protection_line = "\U0001f6e1\ufe0f <b>External Engine Active</b>"
+        elif sl_attached and tp_attached:
+            protection_line = "\u2705 TP/SL attached successfully"
+        elif sl_attached:
+            protection_line = "\u26a0\ufe0f SL attached, TP FAILED \u2014 check manually"
+        elif tp_attached:
+            protection_line = "\u26a0\ufe0f TP attached, SL FAILED \u2014 check manually"
+        else:
+            protection_line = "\U0001f6a8 BOTH TP/SL FAILED \u2014 manual action required!"
+
+        # Order ID proof
+        proof_line = ""
+        if protection_mode != "external_engine" and (sl_order_id or tp_order_id):
+            parts = []
+            if sl_order_id:
+                parts.append(f"SL=#{sl_order_id}")
+            if tp_order_id:
+                parts.append(f"TP=#{tp_order_id}")
+            proof_line = f"\nOrders: <code>{' | '.join(parts)}</code>"
+
+        # Reason block
+        reason_block = ""
+        if reason:
+            reason_block = f"\n\n<b>Reason:</b>\n<i>{reason[:300]}</i>"
+
+        # Skip reasons block (multi-account only)
+        skip_block = ""
+        if skip_reasons:
+            skip_lines_list = [f"  \u2022 {cnt} {cat.lower()}" for cat, cnt in skip_reasons.items()]
+            skip_block = "\n<b>Skipped:</b>\n" + "\n".join(skip_lines_list)
+
+        msg = (
+            f"{title}\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Confidence: <b>{confidence}%</b>"
+            f"{grade_line}"
+            f"{strategy_line}"
+            f"{regime_line}\n\n"
+            f"{accounts_block}"
+            f"Entry: <b>{entry_str}</b>\n"
+            f"Leverage: <b>{leverage_str}</b>\n"
+            f"Method: <b>{order_method}</b>"
+            f"{roi_line}\n\n"
+            f"{tp_block}"
+            f"{rr_line}\n\n"
+            f"<b>Protection:</b>\n{protection_line}"
+            f"{proof_line}"
+            f"{reason_block}"
+            f"{skip_block}"
+        )
+        return msg
+
     async def send_execution_result(
         self,
         symbol: str,
@@ -69,12 +244,11 @@ class TelegramNotifier:
         stop_loss: float,
         tp_pct: float = 0.0,
         sl_pct: float = 0.0,
-        # V13 additions
         tp_roi_pct: float = 0.0,
         sl_roi_pct: float = 0.0,
-        margin_pct: float = 0.0,
-        margin_usdt: float = 0.0,      # V13 Part H: show actual $ margin used
-        account_balance: float = 0.0,  # V13 Part H: balance tier label
+        margin_pct: float = 0.0,        # kept for API compat, NOT shown
+        margin_usdt: float = 0.0,       # kept for API compat, NOT shown
+        account_balance: float = 0.0,   # kept for API compat, NOT shown
         reason: str = "",
         setup_grade: str = "",
         order_method: str = "MARKET",
@@ -90,441 +264,24 @@ class TelegramNotifier:
         tp2_price: float = 0.0,
         protection_mode: str = "",
     ):
-        """
-        V10: Single clean Telegram message for executed trades.
-        NO account names/labels/IDs/balances.
-        Shows totals only.
-        In 2-Engine mode (protection_mode='external_engine'): shows
-        Protection Engine banner instead of TP/SL order status.
-        """
-        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
-
-        # Grade emoji
-        grade_emoji = {"A": "🅰️", "B": "🅱️", "C": "©️"}.get(setup_grade, "")
-        grade_line = f"\nGrade: <b>{grade_emoji} {setup_grade}</b>" if setup_grade else ""
-
-        # V10: Protection status line
-        if protection_mode == "external_engine":
-            tp_sl_status = "🛡️ <b>Protection: External Engine Active</b>"
-        elif sl_attached and tp_attached:
-            tp_sl_status = "✅ TP/SL attached successfully"
-        elif sl_attached and not tp_attached:
-            tp_sl_status = "⚠️ SL attached, TP FAILED — check manually"
-        elif not sl_attached and tp_attached:
-            tp_sl_status = "⚠️ TP attached, SL FAILED — check manually"
-        else:
-            tp_sl_status = "🚨 BOTH TP/SL FAILED — manual action required!"
-
-        # Skip reasons (aggregated, no names)
-        skip_block = ""
-        if skip_reasons:
-            skip_lines = []
-            for reason_cat, count in skip_reasons.items():
-                skip_lines.append(f"  • {count} {reason_cat.lower()}")
-            skip_block = "\n<b>Skipped Reasons:</b>\n" + "\n".join(skip_lines)
-
-        # Reason (truncated)
-        reason_block = ""
-        if reason:
-            truncated = reason[:200]
-            reason_block = f"\n\n<b>Reason:</b>\n<i>{truncated}</i>"
-
-        # Use fill_price if available, otherwise entry_price
-        display_price = fill_price if fill_price > 0 else entry_price
-
-        # TP/SL percentage display
-        tp_pct_str = f" (+{tp_pct:.1f}%)" if tp_pct > 0 else ""
-        sl_pct_str = f" (-{sl_pct:.1f}%)" if sl_pct > 0 else ""
-
-        # V5: Strategy type display
-        strategy_display = ""
-        if strategy_type:
-            if strategy_type.startswith("swing"):
-                strategy_display = "🌊 Swing"
-            elif strategy_type.startswith("sniper"):
-                strategy_display = "🎯 Sniper"
-            else:
-                strategy_display = "⚡ Scalping"
-
-        # V5: Regime display
-        regime_display = ""
-        if regime:
-            regime_map = {
-                "TRENDING_BULL": "🟢 Trending Bull",
-                "TRENDING_BEAR": "🔴 Trending Bear",
-                "SIDEWAYS_RANGE": "↔️ Sideways",
-                "BREAKOUT_EXPANSION": "💥 Breakout",
-                "HIGH_VOLATILITY": "⚠️ High Volatility",
-                "DEAD_MARKET": "💤 Dead Market",
-            }
-            regime_display = regime_map.get(regime, regime)
-
-        strategy_line = f"\nType: <b>{strategy_display}</b>" if strategy_display else ""
-        regime_line = f"\nRegime: <b>{regime_display}</b>" if regime_display else ""
-
-        # V5.5: TP/SL proof line with order IDs
-        # V10: In external_engine mode, no order IDs (no native orders placed)
-        proof_line = ""
-        if protection_mode != "external_engine" and (sl_order_id or tp_order_id):
-            proof_parts = []
-            if sl_order_id:
-                proof_parts.append(f"SL=#{sl_order_id}")
-            if tp_order_id:
-                proof_parts.append(f"TP=#{tp_order_id}")
-            proof_line = f"\nOrders: <code>{' | '.join(proof_parts)}</code>"
-
-        # V5.5: Risk/Reward display
-        rr_line = ""
-        if risk_reward > 0:
-            rr_line = f"\nR:R = <b>1:{risk_reward:.1f}</b>"
-
-        # V13 Part H: Balance tier label
-        if account_balance >= 500:
-            bal_tier = "Large ($500+)"
-        elif account_balance >= 100:
-            bal_tier = "Mid ($100-$500)"
-        elif account_balance >= 30:
-            bal_tier = "Small ($30-$100)"
-        elif account_balance > 0:
-            bal_tier = "Micro (<$30)"
-        else:
-            bal_tier = ""
-        bal_tier_line = f"\nBalance Tier: <b>{bal_tier}</b>" if bal_tier else ""
-
-        # V13 Part H: Margin $ display
-        margin_usdt_line = ""
-        if margin_usdt > 0 and margin_pct > 0:
-            margin_usdt_line = f"\nMargin: <b>${margin_usdt:.2f} ({margin_pct:.1f}%)</b>"
-        elif margin_pct > 0:
-            margin_usdt_line = f"\nMargin: <b>{margin_pct:.1f}%</b>"
-
-        # V13 Part H: Full TP/SL display with ROI + Price
-        if tp_roi_pct > 0 and sl_roi_pct > 0:
-            roi_line = f"\nTP ROI: <b>+{tp_roi_pct:.0f}%</b> | SL ROI: <b>-{sl_roi_pct:.0f}%</b>"
-        else:
-            roi_line = ""
-
-        if partial_tp_enabled and tp1_price > 0:
-            tp_block = (
-                f"TP Mode: <b>📊 Partial (40/30/30)</b>\n"
-                f"TP1: <b>${tp1_price:,.6f}</b> (close 40%)\n"
-                f"TP2: <b>${tp2_price:,.6f}</b> (close 30%)\n"
-                f"Trail: <b>30%</b> with BE stop\n"
-                f"SL: <b>${stop_loss:,.6f}</b>{sl_pct_str}"
-            )
-        else:
-            tp_pct_display = f" (+{tp_pct:.2f}% price)" if tp_pct > 0 else ""
-            sl_pct_display = f" (-{sl_pct:.2f}% price)" if sl_pct > 0 else ""
-            tp_block = (
-                f"TP Price: <b>${take_profit:,.6f}</b>{tp_pct_display}\n"
-                f"SL Price: <b>${stop_loss:,.6f}</b>{sl_pct_display}"
-            )
-
-        msg = (
-            f"🚀 <b>TRADE OPENED — V13</b>\n\n"
-            f"Coin: <b>{symbol}</b>\n"
-            f"Side: <b>{direction}</b>\n"
-            f"Confidence: <b>{confidence}%</b>"
-            f"{grade_line}"
-            f"{strategy_line}"
-            f"{regime_line}\n\n"
-            f"Executed Accounts: <b>{executed_count}</b>\n"
-            f"Skipped Accounts: <b>{skipped_count}</b>\n\n"
-            f"Entry: <b>${display_price:,.6f}</b>\n"
-            f"Leverage: <b>{leverage}x</b>\n"
-            f"Method: <b>{order_method}</b>"
-            f"{bal_tier_line}"
-            f"{margin_usdt_line}\n\n"
-            f"{roi_line}\n"
-            f"{tp_block}"
-            f"{rr_line}\n\n"
-            f"<b>Protection:</b>\n{tp_sl_status}"
-            f"{proof_line}"
-            f"{reason_block}"
-            f"{skip_block}"
+        """V13: Multi-account execution message. Uses unified builder."""
+        msg = self._build_trade_opened_message(
+            symbol=symbol, side=side, confidence=confidence,
+            entry_price=entry_price, fill_price=fill_price,
+            leverage=leverage, take_profit=take_profit, stop_loss=stop_loss,
+            tp_roi_pct=tp_roi_pct, sl_roi_pct=sl_roi_pct,
+            tp_pct=tp_pct, sl_pct=sl_pct, risk_reward=risk_reward,
+            setup_grade=setup_grade, strategy_type=strategy_type,
+            regime=regime, reason=reason, order_method=order_method,
+            executed_count=executed_count, skipped_count=skipped_count,
+            skip_reasons=skip_reasons or {},
+            protection_mode=protection_mode,
+            sl_attached=sl_attached, tp_attached=tp_attached,
+            sl_order_id=sl_order_id, tp_order_id=tp_order_id,
+            partial_tp_enabled=partial_tp_enabled,
+            tp1_price=tp1_price, tp2_price=tp2_price,
         )
         await self.send(msg)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # V10: Protection Engine — Trade Closed notification
-    # ═══════════════════════════════════════════════════════════════════
-
-    async def send_position_closed_by_engine(
-        self,
-        symbol: str,
-        side: str,
-        close_reason: str,           # "tp_hit" | "sl_hit" | "trailing_exit" | "manual"
-        pnl_pct: float,
-        accounts_closed: int = 1,
-        entry_price: float = 0.0,
-        close_price: float = 0.0,
-        duration_minutes: int = 0,
-        strategy_type: str = "",
-    ):
-        """
-        V10: Protection Engine bulk close notification.
-
-        Sent when position_manager.py closes a trade on behalf of all accounts.
-        Format: Shield POSITION CLOSED / Coin / Side / Accounts / Reason / PnL
-        """
-        direction = "\U0001f7e2 LONG" if side == "BUY" else "\U0001f534 SHORT"
-        pnl_sign = "+" if pnl_pct >= 0 else ""
-        pnl_emoji = "\U0001f4c8" if pnl_pct >= 0 else "\U0001f4c9"
-
-        reason_map = {
-            "tp_hit": "TAKE PROFIT",
-            "sl_hit": "STOP LOSS",
-            "trailing_exit": "TRAILING EXIT",
-            "momentum_exit": "MOMENTUM EXIT 🛑",   # V13 anti-reverse
-            "manual": "MANUAL CLOSE",
-        }
-        reason_display = reason_map.get(close_reason, close_reason.upper())
-
-        entry_line = f"\nEntry: <b>${entry_price:,.6f}</b>" if entry_price > 0 else ""
-        close_line = f"\nClose: <b>${close_price:,.6f}</b>" if close_price > 0 else ""
-        dur_line = f"\nDuration: <b>{duration_minutes}m</b>" if duration_minutes > 0 else ""
-
-        strategy_display = ""
-        if strategy_type:
-            if strategy_type.startswith("swing"):
-                strategy_display = "\U0001f30a Swing"
-            elif strategy_type.startswith("sniper"):
-                strategy_display = "\U0001f3af Sniper"
-            else:
-                strategy_display = "\u26a1 Scalp"
-        type_line = f"\nType: <b>{strategy_display}</b>" if strategy_display else ""
-
-        msg = (
-            f"\U0001f6e1\ufe0f <b>POSITION CLOSED</b>\n\n"
-            f"Coin: <b>{symbol}</b>\n"
-            f"Side: <b>{direction}</b>"
-            f"{type_line}\n"
-            f"Accounts Closed: <b>{accounts_closed}</b>\n\n"
-            f"Reason: <b>{reason_display}</b>"
-            f"{entry_line}"
-            f"{close_line}"
-            f"{dur_line}\n\n"
-            f"PnL: <b>{pnl_emoji} {pnl_sign}{pnl_pct:.2f}%</b>\n\n"
-            f"<i>Managed by Protection Engine</i>"
-        )
-        await self.send(msg)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # V4: ONE CLEAN FINAL MESSAGE — No Execution
-    # ═══════════════════════════════════════════════════════════════════
-
-
-    async def send_no_execution(
-        self,
-        symbol: str,
-        side: str,
-        confidence: int,
-        skipped_count: int,
-        skip_reasons: dict,
-    ):
-        """
-        V4: Single message when all accounts were skipped.
-        Only sent if there were accounts to try (not on empty account list).
-        NO account names/labels/IDs.
-        """
-        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
-
-        skip_lines = []
-        if skip_reasons:
-            for reason_cat, count in skip_reasons.items():
-                skip_lines.append(f"  • {count} {reason_cat.lower()}")
-
-        skip_block = "\n".join(skip_lines) if skip_lines else "  • Unknown"
-
-        msg = (
-            f"⚠️ <b>NO EXECUTION</b>\n\n"
-            f"Coin: <b>{symbol}</b>\n"
-            f"Signal: <b>{direction}</b>\n"
-            f"Confidence: <b>{confidence}%</b>\n\n"
-            f"Executed Accounts: <b>0</b>\n"
-            f"Skipped Accounts: <b>{skipped_count}</b>\n\n"
-            f"<b>Reasons:</b>\n{skip_block}"
-        )
-        await self.send(msg)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # CRITICAL ALERTS (V7: Atomic TP/SL Protection)
-    # ═══════════════════════════════════════════════════════════════════
-
-    async def tp_sl_failed(
-        self,
-        symbol: str,
-        side: str,
-        sl_attached: bool,
-        tp_attached: bool,
-        error: str,
-    ):
-        """V7: Alert when TP/SL fails AND emergency close also failed — CRITICAL."""
-        failed_items = []
-        if not sl_attached:
-            failed_items.append("❌ STOP LOSS")
-        if not tp_attached:
-            failed_items.append("❌ TAKE PROFIT")
-
-        msg = (
-            f"🔥 <b>CRITICAL: UNPROTECTED POSITION</b>\n\n"
-            f"Symbol: <b>{symbol}</b>\n"
-            f"Side: <b>{side}</b>\n"
-            f"Failed: {', '.join(failed_items)}\n"
-            f"Error: <code>{error[:200]}</code>\n\n"
-            f"🚨 <b>EMERGENCY CLOSE ALSO FAILED!</b>\n"
-            f"⚠️ <b>MANUAL ACTION REQUIRED IMMEDIATELY!</b>"
-        )
-        await self.send(msg)
-
-    async def send_emergency_close(
-        self,
-        symbol: str,
-        side: str,
-        fill_price: float,
-        sl_attached: bool,
-        tp_attached: bool,
-        error: str,
-    ):
-        """V9: Alert when position was emergency-closed due to TP/SL failure."""
-        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
-        failed_items = []
-        if not sl_attached:
-            failed_items.append("❌ STOP LOSS")
-        if not tp_attached:
-            failed_items.append("❌ TAKE PROFIT")
-
-        msg = (
-            f"🚨 <b>PROTECTION FAILED — Position closed safely</b>\n\n"
-            f"Coin: <b>{symbol}</b>\n"
-            f"Side: <b>{direction}</b>\n"
-            f"Entry: <b>${fill_price:,.6f}</b>\n\n"
-            f"<b>Reason:</b> TP/SL attachment failed after all retries\n"
-            f"Failed: {', '.join(failed_items)}\n"
-            f"Error: <code>{error[:150]}</code>\n\n"
-            f"✅ <b>Position was closed at market to prevent unprotected exposure.</b>\n"
-            f"<i>V9 Bracket Protection: No naked positions allowed.</i>"
-        )
-        await self.send(msg)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # V7: Categorized Skip & Watchlist Notifications
-    # ═══════════════════════════════════════════════════════════════════
-
-    async def send_skipped(
-        self,
-        symbol: str,
-        side: str,
-        confidence: int,
-        category: str,
-        reason: str,
-        strategy_type: str = "",
-    ):
-        """
-        V7: Send a categorized skip notification.
-        Categories: Low Confidence, Cooldown, Daily Guard, TP/SL Failed,
-                    Subscription, Insufficient Balance, etc.
-        """
-        category_emojis = {
-            "Low Confidence": "📉",
-            "Cooldown": "🧊",
-            "Coin Cooldown": "🧊",
-            "Daily Guard": "🛡️",
-            "Daily Target Reached": "🎯",
-            "Daily Loss Limit": "🔴",
-            "Loss Cooldown": "⏸️",
-            "TP/SL Protection Failed": "🔥",
-            "Subscription": "🔒",
-            "Insufficient Balance": "💰",
-            "Existing Position": "📌",
-            "Risk Limit": "⚖️",
-            "Exchange Rejected": "❌",
-        }
-        emoji = category_emojis.get(category, "⏭️")
-        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
-        strategy_line = f"\nStrategy: <b>{strategy_type}</b>" if strategy_type else ""
-
-        msg = (
-            f"{emoji} <b>SKIPPED — {category}</b>\n\n"
-            f"Coin: <b>{symbol}</b>\n"
-            f"Side: <b>{direction}</b>\n"
-            f"Confidence: <b>{confidence}%</b>"
-            f"{strategy_line}\n\n"
-            f"Reason: <i>{reason[:200]}</i>"
-        )
-        await self.send(msg)
-
-    async def send_watchlisted(
-        self,
-        symbol: str,
-        side: str,
-        setup_type: str,
-        confidence: int,
-        trigger_price: float,
-        current_price: float,
-        reason: str = "",
-    ):
-        """V7: Notify when a new swing setup is added to the watchlist."""
-        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
-        msg = (
-            f"🔭 <b>WATCHLISTED — Swing Setup</b>\n\n"
-            f"Coin: <b>{symbol}</b>\n"
-            f"Side: <b>{direction}</b>\n"
-            f"Type: <b>{setup_type}</b>\n"
-            f"Confidence: <b>{confidence}%</b>\n"
-            f"Current: <b>${current_price:,.6f}</b>\n"
-            f"Trigger: <b>${trigger_price:,.6f}</b>\n\n"
-            f"<i>{reason[:150]}</i>\n"
-            f"<i>Will execute when trigger price is hit + confidence ≥ "
-            f"{confidence}%</i>"
-        )
-        await self.send(msg)
-
-    # ─── Error Alert ──────────────────────────────────────────────────
-
-    async def error_alert(self, context: str, error: str):
-        msg = (
-            f"⚠️ <b>ERROR</b>\n"
-            f"Context: {context}\n"
-            f"Error: <code>{error[:300]}</code>"
-        )
-        await self.send(msg)
-
-    # ─── Trading Paused ──────────────────────────────────────────────
-
-    async def trading_paused(self, reason: str):
-        msg = (
-            f"⛔ <b>TRADING PAUSED</b>\n\n"
-            f"Reason: <i>{reason}</i>"
-        )
-        await self.send(msg)
-
-    # ─── Daily Report (Aggregated — no account names) ─────────────────
-
-    async def daily_report(
-        self,
-        total_trades: int,
-        win_rate: float,
-        pnl: float,
-        active_accounts: int,
-        skipped_trades: int,
-        ai_calls: int,
-    ):
-        pnl_emoji = "📈" if pnl >= 0 else "📉"
-        msg = (
-            f"📊 <b>DAILY REPORT</b>\n\n"
-            f"Total Trades: <b>{total_trades}</b>\n"
-            f"Win Rate: <b>{win_rate:.1f}%</b>\n"
-            f"P&L: <b>{pnl_emoji} ${pnl:,.2f}</b>\n"
-            f"Active Accounts: <b>{active_accounts}</b>\n"
-            f"Skipped Trades: <b>{skipped_trades}</b>\n"
-            f"AI Calls: <b>{ai_calls}</b>"
-        )
-        await self.send(msg)
-
-    # ═══════════════════════════════════════════════════════════════════
-    # BACKWARD COMPAT — Single-account endpoints (no account label)
-    # ═══════════════════════════════════════════════════════════════════
 
     async def trade_opened(
         self,
@@ -532,55 +289,42 @@ class TelegramNotifier:
         side: str,
         entry_price: float,
         leverage: int,
-        position_size: float,
-        take_profit: float,
-        stop_loss: float,
-        confidence: int,
-        # V3 additions
+        position_size: float = 0.0,
+        take_profit: float = 0.0,
+        stop_loss: float = 0.0,
+        confidence: int = 0,
         tp_pct: float = 0.0,
         sl_pct: float = 0.0,
         setup_grade: str = "",
         daily_pnl_pct: float = 0.0,
-        # V4: account_label accepted but NEVER displayed
-        account_label: str = "",
+        account_label: str = "",       # API compat, never shown
+        tp_roi_pct: float = 0.0,
+        sl_roi_pct: float = 0.0,
+        risk_reward: float = 0.0,
+        strategy_type: str = "",
+        regime: str = "",
+        reason: str = "",
+        order_method: str = "MARKET",
+        fill_price: float = 0.0,
     ):
         """
-        Single-account trade notification.
-        Used by /execute-full endpoint only.
-        V4: account_label parameter kept for API compat but NEVER shown.
+        V13: Single-account trade notification.
+        Old simple template REMOVED — always uses unified full-detail builder.
+        Called by /execute and /execute-full routes.
         """
-        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
-
-        # V3: Grade emoji
-        grade_emoji = {"A": "🅰️", "B": "🅱️", "C": "©️"}.get(setup_grade, "")
-        grade_line = f"\nGrade: <b>{grade_emoji} {setup_grade}</b>" if setup_grade else ""
-
-        # V3: TP/SL percentage display
-        tp_sl_pct_line = ""
-        if tp_pct > 0 or sl_pct > 0:
-            tp_sl_pct_line = f"\nTP: <b>{tp_pct:.1f}%</b> | SL: <b>{sl_pct:.1f}%</b>"
-
-        # V3: Daily progress
-        daily_line = ""
-        if daily_pnl_pct != 0:
-            daily_emoji = "📈" if daily_pnl_pct >= 0 else "📉"
-            daily_line = f"\nDaily: <b>{daily_emoji} {daily_pnl_pct:+.1f}%</b>"
-
-        msg = (
-            f"✅ <b>TRADE OPENED</b>\n"
-            f"Coin: <b>{symbol}</b>\n"
-            f"Side: <b>{direction}</b>\n"
-            f"Entry: <b>${entry_price:,.6f}</b>\n"
-            f"Leverage: <b>{leverage}x</b>\n"
-            f"Size: <b>${position_size:,.2f}</b>\n"
-            f"TP: <b>${take_profit:,.6f}</b>\n"
-            f"SL: <b>${stop_loss:,.6f}</b>"
-            f"{tp_sl_pct_line}\n"
-            f"Confidence: <b>{confidence}%</b>"
-            f"{grade_line}"
-            f"{daily_line}"
+        msg = self._build_trade_opened_message(
+            symbol=symbol, side=side, confidence=confidence,
+            entry_price=entry_price, fill_price=fill_price,
+            leverage=leverage, take_profit=take_profit, stop_loss=stop_loss,
+            tp_roi_pct=tp_roi_pct, sl_roi_pct=sl_roi_pct,
+            tp_pct=tp_pct, sl_pct=sl_pct, risk_reward=risk_reward,
+            setup_grade=setup_grade, strategy_type=strategy_type,
+            regime=regime, reason=reason, order_method=order_method,
+            executed_count=1, skipped_count=0, skip_reasons={},
+            protection_mode="external_engine",
         )
         await self.send(msg)
+
 
     async def trade_skipped(self, symbol: str, reason: str, account_label: str = ""):
         """Single-account skip notification. V4: No account label shown."""
