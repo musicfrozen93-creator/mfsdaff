@@ -1,31 +1,51 @@
 """
-V5.5 Dynamic Risk Engine — Optimized TP/SL + ATR-Adaptive Stops
+V13 Dynamic Risk Engine — Smarter Leverage + Margin + ROI-Based TP/SL
 
-NO fixed trade sizes. Everything is calculated from live account balance.
+Changes from V5.5:
+  - Confidence-tiered leverage per mode (7/10/12/15x)
+  - Balance-tier margin with confidence boosts (Strong+2%, Elite+3%)
+  - Dynamic scalp TP by confidence (15/18/20/22% ROI)
+  - ROI% converted to price% via leverage (makes TP meaningful at any leverage)
+  - ATR volatility dampener: cap leverage at 10x when ATR%>3%
+  - Fee/slippage profitability filter
+  - Better <$30 account sizing (15% margin, max $4)
 
-Balance Risk Tiers (PRESERVED from V2):
-  $20-$100   → 8% risk
-  $101-$300  → 6% risk
-  $301-$1000 → 4% risk
-  $1000+     → 2% risk
+Margin Tiers:
+  <$10:       hard skip (MIN_TRADE_BALANCE)
+  $10-$30:    15% margin, max $4
+  $30-$50:    12% margin, max $6
+  $50-$200:    8% margin
+  $200-$1000:  5% margin
+  $1000+:      5% margin
 
-V5.5 Leverage (10x REMOVED — max 8x elite scalp only):
-  Scalp:  4x / 5x / 6x / 8x-elite
-  Swing:  2x / 3x / 4x / 5x-elite
-  Sniper: 3x / 3x / 4x / 4x-max
+Confidence Boost (applied AFTER tier calc, Patch 5 — explicit caps):
+  Grade C (72-84):  no boost — base only
+  Grade B (85-88):  +2% margin  (hard cap: tier_base_pct + 2%, never >15% abs)
+  Grade A (89+):    +3% margin  (hard cap: tier_base_pct + 3%, never >15% abs)
 
-V5.5 TP/SL (wider TP, ATR-dynamic SL):
-  Scalp:  TP 2.5-6%, SL max(1-2%, 0.8-1.5×ATR)
-  Swing:  TP 5-12%, SL 2-4%
-  Sniper: TP 2-5%, SL 1-2%
+Leverage (V13 tiers):
+  SCALP:  72-76=7x | 77-82=10x | 83-88=12x | 89+=15x
+  SWING:  75-80=7x | 81-86=10x | 87+=12x
+  SNIPER: 90+=15x max
+  ATR%>3% → cap at 10x
+
+TP/SL (ROI %  → converted to price % by dividing by leverage):
+  SCALP TP ROI: 72-76=15% | 77-82=18% | 83-88=20% | 89+=22%
+  SCALP SL ROI: 9% (fixed)
+  SWING TP ROI: 35% | SL ROI: 12%
+  SNIPER TP ROI: 50% | SL ROI: 15%
 """
 
 import logging
 from dataclasses import dataclass
+from typing import Optional
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+# ── Fee/slippage constants (round-trip) ──────────────────────────────
+ROUND_TRIP_COST_PCT = (settings.V13_TAKER_FEE_PCT * 2) + settings.V13_SLIPPAGE_EST_PCT
 
 
 @dataclass
@@ -35,7 +55,7 @@ class TradeParameters:
     leverage: int
     position_size_usdt: float
     safe_margin: float
-    quantity: float           # In base asset
+    quantity: float
     entry_price: float
     stop_loss: float
     take_profit: float
@@ -44,201 +64,214 @@ class TradeParameters:
     confidence: int
     approved: bool = True
     reject_reason: str = ""
-    # V3 additions
-    setup_grade: str = "C"    # A | B | C
-    tp_pct: float = 0.0       # TP percentage for display
-    sl_pct: float = 0.0       # SL percentage for display
-    is_elite: bool = False     # Elite momentum setup
-    # V5.5 Partial TP additions
+    setup_grade: str = "C"
+    tp_pct: float = 0.0       # price TP% for display
+    sl_pct: float = 0.0       # price SL% for display
+    tp_roi_pct: float = 0.0   # ROI TP% for display (V13)
+    sl_roi_pct: float = 0.0   # ROI SL% for display (V13)
+    margin_pct: float = 0.0   # margin as % of balance (V13)
+    is_elite: bool = False
+    # Partial TP (preserved)
     partial_tp_enabled: bool = False
-    tp1_price: float = 0.0     # First partial TP price
-    tp2_price: float = 0.0     # Second partial TP price (= full TP)
-    tp1_qty_pct: float = 0.40  # 40% of position at TP1
-    tp2_qty_pct: float = 0.30  # 30% of position at TP2
-    trail_qty_pct: float = 0.30  # 30% trails with BE stop
+    tp1_price: float = 0.0
+    tp2_price: float = 0.0
+    tp1_qty_pct: float = 0.40
+    tp2_qty_pct: float = 0.30
+    trail_qty_pct: float = 0.30
+    # V13 fee filter
+    net_roi_after_fees: float = 0.0
+    fee_filtered: bool = False
 
 
 class RiskEngine:
     """
-    V5.5 Dynamic Risk Management — ATR-adaptive, strategy-aware, balance-based.
-    Position sizing PRESERVED from V2. TP/SL and leverage optimized for V5.5.
+    V13 Dynamic Risk Management — ROI-based TP/SL, confidence-tiered leverage,
+    balance-tier margin with explicit confidence boosts.
     """
 
-    # ─── Balance Risk Tiers (PRESERVED — DO NOT CHANGE) ──────────────
+    # ─── V13 Margin Tier ─────────────────────────────────────────────
 
     @staticmethod
-    def get_risk_pct(balance: float) -> float:
-        """Returns risk percentage based on account balance tier."""
-        if balance <= 0:
-            return 0.0
-        elif balance <= 100:
-            return 0.08   # 8%
-        elif balance <= 300:
-            return 0.06   # 6%
-        elif balance <= 1000:
-            return 0.04   # 4%
-        else:
-            return 0.02   # 2%
-
-    # ─── Safe Margin Caps (PRESERVED — DO NOT CHANGE) ────────────────
-
-    @staticmethod
-    def get_max_margin(balance: float) -> float:
+    def get_margin_pct(balance: float, confidence: int) -> tuple[float, float]:
         """
-        Maximum margin allowed for a single trade.
-        Protects small accounts from over-exposure.
-        """
-        if balance <= 30:
-            return min(balance * 0.10, 2.0)
-        elif balance <= 50:
-            return min(balance * 0.08, 4.0)
-        elif balance <= 100:
-            return min(balance * 0.07, 7.0)
-        elif balance <= 300:
-            return min(balance * 0.05, 15.0)
-        elif balance <= 1000:
-            return min(balance * 0.04, 40.0)
-        else:
-            return min(balance * 0.02, 100.0)
+        Returns (margin_pct, max_margin_usdt).
+        Patch 1: better <$30 sizing.
+        Patch 5: explicit confidence boost caps.
 
-    # ─── V5.5 Leverage by Strategy + Confidence ────────────────────────
+        Grade C (72-84): base only
+        Grade B (85-88): +V13_BOOST_STRONG_ADD_PCT (capped at abs 15%)
+        Grade A (89+):   +V13_BOOST_ELITE_ADD_PCT  (capped at abs 15%)
+        """
+        # Determine base tier %
+        if balance < settings.V13_MIN_TRADE_BALANCE:
+            return 0.0, 0.0   # Will be caught by hard skip
+
+        if balance < 30.0:
+            base_pct = settings.V13_MARGIN_UNDER30_PCT   # 15%
+            abs_cap  = settings.V13_MARGIN_UNDER30_MAX   # $4
+        elif balance < 50.0:
+            base_pct = settings.V13_MARGIN_30_50_PCT     # 12%
+            abs_cap  = settings.V13_MARGIN_30_50_MAX     # $6
+        elif balance < 200.0:
+            base_pct = settings.V13_MARGIN_50_200_PCT    # 8%
+            abs_cap  = balance * (base_pct / 100.0)
+        elif balance < 1000.0:
+            base_pct = settings.V13_MARGIN_200_1000_PCT  # 5%
+            abs_cap  = balance * (base_pct / 100.0)
+        else:
+            base_pct = settings.V13_MARGIN_OVER1000_PCT  # 5%
+            abs_cap  = balance * (base_pct / 100.0)
+
+        # Confidence boost (Patch 5 — explicit, capped)
+        if confidence >= 89:
+            boost = settings.V13_BOOST_ELITE_ADD_PCT   # +3%
+        elif confidence >= 85:
+            boost = settings.V13_BOOST_STRONG_ADD_PCT  # +2%
+        else:
+            boost = 0.0
+
+        final_pct = min(base_pct + boost, settings.V13_MARGIN_ABSOLUTE_CAP_PCT)
+        max_margin = min(balance * (final_pct / 100.0), abs_cap + balance * (boost / 100.0))
+        # Absolute hard cap: never more than 15% of balance
+        max_margin = min(max_margin, balance * (settings.V13_MARGIN_ABSOLUTE_CAP_PCT / 100.0))
+
+        return final_pct, max_margin
+
+    # ─── V13 Leverage ─────────────────────────────────────────────────
 
     @staticmethod
     def get_leverage(
-        confidence: int, is_elite: bool = False,
-        max_leverage: int = 8, strategy_type: str = "trend_pullback",
+        confidence: int,
+        strategy_type: str = "trend_pullback",
+        atr_pct: float = 0.0,
     ) -> int:
         """
-        V12: Lowered gate from 70 to 60 to match MIN_CONFIDENCE.
-        Scalp: 3/4/5/6/8. Swing: 2/2/3/4/5. Sniper: 3/3/4/4.
+        V13 confidence-tiered leverage per mode.
+        ATR volatility dampener: if ATR%>V13_VOLATILE_ATR_THRESHOLD → cap at V13_VOLATILE_LEVERAGE_CAP.
         """
-        if confidence < 60:
-            return 0  # NO TRADE
+        is_swing   = strategy_type.startswith("swing")
+        is_sniper  = strategy_type.startswith("sniper")
 
-        # Strategy-specific leverage tiers
-        if strategy_type.startswith("swing"):
-            if is_elite and confidence >= 95:
-                return min(5, max_leverage)
-            elif confidence >= 91:
-                return min(4, max_leverage)
+        if is_swing:
+            if confidence >= 87:
+                lev = 12
             elif confidence >= 81:
-                return min(3, max_leverage)
-            elif confidence >= 70:
-                return min(2, max_leverage)
+                lev = 10
             else:
-                return min(2, max_leverage)  # 60-69: 2x swing
+                lev = 7
+            cap = settings.V13_SWING_LEVERAGE_MAX
 
-        elif strategy_type.startswith("sniper"):
-            if confidence >= 91:
-                return min(4, max_leverage)
-            elif confidence >= 81:
-                return min(4, max_leverage)
-            elif confidence >= 70:
-                return min(3, max_leverage)
+        elif is_sniper:
+            if confidence >= 90:
+                lev = 15
+            elif confidence >= 85:
+                lev = 12
             else:
-                return min(3, max_leverage)  # 60-69: 3x sniper
+                lev = 10
+            cap = settings.V13_SNIPER_LEVERAGE_MAX
 
-        else:
-            # Scalp: 8x max for elite only, no 10x ever
-            if is_elite and confidence >= 95:
-                return min(8, max_leverage)
-            elif confidence >= 91:
-                return min(6, max_leverage)
-            elif confidence >= 81:
-                return min(5, max_leverage)
-            elif confidence >= 70:
-                return min(4, max_leverage)
+        else:  # scalp (default)
+            if confidence >= 89:
+                lev = 15
+            elif confidence >= 83:
+                lev = 12
+            elif confidence >= 77:
+                lev = 10
             else:
-                return min(3, max_leverage)  # V12: 60-69 gets 3x (was 0/rejected)
+                lev = 7
+            cap = settings.V13_SCALP_LEVERAGE_MAX
 
-    # ─── V5.5 TP/SL — Wider TP + ATR-Dynamic SL ──────────────────────
+        lev = min(lev, cap)
+
+        # ATR volatility dampener
+        if atr_pct > settings.V13_VOLATILE_ATR_THRESHOLD:
+            lev = min(lev, settings.V13_VOLATILE_LEVERAGE_CAP)
+            logger.info(
+                f"  [V13] Volatility dampener: ATR%={atr_pct:.2f}% > {settings.V13_VOLATILE_ATR_THRESHOLD}% "
+                f"→ leverage capped at {lev}x"
+            )
+
+        return lev
+
+    # ─── V13 TP/SL (ROI% → price%) ────────────────────────────────────
 
     @staticmethod
-    def get_tp_sl_pct(
+    def get_tp_sl_roi(
         confidence: int,
-        atr_pct: float = 0.0,
-        is_elite: bool = False,
-        setup_grade: str = "C",
         strategy_type: str = "trend_pullback",
     ) -> tuple[float, float]:
         """
-        V5.5: Wider scalp TP (2.5-6%), ATR-adaptive SL (min 1% floor).
-        SL = max(base_sl, atr_pct × multiplier) — prevents wick stop-outs.
+        Returns (tp_roi_pct, sl_roi_pct) — position ROI percentages.
+        Patch 2: dynamic scalp TP by confidence.
         """
-        if strategy_type.startswith("swing"):
-            # Swing: unchanged — wider targets for bigger moves
-            if confidence >= 91:
-                tp_pct = 0.12   # 12%
-                sl_pct = 0.04   # 4%
-            elif confidence >= 81:
-                tp_pct = 0.08   # 8%
-                sl_pct = 0.03   # 3%
-            else:
-                tp_pct = 0.05   # 5%
-                sl_pct = 0.02   # 2%
+        is_swing  = strategy_type.startswith("swing")
+        is_sniper = strategy_type.startswith("sniper")
 
-        elif strategy_type.startswith("sniper"):
-            # Sniper: unchanged — medium targets
-            if confidence >= 91:
-                tp_pct = 0.05   # 5%
-                sl_pct = 0.02   # 2%
-            elif confidence >= 81:
-                tp_pct = 0.03   # 3%
-                sl_pct = 0.015  # 1.5%
-            else:
-                tp_pct = 0.02   # 2%
-                sl_pct = 0.01   # 1%
+        if is_swing:
+            return settings.V13_SWING_TP_ROI, settings.V13_SWING_SL_ROI
 
+        if is_sniper:
+            return settings.V13_SNIPER_TP_ROI, settings.V13_SNIPER_SL_ROI
+
+        # Scalp — dynamic TP by confidence
+        if confidence >= 89:
+            tp_roi = settings.V13_SCALP_TP_ROI_89   # 22%
+        elif confidence >= 83:
+            tp_roi = settings.V13_SCALP_TP_ROI_83   # 20%
+        elif confidence >= 77:
+            tp_roi = settings.V13_SCALP_TP_ROI_77   # 18%
         else:
-            # Scalp: V5.5 WIDER TP to capture real profit after fees
-            if is_elite and confidence >= 95:
-                tp_pct = 0.06   # 6% (was 2.5%)
-                base_sl = 0.02  # 2% base
-                atr_mult = 1.5
-            elif confidence >= 91:
-                tp_pct = 0.045  # 4.5% (was 2%)
-                base_sl = 0.018 # 1.8% base
-                atr_mult = 1.2
-            elif confidence >= 81:
-                tp_pct = 0.035  # 3.5% (was 1.5%)
-                base_sl = 0.015 # 1.5% base
-                atr_mult = 1.0
-            else:
-                tp_pct = 0.025  # 2.5% (was 1%)
-                base_sl = 0.012 # 1.2% base
-                atr_mult = 0.8
+            tp_roi = settings.V13_SCALP_TP_ROI_72   # 15%
 
-            # V5.5 ATR-dynamic SL: max(base, atr × multiplier, 1% floor)
-            atr_sl = (atr_pct / 100.0) * atr_mult if atr_pct > 0 else 0.0
-            sl_pct = max(base_sl, atr_sl, 0.01)  # 1% absolute floor
-            # Cap SL so it never exceeds 50% of TP (maintain R:R ≥ 2)
-            sl_pct = min(sl_pct, tp_pct * 0.5)
-            return tp_pct, sl_pct
+        return tp_roi, settings.V13_SCALP_SL_ROI
 
-        # Swing/Sniper: standard ATR widening (unchanged)
-        if atr_pct > 1.0:
-            volatility_factor = 1 + (atr_pct * 0.1)
-            sl_pct *= min(volatility_factor, 1.5)
+    @staticmethod
+    def roi_to_price_pct(roi_pct: float, leverage: int) -> float:
+        """Convert position ROI% to price movement %.  price_pct = roi_pct / leverage."""
+        if leverage <= 0:
+            return roi_pct
+        return roi_pct / leverage
 
-        return tp_pct, sl_pct
+    # ─── V13 Fee Filter (Patch 4) ─────────────────────────────────────
 
-    # ─── Setup Grade ─────────────────────────────────────────────────
+    @staticmethod
+    def check_fee_filter(tp_roi_pct: float, leverage: int) -> tuple[bool, float, str]:
+        """
+        Patch 4: Reject trade if net ROI after round-trip fees < V13_MIN_NET_ROI_AFTER_FEES.
+
+        Round-trip cost as ROI% = (taker_fee*2 + slippage) * leverage
+        Because fees are on notional, at 10x leverage a 0.13% price move = 1.3% ROI hit.
+
+        Returns: (passed, net_roi_pct, reason)
+        """
+        if not settings.V13_FEE_FILTER_ENABLED:
+            return True, tp_roi_pct, ""
+
+        fee_roi_cost = ROUND_TRIP_COST_PCT * leverage   # fee impact in ROI terms
+        net_roi = tp_roi_pct - fee_roi_cost
+
+        if net_roi < settings.V13_MIN_NET_ROI_AFTER_FEES:
+            reason = (
+                f"Fee filter: TP ROI={tp_roi_pct:.1f}% "
+                f"- fees={fee_roi_cost:.1f}% (at {leverage}x) "
+                f"= net {net_roi:.1f}% < min {settings.V13_MIN_NET_ROI_AFTER_FEES}%"
+            )
+            return False, net_roi, reason
+
+        return True, net_roi, ""
+
+    # ─── Setup Grade (preserved from V5.5) ────────────────────────────
 
     @staticmethod
     def determine_setup_grade(confidence: int, volume_spike: bool = False) -> str:
-        """
-        A = Elite setup (confidence 91+, volume spike)
-        B = Strong setup (confidence 81-90, or 91+ without volume)
-        C = Standard setup (confidence 70-80)
-        """
-        if confidence >= 91 and volume_spike:
+        if confidence >= 89:
             return "A"
-        elif confidence >= 81:
+        elif confidence >= 85:
             return "B"
         else:
             return "C"
 
-    # ─── Main Calculation ─────────────────────────────────────────────
+    # ─── Main Calculate ────────────────────────────────────────────────
 
     def calculate(
         self,
@@ -253,175 +286,149 @@ class RiskEngine:
         step_size: float = 0.0,
         quantity_precision: int = 3,
         price_precision: int = 4,
-        max_leverage_override: int = 10,
-        risk_pct_override: float = None,
-        # V3 params
+        max_leverage_override: int = 0,   # 0 = use V13 auto
+        risk_pct_override: float = None,  # kept for compat, ignored in V13
         volume_spike: bool = False,
-        size_multiplier: float = 1.0,  # For daily guard reductions
-        # V5 params
+        size_multiplier: float = 1.0,
         strategy_type: str = "trend_pullback",
     ) -> TradeParameters:
         """
-        Compute full trade parameters with V5 strategy-aware risk management.
-
-        Flow:
-        1. Check minimum confidence
-        2. Get risk % from balance tier (PRESERVED)
-        3. Calculate safe_margin = balance * risk_pct
-        4. Apply margin cap (PRESERVED)
-        5. Get leverage from strategy + confidence (V5 tiers)
-        6. Calculate position_size = safe_margin * leverage
-        7. Apply size_multiplier (daily guard / consecutive loss reduction)
-        8. Validate symbol minimums
-        9. Calculate TP/SL (V5 strategy-based)
+        V13 full trade parameter calculation.
         """
-
-        # ── Determine setup grade + elite status ─────────────────────
         setup_grade = self.determine_setup_grade(confidence, volume_spike)
-        is_elite = setup_grade == "A" and confidence >= 95
+        is_elite    = setup_grade == "A"
 
-        # ── Confidence gate ──────────────────────────────────────────
-        if confidence < settings.MIN_CONFIDENCE:
+        # ── 1. Hard balance floor ──────────────────────────────────────
+        if account_balance < settings.V13_MIN_TRADE_BALANCE:
             return TradeParameters(
                 symbol=symbol, side=side, leverage=0,
                 position_size_usdt=0, safe_margin=0, quantity=0,
                 entry_price=entry_price, stop_loss=0, take_profit=0,
                 risk_reward=0, risk_pct=0, confidence=confidence,
                 approved=False,
-                reject_reason=f"Confidence {confidence} below minimum {settings.MIN_CONFIDENCE} [SCALP GATE]",
+                reject_reason=f"Balance ${account_balance:.2f} below V13 minimum ${settings.V13_MIN_TRADE_BALANCE}",
                 setup_grade=setup_grade,
             )
 
-        # ── Risk percentage (PRESERVED) ──────────────────────────────
-        risk_pct = risk_pct_override if risk_pct_override else self.get_risk_pct(account_balance)
-
-        # ── Safe margin (PRESERVED) ──────────────────────────────────
-        safe_margin = account_balance * risk_pct
-        max_margin = self.get_max_margin(account_balance)
-        safe_margin = min(safe_margin, max_margin)
-
-        # ── V3: Apply size multiplier (daily guard / loss reduction) ──
-        if size_multiplier < 1.0:
-            safe_margin *= size_multiplier
-            logger.info(f"  V3 size reduction: multiplier={size_multiplier:.2f} margin=${safe_margin:.2f}")
-
-        # ── Leverage (V5 strategy tiers) ──────────────────────────────
-        leverage = self.get_leverage(confidence, is_elite, max_leverage_override, strategy_type)
-        if leverage == 0:
+        # ── 2. Leverage ────────────────────────────────────────────────
+        leverage = self.get_leverage(confidence, strategy_type, atr_pct)
+        if max_leverage_override > 0:
+            leverage = min(leverage, max_leverage_override)
+        if leverage <= 0:
             return TradeParameters(
                 symbol=symbol, side=side, leverage=0,
-                position_size_usdt=0, safe_margin=safe_margin, quantity=0,
+                position_size_usdt=0, safe_margin=0, quantity=0,
                 entry_price=entry_price, stop_loss=0, take_profit=0,
-                risk_reward=0, risk_pct=risk_pct, confidence=confidence,
-                approved=False,
-                reject_reason=f"Confidence {confidence} too low for any leverage",
+                risk_reward=0, risk_pct=0, confidence=confidence,
+                approved=False, reject_reason="Confidence too low for leverage",
                 setup_grade=setup_grade,
             )
 
-        # ── Position size (PRESERVED logic) ──────────────────────────
-        position_size_usdt = safe_margin * leverage
+        # ── 3. Margin ─────────────────────────────────────────────────
+        margin_pct, max_margin = self.get_margin_pct(account_balance, confidence)
+        safe_margin = min(account_balance * (margin_pct / 100.0), max_margin)
 
-        # ── V4: Apply minimum position floor ─────────────────────────
+        # Apply daily-guard / consecutive-loss multiplier
+        if size_multiplier < 1.0:
+            safe_margin *= size_multiplier
+            logger.info(f"  [V13] Size multiplier={size_multiplier:.2f} → margin=${safe_margin:.2f}")
+
+        # ── 4. TP/SL as ROI% → price% ─────────────────────────────────
+        tp_roi_pct, sl_roi_pct = self.get_tp_sl_roi(confidence, strategy_type)
+        tp_price_pct = self.roi_to_price_pct(tp_roi_pct, leverage)
+        sl_price_pct = self.roi_to_price_pct(sl_roi_pct, leverage)
+
+        # ── 5. Fee/slippage filter (Patch 4) ──────────────────────────
+        fee_ok, net_roi, fee_reason = self.check_fee_filter(tp_roi_pct, leverage)
+        if not fee_ok:
+            logger.info(f"  [V13 FEE FILTER] {symbol}: {fee_reason}")
+            return TradeParameters(
+                symbol=symbol, side=side, leverage=leverage,
+                position_size_usdt=0, safe_margin=safe_margin, quantity=0,
+                entry_price=entry_price, stop_loss=0, take_profit=0,
+                risk_reward=0, risk_pct=margin_pct / 100.0, confidence=confidence,
+                approved=False, reject_reason=f"Fee filter: {fee_reason}",
+                setup_grade=setup_grade, fee_filtered=True,
+            )
+
+        # ── 6. Position size ──────────────────────────────────────────
+        position_size_usdt = safe_margin * leverage
         effective_min_notional = max(min_notional, settings.MIN_POSITION_USDT)
 
-        # ── Symbol minimum validation (IMPROVED V4) ──────────────────
         if position_size_usdt < effective_min_notional:
-            # Try bumping to minimum
             required_margin = effective_min_notional / leverage
-            if required_margin <= max_margin * 1.5:  # V4: Allow 50% over cap (was 20%)
-                old_size = position_size_usdt
+            if required_margin <= max_margin * 1.5:
                 position_size_usdt = effective_min_notional
                 safe_margin = required_margin
-                logger.info(
-                    f"  V4 size bump: ${old_size:.2f} -> ${effective_min_notional:.2f} "
-                    f"(min_notional=${min_notional}, floor=${settings.MIN_POSITION_USDT}) "
-                    f"margin=${safe_margin:.2f}"
-                )
             else:
                 return TradeParameters(
                     symbol=symbol, side=side, leverage=leverage,
                     position_size_usdt=position_size_usdt, safe_margin=safe_margin, quantity=0,
                     entry_price=entry_price, stop_loss=0, take_profit=0,
-                    risk_reward=0, risk_pct=risk_pct, confidence=confidence,
+                    risk_reward=0, risk_pct=margin_pct / 100.0, confidence=confidence,
                     approved=False,
                     reject_reason=(
                         f"Position ${position_size_usdt:.2f} below min ${effective_min_notional}. "
-                        f"Bumping would exceed safe margin cap ${max_margin:.2f}"
+                        f"Bumping would exceed safe margin."
                     ),
                     setup_grade=setup_grade,
                 )
 
-        # ── Quantity calculation (PRESERVED) ─────────────────────────
+        # ── 7. Quantity ────────────────────────────────────────────────
         if entry_price <= 0:
             return TradeParameters(
                 symbol=symbol, side=side, leverage=leverage,
                 position_size_usdt=position_size_usdt, safe_margin=safe_margin, quantity=0,
                 entry_price=entry_price, stop_loss=0, take_profit=0,
-                risk_reward=0, risk_pct=risk_pct, confidence=confidence,
+                risk_reward=0, risk_pct=margin_pct / 100.0, confidence=confidence,
                 approved=False, reject_reason="Invalid entry price",
                 setup_grade=setup_grade,
             )
 
-        raw_quantity = position_size_usdt / entry_price
-
-        # Apply step size rounding if provided
+        import math
+        raw_qty = position_size_usdt / entry_price
         if step_size > 0:
-            raw_quantity = int(raw_quantity / step_size) * step_size
+            raw_qty = math.floor(raw_qty / step_size) * step_size
+        quantity = round(raw_qty, quantity_precision)
 
-        quantity = round(raw_quantity, quantity_precision)
-
-        # V4: If step_size rounding dropped quantity to 0, bump to min_qty
         if quantity <= 0 and min_qty > 0:
             quantity = min_qty
             position_size_usdt = quantity * entry_price
-            logger.info(
-                f"  V4: Quantity was 0 after rounding, bumped to min_qty={min_qty} "
-                f"(notional=${position_size_usdt:.2f})"
-            )
 
-        # Validate min qty
         if min_qty > 0 and quantity < min_qty:
-            # V4: Try bumping to min_qty instead of rejecting
             bumped_notional = min_qty * entry_price
-            bumped_margin = bumped_notional / leverage if leverage > 0 else bumped_notional
+            bumped_margin   = bumped_notional / leverage if leverage > 0 else bumped_notional
             if bumped_margin <= max_margin * 1.5:
                 quantity = min_qty
                 position_size_usdt = bumped_notional
                 safe_margin = bumped_margin
-                logger.info(
-                    f"  V4: Bumped quantity to min_qty={min_qty} "
-                    f"(notional=${position_size_usdt:.2f}, margin=${safe_margin:.2f})"
-                )
             else:
                 return TradeParameters(
                     symbol=symbol, side=side, leverage=leverage,
                     position_size_usdt=position_size_usdt, safe_margin=safe_margin, quantity=quantity,
                     entry_price=entry_price, stop_loss=0, take_profit=0,
-                    risk_reward=0, risk_pct=risk_pct, confidence=confidence,
+                    risk_reward=0, risk_pct=margin_pct / 100.0, confidence=confidence,
                     approved=False,
-                    reject_reason=f"Quantity {quantity} below symbol minimum {min_qty}, bumping exceeds margin cap",
+                    reject_reason=f"Qty {quantity} below min {min_qty}, bumping exceeds margin cap",
                     setup_grade=setup_grade,
                 )
 
-        # ── V5 TP/SL (Strategy-Based) ─────────────────────────────────
-        tp_pct, sl_pct = self.get_tp_sl_pct(confidence, atr_pct, is_elite, setup_grade, strategy_type)
-
+        # ── 8. Price levels ────────────────────────────────────────────
         if side == "BUY":
-            take_profit = entry_price * (1 + tp_pct)
-            stop_loss = entry_price * (1 - sl_pct)
+            take_profit = entry_price * (1 + tp_price_pct)
+            stop_loss   = entry_price * (1 - sl_price_pct)
         else:
-            take_profit = entry_price * (1 - tp_pct)
-            stop_loss = entry_price * (1 + sl_pct)
+            take_profit = entry_price * (1 - tp_price_pct)
+            stop_loss   = entry_price * (1 + sl_price_pct)
 
-        # Risk/reward ratio
         sl_distance = abs(entry_price - stop_loss)
         tp_distance = abs(take_profit - entry_price)
         rr = round(tp_distance / sl_distance, 2) if sl_distance > 0 else 0
 
         take_profit = round(take_profit, price_precision)
-        stop_loss = round(stop_loss, price_precision)
+        stop_loss   = round(stop_loss,   price_precision)
 
-        # ── V5.5 Partial TP Calculation ─────────────────────────────
+        # ── 9. Partial TP (preserved from V5.5) ───────────────────────
         partial_tp_enabled, tp1_price, tp2_price = self.calculate_partial_tp(
             entry_price=entry_price,
             take_profit=take_profit,
@@ -432,12 +439,15 @@ class RiskEngine:
             price_precision=price_precision,
         )
 
+        actual_margin_pct = (safe_margin / account_balance * 100) if account_balance > 0 else 0
+
         logger.info(
-            f"  Risk V5: bal=${account_balance:.2f} risk={risk_pct*100:.1f}% "
-            f"margin=${safe_margin:.2f} lev={leverage}x pos=${position_size_usdt:.2f} "
-            f"qty={quantity} TP={tp_pct*100:.1f}% SL={sl_pct*100:.1f}% RR={rr} "
-            f"grade={setup_grade} strategy={strategy_type}"
-            f"{' | PARTIAL_TP' if partial_tp_enabled else ''}"
+            f"  [V13 Risk] {symbol} {side} | bal=${account_balance:.2f} "
+            f"margin={actual_margin_pct:.1f}%/${safe_margin:.2f} lev={leverage}x "
+            f"pos=${position_size_usdt:.2f} | "
+            f"TP_ROI={tp_roi_pct:.1f}% SL_ROI={sl_roi_pct:.1f}% "
+            f"TP_price={tp_price_pct*100:.2f}% SL_price={sl_price_pct*100:.2f}% "
+            f"RR={rr} net_ROI={net_roi:.1f}% grade={setup_grade}"
         )
 
         return TradeParameters(
@@ -451,12 +461,15 @@ class RiskEngine:
             stop_loss=stop_loss,
             take_profit=take_profit,
             risk_reward=rr,
-            risk_pct=round(risk_pct, 4),
+            risk_pct=round(margin_pct / 100.0, 4),
             confidence=confidence,
             approved=True,
             setup_grade=setup_grade,
-            tp_pct=round(tp_pct * 100, 1),
-            sl_pct=round(sl_pct * 100, 1),
+            tp_pct=round(tp_price_pct * 100, 2),
+            sl_pct=round(sl_price_pct * 100, 2),
+            tp_roi_pct=tp_roi_pct,
+            sl_roi_pct=sl_roi_pct,
+            margin_pct=round(actual_margin_pct, 2),
             is_elite=is_elite,
             partial_tp_enabled=partial_tp_enabled,
             tp1_price=tp1_price,
@@ -464,9 +477,10 @@ class RiskEngine:
             tp1_qty_pct=settings.PARTIAL_TP1_PCT,
             tp2_qty_pct=settings.PARTIAL_TP2_PCT,
             trail_qty_pct=settings.PARTIAL_TRAIL_PCT,
+            net_roi_after_fees=round(net_roi, 2),
         )
 
-    # ─── V5.5: Partial Take Profit Calculation ───────────────────────
+    # ─── Partial TP (preserved from V5.5) ─────────────────────────────
 
     @staticmethod
     def calculate_partial_tp(
@@ -478,33 +492,17 @@ class RiskEngine:
         setup_grade: str,
         price_precision: int = 4,
     ) -> tuple[bool, float, float]:
-        """
-        V5.5: Determine if partial TP should be used and calculate levels.
-
-        Partial TP activates for:
-          - Swing trades (any grade)
-          - Breakout scalps with Grade A or B
-          - Any strategy with confidence >= 85 and Grade A or B
-
-        TP1 = 50% of the distance to full TP (close 40% of position)
-        TP2 = full TP level (close 30% of position)
-        Remaining 30% trails via break-even stop.
-
-        Returns: (enabled, tp1_price, tp2_price)
-        """
         if not settings.PARTIAL_TP_ENABLED:
             return False, 0.0, 0.0
 
-        # Determine eligibility
-        is_swing = strategy_type.startswith("swing")
-        is_breakout = "breakout" in strategy_type
-        is_strong_setup = setup_grade in ("A", "B") and confidence >= settings.PARTIAL_TP_MIN_CONFIDENCE
+        is_swing      = strategy_type.startswith("swing")
+        is_breakout   = "breakout" in strategy_type
+        is_strong     = setup_grade in ("A", "B") and confidence >= settings.PARTIAL_TP_MIN_CONFIDENCE
 
-        if not (is_swing or is_breakout or is_strong_setup):
+        if not (is_swing or is_breakout or is_strong):
             return False, 0.0, 0.0
 
-        # Calculate TP1 at halfway to full TP
-        tp_distance = abs(take_profit - entry_price)
+        tp_distance  = abs(take_profit - entry_price)
         tp1_distance = tp_distance * settings.PARTIAL_TP1_DISTANCE
 
         if side == "BUY":
@@ -512,12 +510,4 @@ class RiskEngine:
         else:
             tp1_price = round(entry_price - tp1_distance, price_precision)
 
-        # TP2 = the full TP level
-        tp2_price = take_profit
-
-        logger.info(
-            f"  📊 Partial TP: TP1=${tp1_price} (40% close) | "
-            f"TP2=${tp2_price} (30% close) | Trail 30%"
-        )
-
-        return True, tp1_price, tp2_price
+        return True, tp1_price, take_profit

@@ -280,13 +280,27 @@ class LearningEngine:
                         registry.total_pnl / total, 4
                     ) if total > 0 else 0
 
-                    # Update weight every 5 trades
-                    if total >= 5 and total % 5 == 0:
+                    # V13 Patch 3: Update weight every 20 trades OR weekly (whichever comes first)
+                    _interval = settings.V13_LEARNING_TRADE_INTERVAL   # default 20
+                    _weekly_trigger = False
+                    if settings.V13_LEARNING_WEEKLY_ENABLED and registry.updated_at:
+                        _days_since = (datetime.now(timezone.utc) - registry.updated_at).days
+                        _weekly_trigger = _days_since >= 7
+
+                    if total >= _interval and (total % _interval == 0 or _weekly_trigger):
                         new_weight = await self._calculate_weight(strategy_id)
                         registry.weight = new_weight
                         logger.info(
-                            f"  📊 V7 Strategy weight updated: {strategy_id} → {new_weight}"
+                            f"  📊 V13 Strategy weight updated: {strategy_id} → {new_weight} "
+                            f"(trades={total}, weekly={_weekly_trigger})"
                         )
+                        # V13: Auto-disable persistent losers
+                        if new_weight <= settings.V13_LEARNING_AUTO_DISABLE_WEIGHT and total >= _interval:
+                            registry.is_active = False
+                            logger.warning(
+                                f"  ⛔ V13 Strategy auto-disabled (persistent loser): {strategy_id} "
+                                f"weight={new_weight} trades={total}"
+                            )
 
                     registry.updated_at = datetime.now(timezone.utc)
 

@@ -281,8 +281,18 @@ async def execute_multi_account(req: MultiExecuteRequest):
 
     if side not in ("BUY", "SELL"):
         return {"status": "error", "message": f"Invalid action: {req.action}"}
-    if req.confidence < settings.MIN_CONFIDENCE:
-        return {"status": "skipped", "reason": f"Confidence {req.confidence} < {settings.MIN_CONFIDENCE}"}
+
+    # V13: Per-mode confidence gates (replaces single MIN_CONFIDENCE)
+    _is_swing_mode   = req.strategy_type.startswith("swing")
+    _is_sniper_mode  = req.strategy_type.startswith("sniper")
+    _is_scalp_mode   = not _is_swing_mode and not _is_sniper_mode
+
+    if _is_scalp_mode and req.confidence < settings.V13_SCALP_MIN_CONFIDENCE:
+        return {"status": "skipped", "reason": f"Scalp conf {req.confidence} < V13 min {settings.V13_SCALP_MIN_CONFIDENCE}"}
+    elif _is_swing_mode and req.confidence < settings.V13_SWING_MIN_CONFIDENCE:
+        return {"status": "skipped", "reason": f"Swing conf {req.confidence} < V13 min {settings.V13_SWING_MIN_CONFIDENCE}"}
+    elif _is_sniper_mode and req.confidence < settings.V13_SNIPER_MIN_CONFIDENCE:
+        return {"status": "skipped", "reason": f"Sniper conf {req.confidence} < V13 min {settings.V13_SNIPER_MIN_CONFIDENCE}"}
 
     # ── Global rate limits (trade count + cooldowns only) ────────────
     hourly_limited, _ = state_manager.is_hourly_limit_reached()
@@ -603,14 +613,16 @@ async def execute_multi_account(req: MultiExecuteRequest):
     skipped = []
     skip_reasons_map = {}
 
-    # V10: Track best trade result for the single Telegram message
-    # Note: sl_attached / tp_attached removed — Protection Engine owns that
+    # V13: add margin_pct + ROI targets to Telegram
     best_fill_price = 0.0
     best_leverage = 0
     best_tp = 0.0
     best_sl = 0.0
     best_tp_pct = 0.0
     best_sl_pct = 0.0
+    best_tp_roi_pct = 0.0
+    best_sl_roi_pct = 0.0
+    best_margin_pct = 0.0
     best_grade = "C"
     best_order_method = "MARKET"
     best_rr = 0.0
@@ -620,6 +632,7 @@ async def execute_multi_account(req: MultiExecuteRequest):
     async def execute_for_account(acc_data: dict):
         nonlocal best_fill_price, best_leverage, best_tp, best_sl
         nonlocal best_tp_pct, best_sl_pct, best_grade, best_order_method, best_rr
+        nonlocal best_tp_roi_pct, best_sl_roi_pct, best_margin_pct
 
         async with semaphore:
             acc_id = acc_data["id"]
@@ -655,9 +668,10 @@ async def execute_multi_account(req: MultiExecuteRequest):
                     logger.error(f"  [{internal_label}] Balance fetch failed: {be}")
                     return _skip(acc_id, "API Error", f"Balance fetch failed: {str(be)[:80]}")
 
-                if balance < 5:
-                    logger.info(f"  [{internal_label}] Balance ${balance:.2f} too low → SKIP")
-                    return _skip(acc_id, "Insufficient Balance", f"Balance ${balance:.2f} below $5 minimum")
+                if balance < settings.V13_MIN_TRADE_BALANCE:
+                    logger.info(f"  [{internal_label}] Balance ${balance:.2f} below V13 min ${settings.V13_MIN_TRADE_BALANCE} → SKIP")
+                    return _skip(acc_id, "Insufficient Balance", f"Balance ${balance:.2f} below V13 minimum ${settings.V13_MIN_TRADE_BALANCE}")
+
 
                 # ── 3. Per-account daily guard check ─────────────────
                 guard_result = daily_guard.check_allowed(acc_id, balance, req.confidence)
@@ -908,6 +922,11 @@ async def execute_multi_account(req: MultiExecuteRequest):
                     best_grade = trade_params.setup_grade
                     best_order_method = getattr(result, 'order_method', 'MARKET')
                     best_rr = trade_params.risk_reward
+                    # V13: ROI % and margin %
+                    best_tp_roi_pct  = getattr(trade_params, 'tp_roi_pct', 0.0)
+                    best_sl_roi_pct  = getattr(trade_params, 'sl_roi_pct', 0.0)
+                    best_margin_pct  = getattr(trade_params, 'margin_pct', 0.0)
+
 
                     logger.info(
                         f"  [V10] [{internal_label}] EXECUTED: "
@@ -1040,6 +1059,9 @@ async def execute_multi_account(req: MultiExecuteRequest):
             stop_loss=best_sl,
             tp_pct=best_tp_pct,
             sl_pct=best_sl_pct,
+            tp_roi_pct=best_tp_roi_pct,
+            sl_roi_pct=best_sl_roi_pct,
+            margin_pct=best_margin_pct,
             reason=req.reason,
             setup_grade=best_grade,
             order_method=best_order_method,

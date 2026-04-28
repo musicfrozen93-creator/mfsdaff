@@ -432,7 +432,7 @@ class ConfidenceEngine:
 
         # ── Hard Rejects ─────────────────────────────────────────────
 
-        # 1. Candle overextended (body > 4×ATR — relaxed from 2.5x for scalp compatibility)
+        # 1. Candle overextended (body > 4×ATR)
         if atr > 0 and body > atr * 4.0:
             return False, f"Overextended candle: body={body:.4f} > 4×ATR={atr*4.0:.4f}", 0
 
@@ -444,21 +444,21 @@ class ConfidenceEngine:
         if atr_pct > 5.0:
             return False, f"Extreme volatility: ATR%={atr_pct:.2f}% > 5%", 0
 
-        # 4. Fake pump detection (huge wick > 3×body in trade direction)
+        # 4. V13: Fake pump/dump detection (wick > 2.5×body — tightened from 3x)
         if side == "BUY" and body > 0:
-            if upper_wick > body * 3:
-                return False, "Fake pump: massive upper wick (rejection)", 0
+            if upper_wick > body * 2.5:
+                return False, "Fake pump: upper wick > 2.5× body (rejection)", 0
         elif side == "SELL" and body > 0:
-            if lower_wick > body * 3:
-                return False, "Fake dump: massive lower wick (bounce)", 0
+            if lower_wick > body * 2.5:
+                return False, "Fake dump: lower wick > 2.5× body (bounce)", 0
 
         # 5. Low volume move (volume < 0.3x average — relaxed from 0.5x)
         if volume_ratio < 0.3:
             return False, f"Very low volume: {volume_ratio:.1f}x < 0.3x avg", 0
 
-        # 6. Sideways chop (EMA distance < 0.02% — tightened from 0.05% to reduce over-rejection)
-        if ema_dist_pct < 0.02:
-            return False, f"Extreme chop: EMA dist={ema_dist_pct:.3f}% < 0.02%", 0
+        # 6. V13: Sideways chop (tightened to 0.03%)
+        if ema_dist_pct < 0.03:
+            return False, f"Extreme chop: EMA dist={ema_dist_pct:.3f}% < 0.03%", 0
 
         # ── Soft Penalties (reduce confidence but don't reject) ───────
 
@@ -470,13 +470,21 @@ class ConfidenceEngine:
         elif side == "SELL" and lower_wick > body * 2:
             penalty += 8
 
-        # 8. Moderate overextension (body > 1.8×ATR but < 2.5×ATR)
+        # 8. Moderate overextension (body > 1.8×ATR)
         if atr > 0 and body > atr * 1.8:
             penalty += 5
 
         # 9. Spread warning zone (0.08% - 0.12%)
         if 0.08 < spread_pct <= 0.12:
             penalty += 3
+
+        # 10. V13: Thin-body fakeout penalty — body < 30% of total range signals indecision
+        if total_range > 0 and body > 0 and (body / total_range) < 0.30:
+            penalty += 10
+
+        # 11. V13: Wide spread during potential breakout — spreads hurt fill quality
+        if spread_pct > 0.10 and ema_dist_pct > 0.3:
+            penalty += 5
 
         return True, "", penalty
 

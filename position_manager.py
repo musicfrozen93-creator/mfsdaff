@@ -53,7 +53,9 @@ PRICE_STALE_MAX_SECONDS = 10.0
 SYMBOL_REFRESH_INTERVAL = 30
 TRAILING_SL_PCT_SCALP   = 0.4
 TRAILING_SL_PCT_SWING   = 0.5
-POSITION_MANAGER_VERSION = "V12"
+POSITION_MANAGER_VERSION = "V13"
+# V13: fee buffer for breakeven calculation (0.12% round-trip)
+BE_FEE_BUFFER = settings.V13_FEE_BUFFER_PCT / 100.0
 
 # ── DB ────────────────────────────────────────────────────────────────
 engine = create_async_engine(settings.DATABASE_URL, echo=False)
@@ -74,9 +76,33 @@ def _duration_minutes(opened_at: datetime) -> int:
 def _is_swing(strategy_type: str) -> bool:
     return (strategy_type or "").startswith("swing")
 
+def _is_sniper(strategy_type: str) -> bool:
+    return (strategy_type or "").startswith("sniper")
+
 
 def _stale_threshold_hours(strategy_type: str) -> int:
     return settings.SWING_STALE_HOURS if _is_swing(strategy_type) else settings.SCALP_STALE_HOURS
+
+
+def _get_be_trigger_roi(strategy_type: str) -> float:
+    """V13: Per-mode ROI% threshold that triggers break-even SL move."""
+    st = (strategy_type or "").lower()
+    if _is_swing(st):
+        return settings.V13_SWING_BE_TRIGGER_ROI    # 18%
+    elif _is_sniper(st):
+        return settings.V13_SNIPER_BE_TRIGGER_ROI   # 25%
+    else:
+        return settings.V13_SCALP_BE_TRIGGER_ROI    # 10%
+
+
+def _calc_roi_pct(side: str, entry: float, current: float, leverage: int) -> float:
+    """V13: Calculate position ROI% using leverage."""
+    if entry <= 0 or leverage <= 0:
+        return 0.0
+    if side == "BUY":
+        return (current - entry) / entry * leverage * 100
+    else:
+        return (entry - current) / entry * leverage * 100
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -332,6 +358,99 @@ class PositionManager:
 
     # ── V11: Orphan Sync ──────────────────────────────────────────────
 
+    async def _check_momentum_exit(
+        self, pos: OpenPosition, current_price: float, roi_pct: float
+    ) -> bool:
+        """
+        V13 Anti-Reverse Profit Protection (Part 5).
+        Detects when a profitable trade is losing momentum and exits early.
+
+        Triggers when:
+          - Peak ROI exceeded V13_MOMENTUM_MIN_PEAK_ROI (default 5%)
+          - Current ROI has retraced > V13_MOMENTUM_RETRACE_PCT (default 40%) from peak
+
+        Retrace example: peak ROI=10%, retrace=40% → exit if ROI drops below 6%.
+        """
+        if not settings.V13_MOMENTUM_EXIT_ENABLED:
+            return False
+
+        entry    = pos.entry_price
+        leverage = pos.leverage or 1
+
+        # Track peak ROI in highest_price/lowest_price fields
+        if pos.side == "BUY":
+            peak_price = pos.highest_price or entry
+            peak_roi   = _calc_roi_pct(pos.side, entry, peak_price, leverage)
+        else:
+            peak_price = pos.lowest_price or entry
+            peak_roi   = _calc_roi_pct(pos.side, entry, peak_price, leverage)
+
+        if peak_roi < settings.V13_MOMENTUM_MIN_PEAK_ROI:
+            return False   # Never reached minimum profit — don't interfere
+
+        # Calculate retrace threshold
+        retrace_threshold_roi = peak_roi * (1.0 - settings.V13_MOMENTUM_RETRACE_PCT / 100.0)
+
+        if roi_pct < retrace_threshold_roi:
+            logger.info(
+                f"  [V13 MOMENTUM EXIT] {pos.symbol}: peak_ROI={peak_roi:.1f}% "
+                f"current_ROI={roi_pct:.1f}% < retrace_threshold={retrace_threshold_roi:.1f}% "
+                f"→ exiting early to protect profits"
+            )
+            return True
+
+        return False
+
+    async def _activate_break_even(
+        self, pos: OpenPosition, current_price: float
+    ) -> None:
+        """
+        V13: Move SL to breakeven + fee buffer and persist to DB.
+        Called when position ROI crosses the per-mode BE trigger.
+        """
+        entry    = pos.entry_price
+        fee_buf  = BE_FEE_BUFFER  # 0.0012 = 0.12%
+
+        if pos.side == "BUY":
+            be_price = round(entry * (1 + fee_buf), 8)
+        else:
+            be_price = round(entry * (1 - fee_buf), 8)
+
+        # Only move SL if new BE is better than current SL
+        if pos.side == "BUY" and pos.sl_price and be_price <= pos.sl_price:
+            return  # Already protected or better
+        if pos.side == "SELL" and pos.sl_price and be_price >= pos.sl_price:
+            return
+
+        old_sl = pos.sl_price
+        pos.sl_price = be_price
+        pos.trailing_active = True
+
+        # Persist to DB
+        try:
+            async with AsyncSessionFactory() as session:
+                db_pos = await session.get(OpenPosition, pos.id)
+                if db_pos and db_pos.status == "open":
+                    db_pos.sl_price       = be_price
+                    db_pos.trailing_active = True
+                    db_pos.last_checked_at = datetime.now(timezone.utc)
+                    await session.commit()
+            logger.info(
+                f"  [V13 BE] {pos.symbol}: SL moved {old_sl} → {be_price} "
+                f"(entry={entry} + fee_buf={fee_buf*100:.2f}%)"
+            )
+            # Telegram notification
+            leverage = pos.leverage or 1
+            roi_pct = _calc_roi_pct(pos.side, entry, current_price, leverage)
+            await self.telegram.break_even_moved(
+                symbol=pos.symbol, side=pos.side,
+                entry_price=entry, be_price=be_price,
+                roi_pct=roi_pct,
+            )
+        except Exception as e:
+            logger.error(f"  [V13 BE] DB update failed for {pos.symbol}: {e}")
+
+
     async def _orphan_sync(self) -> None:
         """Compare DB open_positions against Binance live positions on startup."""
         if not settings.PM_ORPHAN_SYNC_ENABLED:
@@ -512,6 +631,10 @@ class PositionManager:
         if not current_price or current_price <= 0:
             return
 
+        # V13: Calculate live ROI
+        leverage = pos.leverage or 1
+        roi_pct  = _calc_roi_pct(pos.side, pos.entry_price, current_price, leverage)
+
         # 1. Hard TP/SL check (price snapshot)
         trigger = self._check_tp_sl(pos, current_price)
         if trigger:
@@ -526,20 +649,38 @@ class PositionManager:
                 await self._close_position(pos, candle_trigger, candle_high or current_price)
                 return
 
-        # 3. Trailing stop
-        if settings.BREAK_EVEN_ENABLED:
+        # 3. V13: ROI-based break-even activation (per mode)
+        if not pos.trailing_active:  # Only activate once
+            be_trigger_roi = _get_be_trigger_roi(pos.strategy_type or "")
+            if roi_pct >= be_trigger_roi:
+                logger.info(
+                    f"  [V13 BE TRIGGER] {symbol}: ROI={roi_pct:.1f}% >= "
+                    f"be_trigger={be_trigger_roi:.1f}% → activating BE stop"
+                )
+                await self._activate_break_even(pos, current_price)
+
+        # 4. Trailing stop (uses updated SL after BE activation)
+        if pos.trailing_active:
             should_trail, _ = self._update_trailing(pos, current_price)
             if should_trail:
                 await self._close_position(pos, "trailing_exit", current_price)
                 return
 
-        # 4. V11: Stale detection (every 60 ticks)
+        # 5. V13: Momentum exit — anti-reverse profit protection
+        if settings.V13_MOMENTUM_EXIT_ENABLED:
+            should_momentum_exit = await self._check_momentum_exit(pos, current_price, roi_pct)
+            if should_momentum_exit:
+                await self._close_position(pos, "momentum_exit", current_price)
+                return
+
+        # 6. V11: Stale detection (every 60 ticks)
         if self._tick % 60 == 0:
             await self._check_stale(pos, current_price)
 
-        # 5. Update DB price (every 10 ticks)
+        # 7. Update DB price (every 10 ticks)
         if self._tick % 10 == 0:
             await self._update_position_price(pos, current_price)
+
 
     # ── Main Loop ─────────────────────────────────────────────────────
 

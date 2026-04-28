@@ -211,6 +211,86 @@ class Settings:
     # Orphan sync: compare DB open_positions vs Binance on startup
     PM_ORPHAN_SYNC_ENABLED: bool = os.getenv("PM_ORPHAN_SYNC_ENABLED", "true").lower() == "true"
 
+    # ── V13 Per-Mode Confidence Gates ────────────────────────────────────
+    V13_SCALP_MIN_CONFIDENCE: int = int(os.getenv("V13_SCALP_MIN_CONFIDENCE", "72"))
+    V13_SWING_MIN_CONFIDENCE: int = int(os.getenv("V13_SWING_MIN_CONFIDENCE", "75"))
+    V13_SNIPER_MIN_CONFIDENCE: int = int(os.getenv("V13_SNIPER_MIN_CONFIDENCE", "82"))
+
+    # ── V13 Leverage Caps (per mode) ─────────────────────────────────────
+    V13_SCALP_LEVERAGE_MAX: int = int(os.getenv("V13_SCALP_LEVERAGE_MAX", "15"))
+    V13_SWING_LEVERAGE_MAX: int = int(os.getenv("V13_SWING_LEVERAGE_MAX", "12"))
+    V13_SNIPER_LEVERAGE_MAX: int = int(os.getenv("V13_SNIPER_LEVERAGE_MAX", "15"))
+    # Reduce leverage if ATR% exceeds this threshold
+    V13_VOLATILE_ATR_THRESHOLD: float = float(os.getenv("V13_VOLATILE_ATR_THRESHOLD", "3.0"))
+    V13_VOLATILE_LEVERAGE_CAP: int = int(os.getenv("V13_VOLATILE_LEVERAGE_CAP", "10"))
+
+    # ── V13 Balance-Tier Margin % (Patch 1: better <$30 sizing) ──────────
+    # Balance < $10: hard skip (MIN_TRADE_BALANCE)
+    V13_MIN_TRADE_BALANCE: float = float(os.getenv("V13_MIN_TRADE_BALANCE", "10.0"))
+    # $10-$30:  15% margin, max $4
+    V13_MARGIN_UNDER30_PCT: float = float(os.getenv("V13_MARGIN_UNDER30_PCT", "15.0"))
+    V13_MARGIN_UNDER30_MAX: float = float(os.getenv("V13_MARGIN_UNDER30_MAX", "4.0"))
+    # $30-$50:  12% margin, max $6
+    V13_MARGIN_30_50_PCT: float = float(os.getenv("V13_MARGIN_30_50_PCT", "12.0"))
+    V13_MARGIN_30_50_MAX: float = float(os.getenv("V13_MARGIN_30_50_MAX", "6.0"))
+    # $50-$200: 8% margin
+    V13_MARGIN_50_200_PCT: float = float(os.getenv("V13_MARGIN_50_200_PCT", "8.0"))
+    # $200-$1000: 5% margin
+    V13_MARGIN_200_1000_PCT: float = float(os.getenv("V13_MARGIN_200_1000_PCT", "5.0"))
+    # $1000+: 5% margin
+    V13_MARGIN_OVER1000_PCT: float = float(os.getenv("V13_MARGIN_OVER1000_PCT", "5.0"))
+
+    # ── V13 Confidence Boost (Patch 5: explicit caps) ─────────────────────
+    # Grade C (72-84): no boost — base only
+    # Grade B / Strong (85-88): +2% margin, hard capped at tier_max + 2%
+    V13_BOOST_STRONG_ADD_PCT: float = float(os.getenv("V13_BOOST_STRONG_ADD_PCT", "2.0"))
+    # Grade A / Elite (89+): +3% margin, hard capped at tier_max + 3%
+    V13_BOOST_ELITE_ADD_PCT: float = float(os.getenv("V13_BOOST_ELITE_ADD_PCT", "3.0"))
+    # Absolute hard cap: no single trade uses more than this % of balance regardless of boosts
+    V13_MARGIN_ABSOLUTE_CAP_PCT: float = float(os.getenv("V13_MARGIN_ABSOLUTE_CAP_PCT", "15.0"))
+
+    # ── V13 TP/SL (ROI %, Patch 2: dynamic scalp TP by confidence) ───────
+    # Scalp TP scales with confidence:
+    V13_SCALP_TP_ROI_72: float = float(os.getenv("V13_SCALP_TP_ROI_72", "15.0"))   # conf 72-76
+    V13_SCALP_TP_ROI_77: float = float(os.getenv("V13_SCALP_TP_ROI_77", "18.0"))   # conf 77-82
+    V13_SCALP_TP_ROI_83: float = float(os.getenv("V13_SCALP_TP_ROI_83", "20.0"))   # conf 83-88
+    V13_SCALP_TP_ROI_89: float = float(os.getenv("V13_SCALP_TP_ROI_89", "22.0"))   # conf 89+
+    V13_SCALP_SL_ROI: float = float(os.getenv("V13_SCALP_SL_ROI", "9.0"))          # fixed
+    # Swing / Sniper (fixed ROI targets)
+    V13_SWING_TP_ROI: float = float(os.getenv("V13_SWING_TP_ROI", "35.0"))
+    V13_SWING_SL_ROI: float = float(os.getenv("V13_SWING_SL_ROI", "12.0"))
+    V13_SNIPER_TP_ROI: float = float(os.getenv("V13_SNIPER_TP_ROI", "50.0"))
+    V13_SNIPER_SL_ROI: float = float(os.getenv("V13_SNIPER_SL_ROI", "15.0"))
+
+    # ── V13 Break-Even ROI Triggers (per mode) ────────────────────────────
+    V13_SCALP_BE_TRIGGER_ROI: float = float(os.getenv("V13_SCALP_BE_TRIGGER_ROI", "10.0"))
+    V13_SWING_BE_TRIGGER_ROI: float = float(os.getenv("V13_SWING_BE_TRIGGER_ROI", "18.0"))
+    V13_SNIPER_BE_TRIGGER_ROI: float = float(os.getenv("V13_SNIPER_BE_TRIGGER_ROI", "25.0"))
+    # Fee buffer added to breakeven price to cover round-trip fees
+    V13_FEE_BUFFER_PCT: float = float(os.getenv("V13_FEE_BUFFER_PCT", "0.12"))   # 0.12% round-trip
+
+    # ── V13 Anti-Reverse Momentum Exit (Part 5) ───────────────────────────
+    V13_MOMENTUM_EXIT_ENABLED: bool = os.getenv("V13_MOMENTUM_EXIT_ENABLED", "true").lower() == "true"
+    # Minimum ROI that must have been achieved before momentum check activates
+    V13_MOMENTUM_MIN_PEAK_ROI: float = float(os.getenv("V13_MOMENTUM_MIN_PEAK_ROI", "5.0"))
+    # Exit if ROI retraces more than this % from peak
+    V13_MOMENTUM_RETRACE_PCT: float = float(os.getenv("V13_MOMENTUM_RETRACE_PCT", "40.0"))
+    # RSI threshold: exit long if RSI drops below this while in profit
+    V13_MOMENTUM_RSI_EXIT_LONG: float = float(os.getenv("V13_MOMENTUM_RSI_EXIT_LONG", "45.0"))
+    V13_MOMENTUM_RSI_EXIT_SHORT: float = float(os.getenv("V13_MOMENTUM_RSI_EXIT_SHORT", "55.0"))
+
+    # ── V13 Fee/Slippage Profitability Filter (Patch 4) ──────────────────
+    V13_FEE_FILTER_ENABLED: bool = os.getenv("V13_FEE_FILTER_ENABLED", "true").lower() == "true"
+    V13_TAKER_FEE_PCT: float = float(os.getenv("V13_TAKER_FEE_PCT", "0.04"))       # 0.04% per side
+    V13_SLIPPAGE_EST_PCT: float = float(os.getenv("V13_SLIPPAGE_EST_PCT", "0.05")) # estimated slippage
+    # Skip trade if net ROI after fees < this value
+    V13_MIN_NET_ROI_AFTER_FEES: float = float(os.getenv("V13_MIN_NET_ROI_AFTER_FEES", "3.0"))
+
+    # ── V13 Learning Engine (Patch 3) ────────────────────────────────────
+    V13_LEARNING_TRADE_INTERVAL: int = int(os.getenv("V13_LEARNING_TRADE_INTERVAL", "20"))  # every 20 trades
+    V13_LEARNING_WEEKLY_ENABLED: bool = os.getenv("V13_LEARNING_WEEKLY_ENABLED", "true").lower() == "true"
+    V13_LEARNING_AUTO_DISABLE_WEIGHT: float = float(os.getenv("V13_LEARNING_AUTO_DISABLE_WEIGHT", "0.3"))
+
     def __post_init__(self):
         self.EXCLUDED_COINS = []
 

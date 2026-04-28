@@ -61,7 +61,7 @@ class TelegramNotifier:
         confidence: int,
         executed_count: int,
         skipped_count: int,
-        skip_reasons: dict,        # {"daily target": 2, "low balance": 1}
+        skip_reasons: dict,
         entry_price: float,
         fill_price: float,
         leverage: int,
@@ -69,13 +69,15 @@ class TelegramNotifier:
         stop_loss: float,
         tp_pct: float = 0.0,
         sl_pct: float = 0.0,
+        # V13 additions
+        tp_roi_pct: float = 0.0,
+        sl_roi_pct: float = 0.0,
+        margin_pct: float = 0.0,
         reason: str = "",
         setup_grade: str = "",
         order_method: str = "MARKET",
-        # V5 additions
         strategy_type: str = "",
         regime: str = "",
-        # V5.5 additions (kept for API compat with /execute-full, but not used by /execute-multi)
         sl_attached: bool = True,
         tp_attached: bool = True,
         sl_order_id: str = "",
@@ -84,8 +86,7 @@ class TelegramNotifier:
         partial_tp_enabled: bool = False,
         tp1_price: float = 0.0,
         tp2_price: float = 0.0,
-        # V10: Two-Engine Architecture
-        protection_mode: str = "",  # "external_engine" = Protection Engine manages TP/SL
+        protection_mode: str = "",
     ):
         """
         V10: Single clean Telegram message for executed trades.
@@ -176,6 +177,15 @@ class TelegramNotifier:
             rr_line = f"\nR:R = <b>1:{risk_reward:.1f}</b>"
 
         # V5.5: Partial TP display
+        # V13: ROI-based TP/SL display
+        if tp_roi_pct > 0 and sl_roi_pct > 0:
+            roi_tag = f" [ROI: +{tp_roi_pct:.0f}% / -{sl_roi_pct:.0f}%]"
+        else:
+            roi_tag = ""
+
+        # V13: Margin % display
+        margin_line = f"\nMargin: <b>{margin_pct:.1f}%</b>" if margin_pct > 0 else ""
+
         if partial_tp_enabled and tp1_price > 0:
             tp_block = (
                 f"TP Mode: <b>📊 Partial (40/30/30)</b>\n"
@@ -186,7 +196,7 @@ class TelegramNotifier:
             )
         else:
             tp_block = (
-                f"TP: <b>${take_profit:,.6f}</b>{tp_pct_str}\n"
+                f"TP: <b>${take_profit:,.6f}</b>{tp_pct_str}{roi_tag}\n"
                 f"SL: <b>${stop_loss:,.6f}</b>{sl_pct_str}"
             )
 
@@ -202,7 +212,8 @@ class TelegramNotifier:
             f"Skipped Accounts: <b>{skipped_count}</b>\n\n"
             f"Entry: <b>${display_price:,.6f}</b>\n"
             f"Leverage: <b>{leverage}x</b>\n"
-            f"Method: <b>{order_method}</b>\n\n"
+            f"Method: <b>{order_method}</b>"
+            f"{margin_line}\n\n"
             f"{tp_block}"
             f"{rr_line}\n\n"
             f"<b>Protection:</b>\n{tp_sl_status}"
@@ -242,6 +253,7 @@ class TelegramNotifier:
             "tp_hit": "TAKE PROFIT",
             "sl_hit": "STOP LOSS",
             "trailing_exit": "TRAILING EXIT",
+            "momentum_exit": "MOMENTUM EXIT 🛑",   # V13 anti-reverse
             "manual": "MANUAL CLOSE",
         }
         reason_display = reason_map.get(close_reason, close_reason.upper())
