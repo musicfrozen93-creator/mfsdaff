@@ -326,6 +326,193 @@ class TelegramNotifier:
         await self.send(msg)
 
 
+    # ═══════════════════════════════════════════════════════════════════
+    # V14: SIGNAL-FIRST ARCHITECTURE
+    #   Phase 1 → send_signal_detected()  fires BEFORE account execution
+    #   Phase 2 → send_execution_followup() fires only if accounts fill
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def send_signal_detected(
+        self,
+        symbol: str,
+        side: str,
+        confidence: int,
+        strategy_type: str = "",
+        regime: str = "",
+        setup_grade: str = "",
+        entry_price: float = 0.0,
+        take_profit: float = 0.0,
+        stop_loss: float = 0.0,
+        tp_pct: float = 0.0,
+        sl_pct: float = 0.0,
+        tp_roi_pct: float = 0.0,
+        sl_roi_pct: float = 0.0,
+        leverage_suggestion: str = "",
+        reason: str = "",
+    ):
+        """
+        V14 Phase 1: Send signal alert BEFORE Binance execution is attempted.
+        Fires for every valid setup that passes all AI / confidence / filter gates.
+        Execution may or may not happen afterward — signal is always sent here first.
+        """
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+
+        # Strategy display
+        if strategy_type.startswith("swing"):
+            strat_display = "🌊 Swing"
+        elif strategy_type.startswith("sniper"):
+            strat_display = "🎯 Sniper"
+        else:
+            strat_display = "⚡ Scalp"
+
+        # Grade line
+        grade_emoji = {"A": "⭐", "B": "🔷", "C": "🔸"}.get(setup_grade, "")
+        grade_line = f"\nGrade: <b>{grade_emoji} {setup_grade}</b>" if setup_grade else ""
+
+        # Regime line
+        regime_display = ""
+        if regime:
+            regime_map = {
+                "TRENDING_BULL": "🟢 Trending Bull",
+                "TRENDING_BEAR": "🔴 Trending Bear",
+                "SIDEWAYS_RANGE": "↔️ Sideways",
+                "BREAKOUT_EXPANSION": "💥 Breakout",
+                "HIGH_VOLATILITY": "⚠️ High Volatility",
+                "DEAD_MARKET": "💤 Dead Market",
+            }
+            regime_display = regime_map.get(regime, regime)
+        regime_line = f"\nRegime: <b>{regime_display}</b>" if regime_display else ""
+
+        # Entry / TP / SL block
+        entry_str = f"${entry_price:,.6f}" if entry_price > 0 else "market"
+        lev_str = leverage_suggestion if leverage_suggestion else "auto"
+
+        tp_line = ""
+        if take_profit > 0:
+            tp_pct_tag = f" (+{tp_pct:.2f}%)" if tp_pct > 0 else ""
+            roi_tag = f" [ROI +{tp_roi_pct:.0f}%]" if tp_roi_pct > 0 else ""
+            tp_line = f"\nTP: <b>${take_profit:,.6f}</b>{tp_pct_tag}{roi_tag}"
+
+        sl_line = ""
+        if stop_loss > 0:
+            sl_pct_tag = f" (-{sl_pct:.2f}%)" if sl_pct > 0 else ""
+            sl_line = f"\nSL: <b>${stop_loss:,.6f}</b>{sl_pct_tag}"
+
+        # Reason block
+        reason_block = f"\n\n<b>Reason:</b>\n<i>{reason[:300]}</i>" if reason else ""
+
+        msg = (
+            f"📡 <b>SIGNAL DETECTED</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Confidence: <b>{confidence}%</b>"
+            f"{grade_line}\n"
+            f"Type: <b>{strat_display}</b>"
+            f"{regime_line}\n\n"
+            f"Entry Zone: <b>{entry_str}</b>\n"
+            f"Leverage Suggestion: <b>{lev_str}</b>"
+            f"{tp_line}"
+            f"{sl_line}\n\n"
+            f"Execution Status: <i>Attempting account execution…</i>"
+            f"{reason_block}"
+        )
+        try:
+            await self.send(msg)
+        except Exception as e:
+            logger.error(f"[V14] send_signal_detected failed: {e}")
+
+    async def send_execution_followup(
+        self,
+        symbol: str,
+        side: str,
+        executed_count: int,
+        skipped_count: int = 0,
+        fill_price: float = 0.0,
+        entry_price: float = 0.0,
+        leverage: int = 0,
+        take_profit: float = 0.0,
+        stop_loss: float = 0.0,
+        strategy_type: str = "",
+    ):
+        """
+        V14 Phase 2: Short follow-up sent ONLY when at least one account fills.
+        Keeps signal and execution as two separate messages.
+        """
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        display_price = fill_price if fill_price > 0 else entry_price
+        price_str = f"${display_price:,.6f}" if display_price > 0 else "—"
+        lev_str = f"{leverage}x" if leverage > 0 else "—"
+
+        tp_line = f"\nTP: <b>${take_profit:,.6f}</b>" if take_profit > 0 else ""
+        sl_line = f"\nSL: <b>${stop_loss:,.6f}</b>" if stop_loss > 0 else ""
+
+        if strategy_type.startswith("swing"):
+            note = "<i>🌊 Swing PM is now monitoring this position.</i>"
+        elif strategy_type.startswith("sniper"):
+            note = "<i>🎯 Sniper PM is monitoring this position.</i>"
+        else:
+            note = "<i>⚡ Scalp PM is monitoring this position.</i>"
+
+        skip_note = f"\nSkipped Accounts: <b>{skipped_count}</b>" if skipped_count > 0 else ""
+
+        msg = (
+            f"✅ <b>ACCOUNT ENTRY EXECUTED</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Accounts Filled: <b>{executed_count}</b>"
+            f"{skip_note}\n"
+            f"Entry: <b>{price_str}</b>\n"
+            f"Leverage: <b>{lev_str}</b>"
+            f"{tp_line}"
+            f"{sl_line}\n\n"
+            f"{note}"
+        )
+        try:
+            await self.send(msg)
+        except Exception as e:
+            logger.error(f"[V14] send_execution_followup failed: {e}")
+
+    async def send_no_execution_signal(
+        self,
+        symbol: str,
+        side: str,
+        confidence: int,
+        skip_reasons: dict,
+        strategy_type: str = "",
+    ):
+        """
+        V14: Update the original signal message to show that no account filled.
+        Called after the account loop finishes with zero executions, so signal
+        subscribers know the setup was valid but accounts could not trade.
+        """
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        skip_summary = ", ".join(
+            f"{cnt} {cat.lower()}" for cat, cnt in skip_reasons.items()
+        ) if skip_reasons else "account-side conditions"
+
+        if strategy_type.startswith("swing"):
+            type_str = "Swing"
+        elif strategy_type.startswith("sniper"):
+            type_str = "Sniper"
+        else:
+            type_str = "Scalp"
+
+        msg = (
+            f"📡 <b>SIGNAL UPDATE — No Account Execution</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Confidence: <b>{confidence}%</b>\n"
+            f"Type: <b>{type_str}</b>\n\n"
+            f"Execution Status: <b>No account trade opened</b>\n"
+            f"Reason: <i>{skip_summary}</i>\n\n"
+            f"<i>Signal was valid. Account-side conditions prevented entry.\n"
+            f"Signal followers may enter manually.</i>"
+        )
+        try:
+            await self.send(msg)
+        except Exception as e:
+            logger.error(f"[V14] send_no_execution_signal failed: {e}")
+
     async def trade_skipped(self, symbol: str, reason: str, account_label: str = ""):
         """Single-account skip notification. V4: No account label shown."""
         msg = (

@@ -734,6 +734,67 @@ async def _execute_multi_inner(req: MultiExecuteRequest):
         f"fee_impact={pre_check.fee_impact_pct:.1f}%"
     )
 
+    # ── V14 Phase 1: Send signal alert NOW — before any account execution ──
+    # Fires for every valid setup that passes all gates above.
+    # Failsafe: wrapped in try/except so Telegram failure never blocks execution.
+    _signal_lev_suggestion = ""
+    _signal_tp = 0.0
+    _signal_sl = 0.0
+    _signal_tp_pct = 0.0
+    _signal_sl_pct = 0.0
+    _signal_tp_roi = 0.0
+    _signal_sl_roi = 0.0
+    _signal_grade = req.indicators.get("setup_grade", "C")
+    try:
+        # Use risk engine to estimate TP/SL for the signal message
+        # (no real account balance needed — use a representative $100 balance)
+        _sig_precision = await scanner_executor.get_precision(symbol)
+        _sig_params = risk_engine.calculate(
+            symbol=symbol, side=side, confidence=req.confidence,
+            entry_price=entry_price, atr_pct=req.atr_pct,
+            account_balance=100.0,  # representative only
+            min_notional=_sig_precision.min_notional,
+            min_qty=_sig_precision.min_qty,
+            step_size=_sig_precision.step_size,
+            quantity_precision=_sig_precision.quantity_precision,
+            price_precision=_sig_precision.price_precision,
+            strategy_type=req.strategy_type,
+        )
+        if _sig_params.approved:
+            _signal_tp = _sig_params.take_profit
+            _signal_sl = _sig_params.stop_loss
+            _signal_tp_pct = _sig_params.tp_pct
+            _signal_sl_pct = _sig_params.sl_pct
+            _signal_tp_roi = getattr(_sig_params, 'tp_roi_pct', 0.0)
+            _signal_sl_roi = getattr(_sig_params, 'sl_roi_pct', 0.0)
+            _signal_grade = _sig_params.setup_grade
+            _lev = _sig_params.leverage
+            _signal_lev_suggestion = f"{max(1, _lev - 2)}x–{_lev}x"
+    except Exception as _sig_err:
+        logger.warning(f"[V14] Signal TP/SL estimation failed (non-critical): {_sig_err}")
+
+    try:
+        await telegram.send_signal_detected(
+            symbol=symbol,
+            side=side,
+            confidence=req.confidence,
+            strategy_type=req.strategy_type,
+            regime=req.regime,
+            setup_grade=_signal_grade,
+            entry_price=entry_price,
+            take_profit=_signal_tp,
+            stop_loss=_signal_sl,
+            tp_pct=_signal_tp_pct,
+            sl_pct=_signal_sl_pct,
+            tp_roi_pct=_signal_tp_roi,
+            sl_roi_pct=_signal_sl_roi,
+            leverage_suggestion=_signal_lev_suggestion,
+            reason=req.reason,
+        )
+        logger.info(f"[V14 SIGNAL] 📡 Signal alert sent for {symbol} {side} conf={req.confidence}")
+    except Exception as _tg_err:
+        logger.error(f"[V14 SIGNAL] Phase 1 Telegram failed (non-critical, execution continues): {_tg_err}")
+
     # ── Execute for each account (hardened loop) ─────────────────────
     executed = []
     skipped = []
@@ -1161,55 +1222,54 @@ async def _execute_multi_inner(req: MultiExecuteRequest):
         logger.warning(f"Failed to save skips to DB: {e}")
 
     # ═════════════════════════════════════════════════════════════════
-    # V4: ONE TELEGRAM MESSAGE (or nothing)
+    # V14: PHASE 2 — Post-execution Telegram (signal already sent above)
     # ═════════════════════════════════════════════════════════════════
 
     executed_count = len(executed)
     skipped_count = len(skipped)
 
     if executed_count > 0:
-        # At least one account traded -- send execution result
+        # Phase 2a: At least one account filled — send short follow-up.
+        # Signal message was already sent in Phase 1 above.
         display_fill = best_fill_price if best_fill_price > 0 else entry_price
+        try:
+            await telegram.send_execution_followup(
+                symbol=symbol,
+                side=side,
+                executed_count=executed_count,
+                skipped_count=skipped_count,
+                fill_price=display_fill,
+                entry_price=entry_price,
+                leverage=best_leverage,
+                take_profit=best_tp,
+                stop_loss=best_sl,
+                strategy_type=req.strategy_type,
+            )
+            logger.info(
+                f"[V14 EXEC] ✅ Execution follow-up sent: {symbol} {side} "
+                f"filled={executed_count} skipped={skipped_count}"
+            )
+        except Exception as _tg_err2:
+            logger.error(f"[V14 EXEC] Phase 2 follow-up Telegram failed: {_tg_err2}")
 
-        await telegram.send_execution_result(
-            symbol=symbol,
-            side=side,
-            confidence=req.confidence,
-            executed_count=executed_count,
-            skipped_count=skipped_count,
-            skip_reasons=skip_reasons_map,
-            entry_price=entry_price,
-            fill_price=display_fill,
-            leverage=best_leverage,
-            take_profit=best_tp,
-            stop_loss=best_sl,
-            tp_pct=best_tp_pct,
-            sl_pct=best_sl_pct,
-            tp_roi_pct=best_tp_roi_pct,
-            sl_roi_pct=best_sl_roi_pct,
-            margin_pct=best_margin_pct,
-            margin_usdt=best_margin_usdt,       # V13 Part H
-            account_balance=best_balance,        # V13 Part H
-            reason=req.reason,
-            setup_grade=best_grade,
-            order_method=best_order_method,
-            strategy_type=req.strategy_type,
-            regime=req.regime,
-            risk_reward=best_rr,
-            # V10: Protection Engine manages TP/SL -- no attachment flags
-            protection_mode="external_engine",
-        )
     elif skipped_count > 0:
-        # V4: All accounts skipped — send compact no-execution message
-        # Only if there were real accounts to try
-        await telegram.send_no_execution(
-            symbol=symbol,
-            side=side,
-            confidence=req.confidence,
-            skipped_count=skipped_count,
-            skip_reasons=skip_reasons_map,
-        )
-    # else: No accounts at all — don't send anything
+        # Phase 2b: All accounts skipped — update signal with no-execution note.
+        # Signal message was already sent in Phase 1; this clarifies the outcome.
+        try:
+            await telegram.send_no_execution_signal(
+                symbol=symbol,
+                side=side,
+                confidence=req.confidence,
+                skip_reasons=skip_reasons_map,
+                strategy_type=req.strategy_type,
+            )
+            logger.info(
+                f"[V14 SKIP] 📡 Signal no-execution update sent: {symbol} {side} "
+                f"skipped={skipped_count} reasons={skip_reasons_map}"
+            )
+        except Exception as _tg_err3:
+            logger.error(f"[V14 SKIP] Phase 2 no-execution Telegram failed: {_tg_err3}")
+    # else: No accounts found at all — signal already sent in Phase 1, no follow-up needed
 
     logger.info(
         f"📊 Multi-account result: {executed_count} executed, {skipped_count} skipped "
