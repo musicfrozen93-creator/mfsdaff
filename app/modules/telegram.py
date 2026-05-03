@@ -349,11 +349,16 @@ class TelegramNotifier:
         sl_roi_pct: float = 0.0,
         leverage_suggestion: str = "",
         reason: str = "",
+        # V15: pullback zone bounds
+        entry_zone_low: float = 0.0,
+        entry_zone_high: float = 0.0,
+        pullback_monitoring: bool = False,
     ):
         """
-        V14 Phase 1: Send signal alert BEFORE Binance execution is attempted.
+        V15 Phase 1: Send signal alert BEFORE Binance execution is attempted.
         Fires for every valid setup that passes all AI / confidence / filter gates.
         Execution may or may not happen afterward — signal is always sent here first.
+        Shows Entry Zone as a range (signal_price ± pullback %) for pullback mode.
         """
         direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
 
@@ -383,20 +388,34 @@ class TelegramNotifier:
             regime_display = regime_map.get(regime, regime)
         regime_line = f"\nRegime: <b>{regime_display}</b>" if regime_display else ""
 
-        # Entry / TP / SL block
-        entry_str = f"${entry_price:,.6f}" if entry_price > 0 else "market"
+        # V15: Entry zone — show range if pullback monitoring, else single price
+        if pullback_monitoring and entry_zone_low > 0 and entry_zone_high > 0:
+            zone_str = f"<b>${min(entry_zone_low, entry_zone_high):,.6f} – ${max(entry_zone_low, entry_zone_high):,.6f}</b>"
+        elif entry_price > 0:
+            zone_str = f"<b>${entry_price:,.6f}</b>"
+        else:
+            zone_str = "<b>market</b>"
+
         lev_str = leverage_suggestion if leverage_suggestion else "auto"
 
+        # V15: TP/SL shown as percentages (fixed model)
         tp_line = ""
-        if take_profit > 0:
-            tp_pct_tag = f" (+{tp_pct:.2f}%)" if tp_pct > 0 else ""
-            roi_tag = f" [ROI +{tp_roi_pct:.0f}%]" if tp_roi_pct > 0 else ""
-            tp_line = f"\nTP: <b>${take_profit:,.6f}</b>{tp_pct_tag}{roi_tag}"
+        if tp_pct > 0:
+            tp_line = f"\nTP: <b>{tp_pct:.0f}%</b>"
+            if take_profit > 0:
+                tp_line += f" (${take_profit:,.6f})"
 
         sl_line = ""
-        if stop_loss > 0:
-            sl_pct_tag = f" (-{sl_pct:.2f}%)" if sl_pct > 0 else ""
-            sl_line = f"\nSL: <b>${stop_loss:,.6f}</b>{sl_pct_tag}"
+        if sl_pct > 0:
+            sl_line = f"\nSL: <b>{sl_pct:.0f}%</b>"
+            if stop_loss > 0:
+                sl_line += f" (${stop_loss:,.6f})"
+
+        # V15: Execution status
+        if pullback_monitoring:
+            exec_status = "<i>⏳ Monitoring for pullback entry…</i>"
+        else:
+            exec_status = "<i>Attempting account execution…</i>"
 
         # Reason block
         reason_block = f"\n\n<b>Reason:</b>\n<i>{reason[:300]}</i>" if reason else ""
@@ -405,21 +424,21 @@ class TelegramNotifier:
             f"📡 <b>SIGNAL DETECTED</b>\n\n"
             f"Coin: <b>{symbol}</b>\n"
             f"Side: <b>{direction}</b>\n"
-            f"Confidence: <b>{confidence}%</b>"
-            f"{grade_line}\n"
             f"Type: <b>{strat_display}</b>"
-            f"{regime_line}\n\n"
-            f"Entry Zone: <b>{entry_str}</b>\n"
+            f"{grade_line}"
+            f"{regime_line}\n"
+            f"Confidence: <b>{confidence}%</b>\n\n"
+            f"Entry Zone: {zone_str}\n"
             f"Leverage Suggestion: <b>{lev_str}</b>"
             f"{tp_line}"
             f"{sl_line}\n\n"
-            f"Execution Status: <i>Attempting account execution…</i>"
+            f"Execution Status: {exec_status}"
             f"{reason_block}"
         )
         try:
             await self.send(msg)
         except Exception as e:
-            logger.error(f"[V14] send_signal_detected failed: {e}")
+            logger.error(f"[V15] send_signal_detected failed: {e}")
 
     async def send_execution_followup(
         self,
@@ -512,6 +531,102 @@ class TelegramNotifier:
             await self.send(msg)
         except Exception as e:
             logger.error(f"[V14] send_no_execution_signal failed: {e}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # V15: Pullback Monitor Outcome Notifications
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def send_signal_timeout(
+        self,
+        symbol: str,
+        side: str,
+        confidence: int,
+        strategy_type: str = "",
+        signal_price: float = 0.0,
+        timeout_minutes: int = 15,
+    ):
+        """
+        V15: Fired when a pending signal expires without a pullback entry.
+        Informs followers that the setup was valid but entry window closed.
+        """
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        if strategy_type.startswith("swing"):
+            type_str = "🌊 Swing"
+        elif strategy_type.startswith("sniper"):
+            type_str = "🎯 Sniper"
+        else:
+            type_str = "⚡ Scalp"
+
+        timeout_str = f"{timeout_minutes}m" if timeout_minutes < 60 else f"{timeout_minutes // 60}h"
+        price_line = f"\nSignal Price: <b>${signal_price:,.6f}</b>" if signal_price > 0 else ""
+
+        msg = (
+            f"⏱️ <b>SIGNAL EXPIRED — No Entry</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Type: <b>{type_str}</b>\n"
+            f"Confidence: <b>{confidence}%</b>"
+            f"{price_line}\n\n"
+            f"Timeout: <b>{timeout_str}</b> elapsed without pullback\n"
+            f"Execution Status: <b>Cancelled — entry window closed</b>\n\n"
+            f"<i>No trade was opened. The setup may re-appear on next scan.</i>"
+        )
+        try:
+            await self.send(msg)
+        except Exception as e:
+            logger.error(f"[V15] send_signal_timeout failed: {e}")
+
+    async def send_signal_cancelled(
+        self,
+        symbol: str,
+        side: str,
+        confidence: int,
+        strategy_type: str = "",
+        signal_price: float = 0.0,
+        current_price: float = 0.0,
+        cancel_reason: str = "anti_chase",
+    ):
+        """
+        V15: Fired when anti-chase rule triggers — price ran away from signal zone.
+        LONG: price rose >2% above signal → skip to avoid chasing.
+        SHORT: price fell >2% below signal → skip.
+        """
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        if strategy_type.startswith("swing"):
+            type_str = "🌊 Swing"
+        else:
+            type_str = "⚡ Scalp"
+
+        price_line = ""
+        if signal_price > 0 and current_price > 0:
+            move_pct = abs(current_price - signal_price) / signal_price * 100
+            price_line = (
+                f"\nSignal Price: <b>${signal_price:,.6f}</b>\n"
+                f"Current Price: <b>${current_price:,.6f}</b>\n"
+                f"Price Move: <b>{move_pct:.2f}%</b>"
+            )
+
+        reason_display = {
+            "anti_chase": "Price ran away from entry zone (+2% anti-chase rule)",
+            "price_too_high": "LONG: price rose above signal zone — not pulling back",
+            "price_too_low": "SHORT: price fell below signal zone — not bouncing",
+        }.get(cancel_reason, cancel_reason)
+
+        msg = (
+            f"🚫 <b>SIGNAL CANCELLED — Anti-Chase</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Type: <b>{type_str}</b>\n"
+            f"Confidence: <b>{confidence}%</b>"
+            f"{price_line}\n\n"
+            f"Reason: <i>{reason_display}</i>\n"
+            f"Execution Status: <b>Cancelled — will not chase</b>\n\n"
+            f"<i>Protecting against bad entry. Waiting for next valid setup.</i>"
+        )
+        try:
+            await self.send(msg)
+        except Exception as e:
+            logger.error(f"[V15] send_signal_cancelled failed: {e}")
 
     async def trade_skipped(self, symbol: str, reason: str, account_label: str = ""):
         """Single-account skip notification. V4: No account label shown."""

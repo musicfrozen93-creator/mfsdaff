@@ -35,6 +35,29 @@ from app.config import settings
 from app.database import async_session
 from app.models.user import Account, ApiConnection
 from app.models.trading import Signal, Trade, TradeSkip, OpenPosition
+from datetime import datetime, timezone
+
+# ── V15: Pending Signal Store (in-memory) ───────────────────────────────
+# Keyed by symbol. Signals expire after SCALP_TIMEOUT_MINUTES or SWING_TIMEOUT_MINUTES.
+# Each entry: { symbol, side, signal_price, strategy_type, confidence,
+#               tp_pct, sl_pct, stored_at, indicators, regime, reason, atr_pct }
+_pending_signals: dict[str, dict] = {}
+
+# V15: Fixed SL/TP percentages (price-based, not ROI-based)
+_SCALP_TP_PCT  = 15.0   # +15% from entry
+_SCALP_SL_PCT  =  5.0   # -5% from entry
+_SWING_TP_PCT  = 40.0   # +40% from entry
+_SWING_SL_PCT  = 30.0   # -30% from entry
+
+# V15: Pullback ranges for entry zone display
+_SCALP_PULLBACK_MIN = 2.0   # 2% min pullback for scalp
+_SCALP_PULLBACK_MAX = 5.0   # 5% max pullback for scalp
+_SWING_PULLBACK_MIN = 5.0   # 5% min pullback for swing
+_SWING_PULLBACK_MAX = 12.0  # 12% max pullback for swing
+
+# V15: Timeout windows
+_SCALP_TIMEOUT_MINUTES = 15
+_SWING_TIMEOUT_MINUTES = 240  # 4 hours
 from app.utils.subscription_guard import check_account_eligible
 
 router = APIRouter()
@@ -79,6 +102,8 @@ class MultiExecuteRequest(BaseModel):
     indicators: dict = {}
     strategy_type: str = "scalp_trend_pullback"
     regime: str = ""
+    # V15: when True, skip Phase-1 signal Telegram (n8n already sent it)
+    skip_signal_telegram: bool = False
 
     # V13: Coerce numeric fields sent as strings from n8n
     @field_validator("confidence", mode="before")
@@ -734,66 +759,66 @@ async def _execute_multi_inner(req: MultiExecuteRequest):
         f"fee_impact={pre_check.fee_impact_pct:.1f}%"
     )
 
-    # ── V14 Phase 1: Send signal alert NOW — before any account execution ──
+    # ── V15 Phase 1: Send signal alert NOW — before any account execution ──
     # Fires for every valid setup that passes all gates above.
+    # V15: skip if n8n already sent signal (skip_signal_telegram=True) to avoid duplicates.
     # Failsafe: wrapped in try/except so Telegram failure never blocks execution.
     _signal_lev_suggestion = ""
-    _signal_tp = 0.0
-    _signal_sl = 0.0
-    _signal_tp_pct = 0.0
-    _signal_sl_pct = 0.0
-    _signal_tp_roi = 0.0
-    _signal_sl_roi = 0.0
     _signal_grade = req.indicators.get("setup_grade", "C")
-    try:
-        # Use risk engine to estimate TP/SL for the signal message
-        # (no real account balance needed — use a representative $100 balance)
-        _sig_precision = await scanner_executor.get_precision(symbol)
-        _sig_params = risk_engine.calculate(
-            symbol=symbol, side=side, confidence=req.confidence,
-            entry_price=entry_price, atr_pct=req.atr_pct,
-            account_balance=100.0,  # representative only
-            min_notional=_sig_precision.min_notional,
-            min_qty=_sig_precision.min_qty,
-            step_size=_sig_precision.step_size,
-            quantity_precision=_sig_precision.quantity_precision,
-            price_precision=_sig_precision.price_precision,
-            strategy_type=req.strategy_type,
-        )
-        if _sig_params.approved:
-            _signal_tp = _sig_params.take_profit
-            _signal_sl = _sig_params.stop_loss
-            _signal_tp_pct = _sig_params.tp_pct
-            _signal_sl_pct = _sig_params.sl_pct
-            _signal_tp_roi = getattr(_sig_params, 'tp_roi_pct', 0.0)
-            _signal_sl_roi = getattr(_sig_params, 'sl_roi_pct', 0.0)
-            _signal_grade = _sig_params.setup_grade
-            _lev = _sig_params.leverage
-            _signal_lev_suggestion = f"{max(1, _lev - 2)}x–{_lev}x"
-    except Exception as _sig_err:
-        logger.warning(f"[V14] Signal TP/SL estimation failed (non-critical): {_sig_err}")
+    _is_swing_signal = req.strategy_type.lower().startswith("swing")
 
+    # V15: Fixed SL/TP for signal display
+    _sig_tp_pct = _SWING_TP_PCT if _is_swing_signal else _SCALP_TP_PCT
+    _sig_sl_pct = _SWING_SL_PCT if _is_swing_signal else _SCALP_SL_PCT
+    _sig_pullback_max = _SWING_PULLBACK_MAX if _is_swing_signal else _SCALP_PULLBACK_MAX
+
+    # V15: Calculate entry zone (signal_price ± pullback range)
+    _zone_low  = entry_price * (1 - _sig_pullback_max / 100) if side == "BUY" else entry_price
+    _zone_high = entry_price if side == "BUY" else entry_price * (1 + _sig_pullback_max / 100)
+
+    # V15: Calculate TP/SL absolute prices for signal display
+    if side == "BUY":
+        _signal_tp = entry_price * (1 + _sig_tp_pct / 100)
+        _signal_sl = entry_price * (1 - _sig_sl_pct / 100)
+    else:
+        _signal_tp = entry_price * (1 - _sig_tp_pct / 100)
+        _signal_sl = entry_price * (1 + _sig_sl_pct / 100)
+
+    # Leverage suggestion via risk engine (non-critical)
     try:
-        await telegram.send_signal_detected(
-            symbol=symbol,
-            side=side,
-            confidence=req.confidence,
-            strategy_type=req.strategy_type,
-            regime=req.regime,
-            setup_grade=_signal_grade,
-            entry_price=entry_price,
-            take_profit=_signal_tp,
-            stop_loss=_signal_sl,
-            tp_pct=_signal_tp_pct,
-            sl_pct=_signal_sl_pct,
-            tp_roi_pct=_signal_tp_roi,
-            sl_roi_pct=_signal_sl_roi,
-            leverage_suggestion=_signal_lev_suggestion,
-            reason=req.reason,
-        )
-        logger.info(f"[V14 SIGNAL] 📡 Signal alert sent for {symbol} {side} conf={req.confidence}")
-    except Exception as _tg_err:
-        logger.error(f"[V14 SIGNAL] Phase 1 Telegram failed (non-critical, execution continues): {_tg_err}")
+        _sig_lev = risk_engine.get_leverage(req.confidence, req.strategy_type, req.atr_pct)
+        _signal_lev_suggestion = f"{max(1, _sig_lev - 2)}x–{_sig_lev}x"
+        _signal_grade = req.indicators.get("setup_grade", "C")
+    except Exception as _sig_err:
+        logger.warning(f"[V15] Signal leverage estimation failed (non-critical): {_sig_err}")
+
+    if not req.skip_signal_telegram:
+        try:
+            await telegram.send_signal_detected(
+                symbol=symbol,
+                side=side,
+                confidence=req.confidence,
+                strategy_type=req.strategy_type,
+                regime=req.regime,
+                setup_grade=_signal_grade,
+                entry_price=entry_price,
+                take_profit=_signal_tp,
+                stop_loss=_signal_sl,
+                tp_pct=_sig_tp_pct,
+                sl_pct=_sig_sl_pct,
+                tp_roi_pct=0.0,
+                sl_roi_pct=0.0,
+                leverage_suggestion=_signal_lev_suggestion,
+                reason=req.reason,
+                entry_zone_low=_zone_low,
+                entry_zone_high=_zone_high,
+                pullback_monitoring=True,
+            )
+            logger.info(f"[V15 SIGNAL] 📡 Signal alert sent for {symbol} {side} conf={req.confidence}")
+        except Exception as _tg_err:
+            logger.error(f"[V15 SIGNAL] Phase 1 Telegram failed (non-critical, execution continues): {_tg_err}")
+    else:
+        logger.info(f"[V15 SIGNAL] skip_signal_telegram=True — signal already sent by n8n for {symbol} {side}")
 
     # ── Execute for each account (hardened loop) ─────────────────────
     executed = []
@@ -929,6 +954,39 @@ async def _execute_multi_inner(req: MultiExecuteRequest):
                     size_multiplier=size_multiplier,
                     strategy_type=req.strategy_type,
                 )
+
+                # ── 5.5 V15: Override SL/TP with fixed percentages ─────
+                # Preserves risk engine sizing/leverage; only replaces TP/SL prices.
+                _is_swing_trade = req.strategy_type.lower().startswith("swing")
+                _tp_pct_fixed = _SWING_TP_PCT if _is_swing_trade else _SCALP_TP_PCT
+                _sl_pct_fixed = _SWING_SL_PCT if _is_swing_trade else _SCALP_SL_PCT
+
+                if trade_params.approved:
+                    try:
+                        _ep = result.fill_price if hasattr(result, 'fill_price') and result.fill_price else entry_price
+                        if side == "BUY":
+                            trade_params.take_profit = round(
+                                entry_price * (1 + _tp_pct_fixed / 100), precision.price_precision
+                            )
+                            trade_params.stop_loss = round(
+                                entry_price * (1 - _sl_pct_fixed / 100), precision.price_precision
+                            )
+                        else:  # SELL
+                            trade_params.take_profit = round(
+                                entry_price * (1 - _tp_pct_fixed / 100), precision.price_precision
+                            )
+                            trade_params.stop_loss = round(
+                                entry_price * (1 + _sl_pct_fixed / 100), precision.price_precision
+                            )
+                        trade_params.tp_pct = _tp_pct_fixed
+                        trade_params.sl_pct = _sl_pct_fixed
+                        logger.info(
+                            f"  [V15 SL/TP] {internal_label}: {'swing' if _is_swing_trade else 'scalp'} "
+                            f"TP={_tp_pct_fixed}% → ${trade_params.take_profit} | "
+                            f"SL={_sl_pct_fixed}% → ${trade_params.stop_loss}"
+                        )
+                    except Exception as _tpsl_err:
+                        logger.warning(f"  [V15 SL/TP] Override failed (non-critical): {_tpsl_err}")
 
                 # ── 5.5 V13: V7_MAX_LEVERAGE cap removed — V13 tiers handle leverage ──
                 # Previously capped at V7_MAX_LEVERAGE=7, now up to 15x by confidence tier
@@ -2000,3 +2058,256 @@ async def count_open_positions():
             "binance_live_count": binance_live_total, "truth_source": truth_source,
             "error": str(e),
         }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# V15: PENDING SIGNAL STORE — Pullback Entry System
+# ═══════════════════════════════════════════════════════════════════════
+
+class SignalStoreRequest(BaseModel):
+    symbol: str
+    side: str              # BUY | SELL
+    signal_price: float
+    strategy_type: str = "scalp_trend_pullback"
+    confidence: int = 70
+    reason: str = ""
+    regime: str = ""
+    atr_pct: float = 0.0
+    indicators: dict = {}
+    send_telegram: bool = True   # if False, just store (no Telegram)
+
+    @field_validator("symbol", mode="before")
+    @classmethod
+    def _norm_sym(cls, v): return str(v).upper().strip() if v else "UNKNOWN"
+
+    @field_validator("side", mode="before")
+    @classmethod
+    def _norm_side(cls, v): return str(v).upper().strip() if v else "BUY"
+
+    @field_validator("strategy_type", mode="before")
+    @classmethod
+    def _norm_strat(cls, v):
+        if not v or not isinstance(v, str):
+            return "scalp_trend_pullback"
+        v = v.strip().lower().replace(" ", "_")
+        # Map bare words to canonical form
+        if v in ("scalp", "scalping"):
+            return "scalp_trend_pullback"
+        if v in ("swing", "swinging"):
+            return "swing_trend_continuation"
+        return v
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _norm_conf(cls, v):
+        try: return int(float(str(v)))
+        except: return 70
+
+    @field_validator("signal_price", "atr_pct", mode="before")
+    @classmethod
+    def _norm_float(cls, v):
+        try: return float(str(v))
+        except: return 0.0
+
+    @field_validator("indicators", mode="before")
+    @classmethod
+    def _norm_ind(cls, v):
+        if not v: return {}
+        if isinstance(v, str):
+            import json
+            try: return json.loads(v)
+            except: return {}
+        return v if isinstance(v, dict) else {}
+
+
+@router.post("/signals/store")
+async def store_pending_signal(req: SignalStoreRequest):
+    """
+    V15: Store a pending signal in the in-memory pullback queue.
+    Optionally sends the SIGNAL DETECTED Telegram alert immediately.
+    Called by n8n BEFORE the pullback monitoring loop.
+
+    Timeout: scalp = 15 min, swing = 4 hours.
+    Only one pending signal per symbol is kept (newer overwrites older).
+    """
+    telegram = TelegramNotifier()
+    _is_swing = req.strategy_type.lower().startswith("swing")
+
+    tp_pct  = _SWING_TP_PCT  if _is_swing else _SCALP_TP_PCT
+    sl_pct  = _SWING_SL_PCT  if _is_swing else _SCALP_SL_PCT
+    pb_max  = _SWING_PULLBACK_MAX if _is_swing else _SCALP_PULLBACK_MAX
+    timeout = _SWING_TIMEOUT_MINUTES if _is_swing else _SCALP_TIMEOUT_MINUTES
+
+    now = datetime.now(timezone.utc)
+
+    # Compute entry zone
+    if req.side == "BUY":
+        zone_low  = req.signal_price * (1 - pb_max / 100)
+        zone_high = req.signal_price
+        tp_price  = req.signal_price * (1 + tp_pct / 100)
+        sl_price  = req.signal_price * (1 - sl_pct / 100)
+    else:
+        zone_low  = req.signal_price
+        zone_high = req.signal_price * (1 + pb_max / 100)
+        tp_price  = req.signal_price * (1 - tp_pct / 100)
+        sl_price  = req.signal_price * (1 + sl_pct / 100)
+
+    signal_data = {
+        "symbol":        req.symbol,
+        "side":          req.side,
+        "signal_price":  req.signal_price,
+        "strategy_type": req.strategy_type,
+        "confidence":    req.confidence,
+        "reason":        req.reason,
+        "regime":        req.regime,
+        "atr_pct":       req.atr_pct,
+        "indicators":    req.indicators,
+        "tp_pct":        tp_pct,
+        "sl_pct":        sl_pct,
+        "tp_price":      tp_price,
+        "sl_price":      sl_price,
+        "zone_low":      zone_low,
+        "zone_high":     zone_high,
+        "timeout_minutes": timeout,
+        "stored_at":     now.isoformat(),
+        "is_swing":      _is_swing,
+    }
+
+    _pending_signals[req.symbol] = signal_data
+    logger.info(
+        f"[V15 STORE] Signal stored: {req.symbol} {req.side} "
+        f"{'swing' if _is_swing else 'scalp'} conf={req.confidence} "
+        f"price={req.signal_price} zone={zone_low:.6f}–{zone_high:.6f} "
+        f"timeout={timeout}m"
+    )
+
+    # Send Telegram signal alert
+    if req.send_telegram:
+        try:
+            await telegram.send_signal_detected(
+                symbol=req.symbol,
+                side=req.side,
+                confidence=req.confidence,
+                strategy_type=req.strategy_type,
+                regime=req.regime,
+                setup_grade=req.indicators.get("setup_grade", "C"),
+                entry_price=req.signal_price,
+                take_profit=tp_price,
+                stop_loss=sl_price,
+                tp_pct=tp_pct,
+                sl_pct=sl_pct,
+                tp_roi_pct=0.0,
+                sl_roi_pct=0.0,
+                leverage_suggestion="",
+                reason=req.reason,
+                entry_zone_low=zone_low,
+                entry_zone_high=zone_high,
+                pullback_monitoring=True,
+            )
+            logger.info(f"[V15 STORE] 📡 Signal Telegram sent for {req.symbol}")
+        except Exception as tg_err:
+            logger.error(f"[V15 STORE] Telegram failed (non-critical): {tg_err}")
+
+    return {
+        "status": "stored",
+        "symbol": req.symbol,
+        "side": req.side,
+        "signal_price": req.signal_price,
+        "strategy_type": req.strategy_type,
+        "tp_pct": tp_pct,
+        "sl_pct": sl_pct,
+        "tp_price": tp_price,
+        "sl_price": sl_price,
+        "zone_low": zone_low,
+        "zone_high": zone_high,
+        "timeout_minutes": timeout,
+        "expires_at": (now.replace(microsecond=0).isoformat()),
+    }
+
+
+@router.get("/signals/pending")
+async def get_pending_signals(type: Optional[str] = None):
+    """
+    V15: Return all non-expired pending signals.
+    Called by n8n each scan cycle to check for pullback entry opportunities.
+
+    Query param:
+      type=scalp  → only scalp/sniper pending signals
+      type=swing  → only swing pending signals
+      (omit)      → all
+
+    Also prunes expired signals from the store.
+    """
+    now = datetime.now(timezone.utc)
+    active = []
+    expired_keys = []
+
+    for sym, sig in list(_pending_signals.items()):
+        try:
+            stored_at = datetime.fromisoformat(sig["stored_at"])
+            if stored_at.tzinfo is None:
+                stored_at = stored_at.replace(tzinfo=timezone.utc)
+            elapsed_minutes = (now - stored_at).total_seconds() / 60
+            timeout = sig.get("timeout_minutes", _SCALP_TIMEOUT_MINUTES)
+
+            if elapsed_minutes > timeout:
+                expired_keys.append(sym)
+                logger.info(
+                    f"[V15 PENDING] Signal {sym} expired ({elapsed_minutes:.1f}m > {timeout}m)"
+                )
+                continue
+
+            sig_out = {**sig, "elapsed_minutes": round(elapsed_minutes, 1)}
+
+            if type == "scalp" and sig.get("is_swing"):
+                continue
+            elif type == "swing" and not sig.get("is_swing"):
+                continue
+
+            active.append(sig_out)
+        except Exception as parse_err:
+            logger.warning(f"[V15 PENDING] Error reading signal {sym}: {parse_err}")
+            expired_keys.append(sym)
+
+    # Auto-prune expired
+    for k in expired_keys:
+        _pending_signals.pop(k, None)
+
+    return {
+        "status": "ok",
+        "count": len(active),
+        "signals": active,
+        "type_filter": type,
+    }
+
+
+@router.delete("/signals/cancel/{symbol}")
+async def cancel_pending_signal(symbol: str, reason: str = "manual"):
+    """
+    V15: Remove a pending signal (anti-chase, timeout, or manual).
+    Called by n8n when anti-chase rule triggers or timeout window closes.
+    """
+    sym = symbol.upper().strip()
+    sig = _pending_signals.pop(sym, None)
+    if sig:
+        logger.info(f"[V15 CANCEL] Signal {sym} removed. reason={reason}")
+        return {"status": "cancelled", "symbol": sym, "reason": reason}
+    return {"status": "not_found", "symbol": sym}
+
+
+# ─── GET /price/{symbol} ─────────────────────────────────────────────
+
+@router.get("/price/{symbol}")
+async def get_symbol_price(symbol: str):
+    """
+    V15: Return current Binance mark price for a symbol.
+    Used by n8n pullback monitor to check entry conditions each loop iteration.
+    """
+    sym = symbol.upper().strip()
+    try:
+        executor_inst = BinanceExecutor()
+        price = await executor_inst.get_market_price(sym)
+        return {"status": "ok", "symbol": sym, "price": price}
+    except Exception as e:
+        logger.error(f"[V15 PRICE] Failed to get price for {sym}: {e}")
+        return {"status": "error", "symbol": sym, "price": 0.0, "error": str(e)}
