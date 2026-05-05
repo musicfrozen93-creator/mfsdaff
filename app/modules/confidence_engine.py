@@ -635,11 +635,13 @@ class ConfidenceEngine:
             raw_score -= eq_penalty
             penalty_descriptions.append(f"entry quality penalty -{eq_penalty}")
 
-        # ── Step 6: HARD CLAMP to 0-100 ──────────────────────────────
-        final_score = max(0, min(int(round(raw_score)), 100))
+        # ── Step 6: HARD CLAMP to 0-92 (V16: realistic ceiling) ────────
+        # Max 92 — signals never appear "100% sure" which is unrealistic.
+        # BTC directional multiplier is applied AFTER this at the /signal level.
+        final_score = max(0, min(int(round(raw_score)), 92))
 
         # ── Step 7: Determine tier ────────────────────────────────────
-        if final_score >= 90:
+        if final_score >= 88:
             tier = "ELITE"
         elif final_score >= 80:
             tier = "STRONG"
@@ -655,7 +657,7 @@ class ConfidenceEngine:
 
         # ── Build reason string ───────────────────────────────────────
         reason_parts = [
-            f"V7 confidence={final_score} [{tier}]",
+            f"V16 confidence={final_score} [{tier}]",
             f"T:{trend_score:.0f}/25",
             f"V:{volume_score:.0f}/20",
             f"M:{momentum_score:.0f}/15",
@@ -667,6 +669,7 @@ class ConfidenceEngine:
             reason_parts.append(f"bonus: {', '.join(bonus_descriptions)}")
         if penalty_descriptions:
             reason_parts.append(f"penalty: {', '.join(penalty_descriptions)}")
+        # Note: BTC directional multiplier applied at /signal endpoint
 
         breakdown = {
             "trend": round(trend_score, 1),

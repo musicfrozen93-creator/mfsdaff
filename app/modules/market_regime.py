@@ -96,7 +96,152 @@ class MarketRegimeRouter:
             resp.raise_for_status()
             return resp.json()
 
+    # ─── V16: BTC Directional Bias ────────────────────────────────────
+
+    # Cache bias for 3 minutes (more responsive than 10-min regime cache)
+    _btc_bias_cache: dict = {}
+    _btc_bias_cache_ts: float = 0.0
+    BTC_BIAS_CACHE_TTL: float = 180.0  # 3 minutes
+
+    async def get_btc_directional_bias(self) -> dict:
+        """
+        V16: Multi-timeframe BTC directional bias filter.
+
+        Checks:
+          1. EMA50 / EMA200 on 1h (macro trend)
+          2. 1m / 5m / 15m EMA9 vs EMA21 alignment
+          3. HH/HL structure (bullish) vs LH/LL structure (bearish)
+          4. ATR-based volatility spike detection
+
+        Returns:
+          {
+            "bias": "BULLISH" | "BEARISH" | "NEUTRAL",
+            "volatility_high": bool,
+            "long_confidence_multiplier": float,   # apply to LONG signals
+            "short_confidence_multiplier": float,  # apply to SHORT signals
+            "reason": str,
+          }
+        """
+        import time as _time
+        now = _time.time()
+        if self._btc_bias_cache and (now - self._btc_bias_cache_ts) < self.BTC_BIAS_CACHE_TTL:
+            return self._btc_bias_cache
+
+        try:
+            import asyncio as _asyncio
+            raw_1h, raw_15m, raw_5m, raw_1m = await _asyncio.gather(
+                self._fetch_btc_candles("1h", 210),
+                self._fetch_btc_candles("15m", 50),
+                self._fetch_btc_candles("5m", 50),
+                self._fetch_btc_candles("1m", 30),
+            )
+
+            def _closes(raw): return np.array([float(k[4]) for k in raw])
+            def _highs(raw):  return np.array([float(k[2]) for k in raw])
+            def _lows(raw):   return np.array([float(k[3]) for k in raw])
+
+            # ── 1H: EMA50 / EMA200 macro trend ───────────────────────
+            c1h = _closes(raw_1h)
+            ema50  = self._ema(c1h, 50)[-1]
+            ema200 = self._ema(c1h, 200)[-1]
+            price_1h = c1h[-1]
+            macro_bull = ema50 > ema200 and price_1h > ema50
+            macro_bear = ema50 < ema200 and price_1h < ema50
+
+            # ── Multi-TF EMA9 vs EMA21 alignment ─────────────────────
+            def tf_trend(raw):
+                c = _closes(raw)
+                e9  = self._ema(c, 9)[-1]
+                e21 = self._ema(c, 21)[-1]
+                if e9 > e21 and c[-1] > e9:
+                    return "BULL"
+                elif e9 < e21 and c[-1] < e9:
+                    return "BEAR"
+                return "NEUTRAL"
+
+            t15 = tf_trend(raw_15m)
+            t5  = tf_trend(raw_5m)
+            t1  = tf_trend(raw_1m)
+            bull_count = sum(1 for t in [t15, t5, t1] if t == "BULL")
+            bear_count = sum(1 for t in [t15, t5, t1] if t == "BEAR")
+
+            # ── HH/HL vs LH/LL structure (15m) ───────────────────────
+            h15 = _highs(raw_15m)[-10:]
+            l15 = _lows(raw_15m)[-10:]
+            hh_hl = h15[-1] > h15[-3] and l15[-1] > l15[-3]   # Higher High + Higher Low
+            lh_ll = h15[-1] < h15[-3] and l15[-1] < l15[-3]   # Lower High + Lower Low
+
+            # ── ATR volatility spike (1h) ─────────────────────────────
+            atr_1h = self._atr(_highs(raw_1h), _lows(raw_1h), c1h, 14)
+            atr_pct_1h = (atr_1h / price_1h) * 100 if price_1h > 0 else 0
+            volatility_high = atr_pct_1h > 3.0
+
+            # ── 5-min BTC move: >1.5% in last 5 minutes = volatile stop ───────
+            c5m = _closes(raw_5m)
+            btc_5m_move = abs((c5m[-1] - c5m[-2]) / c5m[-2] * 100) if len(c5m) >= 2 else 0.0
+            btc_5m_volatile = btc_5m_move > 1.5
+            if btc_5m_volatile:
+                logger.warning(
+                    f"  ⚠️ V16 BTC 5m spike: {btc_5m_move:.2f}% — signals PAUSED"
+                )
+
+            # ── Decide bias ───────────────────────────────────────────
+            bull_score = (2 if macro_bull else 0) + bull_count + (1 if hh_hl else 0)
+            bear_score = (2 if macro_bear else 0) + bear_count + (1 if lh_ll else 0)
+
+            if bull_score >= 4:
+                bias = "BULLISH"
+                long_mult  = 1.0
+                short_mult = 0.75   # reduce SHORT confidence 25% in bull market
+                reason = f"BTC bullish: macro={'bull' if macro_bull else 'bear'} TF={bull_count}/3 bull HH/HL={hh_hl}"
+            elif bear_score >= 4:
+                bias = "BEARISH"
+                long_mult  = 0.75   # reduce LONG confidence 25% in bear market
+                short_mult = 1.0
+                reason = f"BTC bearish: macro={'bear' if macro_bear else 'bull'} TF={bear_count}/3 bear LH/LL={lh_ll}"
+            else:
+                bias = "NEUTRAL"
+                long_mult  = 1.0
+                short_mult = 1.0
+                reason = f"BTC neutral: bull_score={bull_score} bear_score={bear_score}"
+
+            if volatility_high:
+                reason += f" | HIGH VOLATILITY (ATR%={atr_pct_1h:.2f})"
+            if btc_5m_volatile:
+                reason += f" | BTC 5m SPIKE +{btc_5m_move:.2f}%"
+
+            result = {
+                "bias": bias,
+                "volatility_high": volatility_high,
+                "btc_5m_volatile": btc_5m_volatile,
+                "btc_5m_move_pct": round(btc_5m_move, 3),
+                "long_confidence_multiplier": long_mult,
+                "short_confidence_multiplier": short_mult,
+                "reason": reason,
+                "bull_score": bull_score,
+                "bear_score": bear_score,
+                "atr_pct_1h": round(atr_pct_1h, 3),
+            }
+            logger.info(f"  🔶 V16 BTC Bias: {bias} | {reason}")
+            self._btc_bias_cache = result
+            self._btc_bias_cache_ts = now
+            return result
+
+        except Exception as e:
+            logger.warning(f"V16 BTC bias detection failed: {e} — using NEUTRAL")
+            result = {
+                "bias": "NEUTRAL", "volatility_high": False,
+                "btc_5m_volatile": False, "btc_5m_move_pct": 0.0,
+                "long_confidence_multiplier": 1.0, "short_confidence_multiplier": 1.0,
+                "reason": f"Detection failed: {str(e)[:60]}", "bull_score": 0, "bear_score": 0,
+                "atr_pct_1h": 0.0,
+            }
+            self._btc_bias_cache = result
+            self._btc_bias_cache_ts = now
+            return result
+
     # ─── Main Detection ───────────────────────────────────────────────
+
 
     async def detect_regime(self, force_refresh: bool = False) -> MarketRegime:
         """

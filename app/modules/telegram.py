@@ -983,3 +983,306 @@ class TelegramNotifier:
             f"<i>Position Manager will attempt to reconcile automatically.</i>"
         )
         return await self.send(msg)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # V16: Signal Engine — Pure Signal Messages (no execution)
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def send_signal_alert(
+        self,
+        signal_number: int,
+        symbol: str,
+        side: str,
+        confidence: int,
+        entry_price: float,
+        entry_zone_low: float,
+        entry_zone_high: float,
+        tp_price: float,
+        sl_price: float,
+        tp_pct: float,
+        sl_pct: float,
+        strategy_type: str = "",
+        setup_grade: str = "",
+        regime: str = "",
+        btc_bias: str = "NEUTRAL",
+        reason: str = "",
+        atr_pct: float = 0.0,
+        risk_reward: float = 0.0,
+    ) -> bool:
+        """
+        V16: Primary signal alert — sent once when a valid signal is detected.
+        Shows signal number, direction, full entry zone, TP/SL, and BTC bias alignment.
+        """
+        direction  = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        num_str    = f"#{signal_number:03d}"
+
+        # Strategy display
+        if strategy_type.startswith("swing"):
+            strat_emoji = "🌊 Swing"
+        elif strategy_type.startswith("sniper"):
+            strat_emoji = "🎯 Sniper"
+        else:
+            strat_emoji = "⚡ Scalp"
+
+        # Grade
+        grade_emoji = {"A": "⭐", "B": "🔷", "C": "🔸"}.get(setup_grade, "")
+        grade_line  = f"\nGrade: <b>{grade_emoji} {setup_grade}</b>" if setup_grade else ""
+
+        # Regime
+        regime_map = {
+            "TRENDING_BULL":      "🟢 Trending Bull",
+            "TRENDING_BEAR":      "🔴 Trending Bear",
+            "SIDEWAYS_RANGE":     "↔️ Sideways",
+            "BREAKOUT_EXPANSION": "💥 Breakout",
+            "HIGH_VOLATILITY":    "⚠️ High Volatility",
+            "DEAD_MARKET":        "💤 Dead Market",
+        }
+        regime_line = f"\nRegime: <b>{regime_map.get(regime, regime)}</b>" if regime else ""
+
+        # Entry zone
+        if entry_zone_low > 0 and entry_zone_high > 0:
+            zone_str = f"<b>${min(entry_zone_low, entry_zone_high):,.6f} – ${max(entry_zone_low, entry_zone_high):,.6f}</b>"
+        else:
+            zone_str = f"<b>${entry_price:,.6f}</b>"
+
+        # BTC bias alignment
+        bias_map = {
+            "BULLISH": "🟢 Bullish ✓" if side == "BUY" else "🟢 Bullish ⚠️",
+            "BEARISH": "🔴 Bearish ✓" if side == "SELL" else "🔴 Bearish ⚠️",
+            "NEUTRAL": "⬜ Neutral",
+        }
+        btc_line = f"\nBTC Bias: <b>{bias_map.get(btc_bias, btc_bias)}</b>"
+
+        # TP/SL lines
+        tp_sign = "+" if side == "BUY" else "-"
+        sl_sign = "-" if side == "BUY" else "+"
+        tp_line = f"TP: <b>${tp_price:,.6f}</b> ({tp_sign}{tp_pct:.1f}%)"
+        sl_line = f"SL: <b>${sl_price:,.6f}</b> ({sl_sign}{sl_pct:.1f}%)"
+
+        # R:R
+        rr_line = f"\nR:R = <b>1:{risk_reward:.1f}</b>" if risk_reward > 0 else ""
+
+        # ATR
+        atr_line = f"\nATR: <b>{atr_pct:.2f}%</b>" if atr_pct > 0 else ""
+
+        # Reason
+        reason_block = f"\n\n<b>AI Reason:</b>\n<i>{reason[:280]}</i>" if reason else ""
+
+        msg = (
+            f"📡 <b>SIGNAL {num_str}</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Direction: <b>{direction}</b>\n"
+            f"Type: <b>{strat_emoji}</b>"
+            f"{grade_line}"
+            f"{regime_line}"
+            f"{btc_line}"
+            f"\nConfidence: <b>{confidence}%</b>\n\n"
+            f"Entry Zone: {zone_str}\n"
+            f"{tp_line}\n"
+            f"{sl_line}"
+            f"{rr_line}"
+            f"{atr_line}"
+            f"{reason_block}"
+        )
+        try:
+            return await self.send(msg)
+        except Exception as e:
+            logger.error(f"[V16] send_signal_alert failed: {e}")
+            return False
+
+    async def send_signal_entry_triggered(
+        self,
+        signal_number: int,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        tp_price: float,
+        sl_price: float,
+    ) -> bool:
+        """V16: Fired when price enters the entry zone for a pending signal."""
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        num_str   = f"#{signal_number:03d}"
+        msg = (
+            f"✅ <b>ENTRY TRIGGERED — Signal {num_str}</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Direction: <b>{direction}</b>\n"
+            f"Entry @ <b>${entry_price:,.6f}</b>\n\n"
+            f"TP: <b>${tp_price:,.6f}</b>\n"
+            f"SL: <b>${sl_price:,.6f}</b>\n\n"
+            f"<i>Virtual trade opened — monitoring TP/SL…</i>"
+        )
+        try:
+            return await self.send(msg)
+        except Exception as e:
+            logger.error(f"[V16] send_signal_entry_triggered failed: {e}")
+            return False
+
+    async def send_signal_status_update(
+        self,
+        signal_number: int,
+        symbol: str,
+        side: str,
+        status: str,
+        current_price: float,
+        entry_price: float,
+        drawdown_pct: float,
+    ) -> bool:
+        """V16: Drawdown warning update for an active signal."""
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        num_str   = f"#{signal_number:03d}"
+        warn_level = "⚠️" if abs(drawdown_pct) < 15 else "🚨"
+        dd_str = f"{drawdown_pct:.1f}%"
+        msg = (
+            f"{warn_level} <b>Signal {num_str} UPDATE</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Direction: <b>{direction}</b>\n"
+            f"Status: <b>In Drawdown ({dd_str})</b>\n\n"
+            f"Current: <b>${current_price:,.6f}</b>\n"
+            f"Entry:   <b>${entry_price:,.6f}</b>\n\n"
+            f"<i>Signal still active — SL not hit yet.</i>"
+        )
+        try:
+            return await self.send(msg)
+        except Exception as e:
+            logger.error(f"[V16] send_signal_status_update failed: {e}")
+            return False
+
+    async def send_signal_result(
+        self,
+        signal_number: int,
+        symbol: str,
+        side: str,
+        result: str,
+        entry_price: float,
+        close_price: float,
+        tp_pct: float,
+        sl_pct: float,
+        duration_minutes: int = 0,
+    ) -> bool:
+        """V16: Final outcome message for a closed signal (TP or SL)."""
+        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+        num_str   = f"#{signal_number:03d}"
+
+        if result == "TP":
+            emoji   = "✅"
+            verdict = "TP HIT"
+            move_pct = tp_pct
+        else:
+            emoji   = "❌"
+            verdict = "SL HIT"
+            move_pct = -sl_pct
+
+        pct_str = f"{move_pct:+.1f}%"
+        dur_str = ""
+        if duration_minutes > 0:
+            h, m = divmod(duration_minutes, 60)
+            dur_str = f"\nDuration: <b>{h}h {m}m</b>" if h > 0 else f"\nDuration: <b>{m}m</b>"
+
+        msg = (
+            f"{emoji} <b>{verdict} — Signal {num_str}</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Direction: <b>{direction}</b>\n\n"
+            f"Entry: <b>${entry_price:,.6f}</b>\n"
+            f"Close: <b>${close_price:,.6f}</b>"
+            f"{dur_str}\n\n"
+            f"Result: <b>{pct_str}</b>"
+        )
+        try:
+            return await self.send(msg)
+        except Exception as e:
+            logger.error(f"[V16] send_signal_result failed: {e}")
+            return False
+
+    async def send_reversal_warning(
+        self,
+        invalidated_number: int,
+        symbol: str,
+        old_side: str,
+    ) -> bool:
+        """V16: Notify when an existing signal is invalidated by an opposite signal."""
+        old_dir = "🟢 LONG" if old_side == "BUY" else "🔴 SHORT"
+        new_dir = "🔴 SHORT" if old_side == "BUY" else "🟢 LONG"
+        num_str = f"#{invalidated_number:03d}"
+        msg = (
+            f"⚠️ <b>REVERSAL — Signal {num_str} INVALIDATED</b>\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Was: <b>{old_dir}</b>\n"
+            f"New Direction: <b>{new_dir}</b>\n\n"
+            f"<i>Opposite signal detected — previous setup cancelled.</i>"
+        )
+        try:
+            return await self.send(msg)
+        except Exception as e:
+            logger.error(f"[V16] send_reversal_warning failed: {e}")
+            return False
+
+    async def send_quiet_market(self, active_signals: int = 0) -> bool:
+        """
+        V16: Sent at most once every 15 minutes when no high-quality signals found.
+        Suppresses per-cycle spam. Shows count of still-active signals.
+        """
+        active_line = (
+            f"\n<i>⏳ {active_signals} signal(s) still being monitored.</i>"
+            if active_signals > 0 else ""
+        )
+        msg = (
+            f"💤 <b>Market Quiet</b>\n\n"
+            f"No high-quality signals detected this cycle.\n"
+            f"Scanning continues…{active_line}"
+        )
+        try:
+            return await self.send(msg)
+        except Exception as e:
+            logger.error(f"[V16] send_quiet_market failed: {e}")
+            return False
+
+    async def send_daily_report(
+        self,
+        date_str: str,
+        total_signals: int,
+        tp_count: int,
+        sl_count: int,
+        invalid_count: int,
+        pending_count: int,
+        win_rate: float,
+        signal_log: list[dict],
+    ) -> bool:
+        """
+        V16: Daily performance report — sent at midnight or on demand.
+        signal_log: [{"number": 1, "symbol": "ETHUSDT", "side": "BUY", "result": "TP"}, ...]
+        """
+        if total_signals == 0:
+            msg = (
+                f"📊 <b>DAILY REPORT — {date_str}</b>\n\n"
+                f"No signals generated today."
+            )
+        else:
+            # Result lines (max 20 to avoid message overflow)
+            result_emoji = {"TP": "✅", "SL": "❌", "INVALID": "⚠️", "CANCELLED": "⬜", "PENDING": "⏳"}
+            log_lines = []
+            for s in signal_log[:20]:
+                side_ch = "L" if s.get("side") == "BUY" else "S"
+                emoji   = result_emoji.get(s.get("result", "PENDING"), "⬜")
+                log_lines.append(
+                    f"  {emoji} #{s['number']:03d} {s['symbol']} {side_ch} → {s.get('result','?')}"
+                )
+            if len(signal_log) > 20:
+                log_lines.append(f"  … and {len(signal_log) - 20} more")
+
+            wr_str = f"{win_rate:.1f}%" if tp_count + sl_count > 0 else "—"
+            msg = (
+                f"📊 <b>DAILY REPORT — {date_str}</b>\n\n"
+                f"Total Signals: <b>{total_signals}</b>\n"
+                f"✅ TP Hit:       <b>{tp_count}</b>\n"
+                f"❌ SL Hit:       <b>{sl_count}</b>\n"
+                f"⚠️ Invalidated: <b>{invalid_count}</b>\n"
+                f"⏳ Still Open:  <b>{pending_count}</b>\n"
+                f"Win Rate: <b>{wr_str}</b>\n\n"
+                f"<b>Signal Log:</b>\n" +
+                "\n".join(log_lines)
+            )
+        try:
+            return await self.send(msg)
+        except Exception as e:
+            logger.error(f"[V16] send_daily_report failed: {e}")
+            return False

@@ -30,6 +30,8 @@ from app.modules.daily_guard import daily_guard
 from app.modules.strategy_tracker import strategy_tracker  # V7: per-coin cooldown
 from app.modules.learning_engine import learning_engine      # V7: adaptive learning
 from app.modules.binance_sync import get_binance_live_positions, count_all_live_positions  # V12
+from app.modules.market_regime import MarketRegimeRouter     # V16: BTC bias
+from app.modules.signal_tracker_v16 import signal_tracker_v16  # V16: virtual trade tracker
 from app.utils.state import state_manager
 from app.config import settings
 from app.database import async_session
@@ -165,6 +167,59 @@ class MultiExecuteRequest(BaseModel):
             except Exception:
                 return {}
         return v if isinstance(v, dict) else {}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# V16: Signal-Only Request Model (no Binance execution)
+# ═══════════════════════════════════════════════════════════════════════
+
+class SignalRequest(BaseModel):
+    """
+    V16: Pure signal generation request.
+    Receives output from /analyze-batch or /analyze-scalp/swing endpoints.
+    No Binance account fields needed.
+    """
+    symbol:        str
+    action:        str        # BUY | SELL
+    confidence:    Any = 70
+    reason:        str = ""
+    current_price: Any = 0.0
+    atr:           Any = 0.0
+    atr_pct:       Any = 0.0
+    spread_pct:    Any = 0.0
+    strategy_type: str = "scalp_trend_pullback"
+    regime:        str = ""
+    setup_grade:   str = ""
+    rsi:           Any = 50.0
+    # V16: optional pre-computed smart entry info from ai_engine
+    entry_confirmation_required: bool = False
+    smart_entry_reason: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_confidence(cls, v):
+        try:
+            return int(float(str(v))) if v is not None else 70
+        except (ValueError, TypeError):
+            return 70
+
+    @field_validator("current_price", "atr", "atr_pct", "spread_pct", "rsi", mode="before")
+    @classmethod
+    def coerce_float(cls, v):
+        try:
+            return float(str(v)) if v is not None else 0.0
+        except (ValueError, TypeError):
+            return 0.0
+
+    @field_validator("strategy_type", mode="before")
+    @classmethod
+    def normalize_strategy_type(cls, v):
+        if not v or not isinstance(v, str):
+            return "scalp_trend_pullback"
+        v = v.strip().lower().replace(" ", "_")
+        if any(v.startswith(p) for p in _VALID_STRATEGY_PREFIXES):
+            return v
+        return "scalp_trend_pullback"
 
     @field_validator("action", mode="before")
     @classmethod
@@ -2311,3 +2366,615 @@ async def get_symbol_price(symbol: str):
     except Exception as e:
         logger.error(f"[V15 PRICE] Failed to get price for {sym}: {e}")
         return {"status": "error", "symbol": sym, "price": 0.0, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# V16: POST /signal — Pure Signal Generation (NO Binance execution)
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.post("/signal")
+async def generate_signal(req: SignalRequest):
+    """
+    V16 Signal Engine — pure signal generation without any Binance trade execution.
+
+    Flow:
+      1. Validate action (BUY/SELL only, skip HOLD)
+      2. Fetch BTC directional bias → apply confidence multiplier
+      3. Reject if confidence < MIN_CONFIDENCE after BTC penalty
+      4. Reject if high BTC volatility + confidence < 75
+      5. Compute ATR-adjusted TP/SL (fixed % model)
+      6. Compute R:R — reject if < 2.0
+      7. Check & invalidate any opposite signals for same coin
+      8. Assign daily sequential signal number
+      9. Persist to signals table with all tracking fields
+     10. Register with SignalTracker for virtual monitoring
+     11. Send Telegram signal alert
+     12. Return signal details
+    """
+    symbol    = req.symbol.upper().strip()
+    action    = req.action.upper().strip()
+    raw_conf  = int(req.confidence)
+    price     = float(req.current_price)
+    atr_pct   = float(req.atr_pct)
+    strategy  = req.strategy_type
+    is_swing  = strategy.startswith("swing")
+
+    # 1. Skip HOLD
+    if action not in ("BUY", "SELL"):
+        return {"status": "skipped", "symbol": symbol, "reason": f"action={action} not actionable"}
+
+    if price <= 0:
+        return {"status": "error", "symbol": symbol, "reason": "current_price=0 — cannot compute TP/SL"}
+
+    # 2. BTC Directional Bias
+    btc_bias     = "NEUTRAL"
+    btc_vol_high = False
+    try:
+        regime_router = MarketRegimeRouter()
+        btc_info      = await regime_router.get_btc_directional_bias()
+        btc_bias      = btc_info.get("bias", "NEUTRAL")
+        btc_vol_high  = btc_info.get("volatility_high", False)
+
+        if action == "BUY":
+            mult = btc_info.get("long_confidence_multiplier", 1.0)
+        else:
+            mult = btc_info.get("short_confidence_multiplier", 1.0)
+
+        adj_conf = int(raw_conf * mult)
+        logger.info(
+            f"  [V16 /signal] {symbol} {action}: raw_conf={raw_conf} btc_bias={btc_bias} "
+            f"mult={mult} → adj_conf={adj_conf}"
+        )
+    except Exception as e:
+        logger.warning(f"  [V16 /signal] BTC bias failed: {e} — using raw confidence")
+        adj_conf = raw_conf
+
+    # 3. Min confidence gate
+    min_conf = settings.MIN_CONFIDENCE if hasattr(settings, "MIN_CONFIDENCE") else 65
+    if adj_conf < min_conf:
+        return {
+            "status": "rejected",
+            "symbol": symbol,
+            "reason": f"Confidence {adj_conf}% < threshold {min_conf}% after BTC bias penalty",
+            "btc_bias": btc_bias,
+            "raw_confidence": raw_conf,
+            "adj_confidence": adj_conf,
+        }
+
+    # 4. High volatility gate
+    if btc_vol_high and adj_conf < 75:
+        return {
+            "status": "rejected",
+            "symbol": symbol,
+            "reason": f"BTC high volatility + confidence {adj_conf}% < 75 — skipping risky signal",
+            "btc_bias": btc_bias,
+        }
+
+    # 5. Compute ATR-adjusted TP/SL
+    # Base %: Scalp 15%TP/5%SL, Swing 40%TP/30%SL
+    # ATR adjustment: ±20% cap on base (never go below 50% of base)
+    if is_swing:
+        base_tp_pct = _SWING_TP_PCT
+        base_sl_pct = _SWING_SL_PCT
+    else:
+        base_tp_pct = _SCALP_TP_PCT
+        base_sl_pct = _SCALP_SL_PCT
+
+    # ATR multiplier: if ATR% is high, widen TP/SL slightly (max 20% wider)
+    atr_mult = 1.0
+    if atr_pct > 0:
+        atr_mult = min(1.0 + (atr_pct - 1.5) * 0.1, 1.2)  # 1.0 – 1.2 range
+        atr_mult = max(atr_mult, 0.8)  # never shrink below 80%
+
+    tp_pct = round(base_tp_pct * atr_mult, 2)
+    sl_pct = round(base_sl_pct * atr_mult, 2)
+
+    if action == "BUY":
+        tp_price = price * (1 + tp_pct / 100)
+        sl_price = price * (1 - sl_pct / 100)
+        ez_low   = price * (1 - _SCALP_PULLBACK_MIN / 100) if not is_swing else price * (1 - _SWING_PULLBACK_MIN / 100)
+        ez_high  = price * (1 + 0.3 / 100)    # slight buffer above signal price
+    else:
+        tp_price = price * (1 - tp_pct / 100)
+        sl_price = price * (1 + sl_pct / 100)
+        ez_low   = price * (1 - 0.3 / 100)
+        ez_high  = price * (1 + (_SCALP_PULLBACK_MIN / 100)) if not is_swing else price * (1 + (_SWING_PULLBACK_MIN / 100))
+
+    # 6. R:R gate (must be ≥ 2.0)
+    rr = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0
+    if rr < 2.0:
+        return {
+            "status": "rejected",
+            "symbol": symbol,
+            "reason": f"R:R = 1:{rr:.1f} < minimum 1:2.0 — signal quality insufficient",
+        }
+
+    # 7. Invalidate opposite signals for same coin
+    telegram = TelegramNotifier()
+    try:
+        invalidated = await signal_tracker_v16.check_and_invalidate_opposite(
+            symbol=symbol, new_side=action, new_signal_id=0, telegram=telegram,
+        )
+        if invalidated:
+            logger.info(f"  [V16] Invalidated {len(invalidated)} opposite signals for {symbol}")
+    except Exception as e:
+        logger.warning(f"  [V16] Opposite-signal check failed: {e}")
+
+    # 8. Get daily signal number
+    signal_number = await signal_tracker_v16.get_next_signal_number()
+
+    # 9. Persist to DB
+    try:
+        async with async_session() as session:
+            db_signal = Signal(
+                symbol        = symbol,
+                side          = action,
+                confidence    = adj_conf,
+                reason        = req.reason[:800] if req.reason else "",
+                ai_called     = True,
+                strategy_type = strategy,
+                regime        = req.regime,
+                signal_number = signal_number,
+                entry_price   = price,
+                tp_price      = round(tp_price, 8),
+                sl_price      = round(sl_price, 8),
+                tp_pct        = tp_pct,
+                sl_pct        = sl_pct,
+                entry_zone_low  = round(ez_low, 8),
+                entry_zone_high = round(ez_high, 8),
+                status        = "PENDING",
+                atr           = float(req.atr),
+                atr_pct       = atr_pct,
+                btc_bias      = btc_bias,
+            )
+            session.add(db_signal)
+            await session.flush()   # get db_signal.id
+            signal_id = db_signal.id
+            await session.commit()
+    except Exception as e:
+        logger.error(f"  [V16] DB persist failed for {symbol}: {e}")
+        return {"status": "error", "symbol": symbol, "reason": f"DB error: {str(e)[:100]}"}
+
+    # 10. Register with SignalTracker
+    try:
+        await signal_tracker_v16.register(
+            signal_id     = signal_id,
+            signal_number = signal_number,
+            symbol        = symbol,
+            side          = action,
+            entry_price   = price,
+            entry_zone_low  = round(ez_low, 8),
+            entry_zone_high = round(ez_high, 8),
+            tp_price      = round(tp_price, 8),
+            sl_price      = round(sl_price, 8),
+            tp_pct        = tp_pct,
+            sl_pct        = sl_pct,
+            strategy_type = strategy,
+            confidence    = adj_conf,
+        )
+    except Exception as e:
+        logger.warning(f"  [V16] SignalTracker.register failed: {e}")
+
+    # 11. Telegram alert (backend is primary sender)
+    telegram_sent = False
+    try:
+        telegram_sent = await telegram.send_signal_alert(
+            signal_number   = signal_number,
+            symbol          = symbol,
+            side            = action,
+            confidence      = adj_conf,
+            entry_price     = price,
+            entry_zone_low  = round(ez_low, 8),
+            entry_zone_high = round(ez_high, 8),
+            tp_price        = round(tp_price, 8),
+            sl_price        = round(sl_price, 8),
+            tp_pct          = tp_pct,
+            sl_pct          = sl_pct,
+            strategy_type   = strategy,
+            setup_grade     = req.setup_grade,
+            regime          = req.regime,
+            btc_bias        = btc_bias,
+            reason          = req.reason,
+            atr_pct         = atr_pct,
+            risk_reward     = rr,
+        )
+    except Exception as e:
+        logger.error(f"  [V16] Telegram send_signal_alert raised: {e}")
+        telegram_sent = False
+
+    # ─ Structured debug log (always emitted) ──────────────────────────────────────
+    logger.info(
+        f"  ✅ [V16 SIGNAL] "
+        f"signal_id={signal_id} | "
+        f"signal_number={signal_number:03d} | "
+        f"symbol={symbol} | "
+        f"side={action} | "
+        f"confidence={adj_conf}% | "
+        f"btc_bias={btc_bias} | "
+        f"tp={tp_pct}% sl={sl_pct}% rr=1:{rr} | "
+        f"telegram_sent={telegram_sent}"
+    )
+    if not telegram_sent:
+        logger.warning(
+            f"  ⚠️ [V16 TELEGRAM] Backend send FAILED for #{signal_number:03d} {symbol} — "
+            f"n8n failsafe node will handle delivery."
+        )
+
+    logger.info(
+        f"  ✅ [V16] Signal #{signal_number:03d} {symbol} {action} "
+        f"conf={adj_conf}% TP={tp_pct}% SL={sl_pct}% R:R=1:{rr}"
+    )
+
+    return {
+        "status":          "signal_generated",
+        "signal_id":       signal_id,
+        "signal_number":   signal_number,
+        "symbol":          symbol,
+        "side":            action,           # n8n alias for action
+        "action":          action,
+        "trade_type":      "SWING" if is_swing else "SCALP",
+        "raw_confidence":  raw_conf,
+        "adj_confidence":  adj_conf,
+        "confidence":      adj_conf,          # convenience alias
+        "btc_bias":        btc_bias,
+        "entry_price":     price,
+        "entry_low":       round(ez_low, 6),   # n8n alias
+        "entry_high":      round(ez_high, 6),  # n8n alias
+        "entry_zone_low":  round(ez_low, 6),
+        "entry_zone_high": round(ez_high, 6),
+        "tp_price":        round(tp_price, 6),
+        "sl_price":        round(sl_price, 6),
+        "tp":              tp_pct,             # n8n alias
+        "sl":              sl_pct,             # n8n alias
+        "tp_pct":          tp_pct,
+        "sl_pct":          sl_pct,
+        "risk_reward":     rr,
+        "strategy_type":   strategy,
+        "atr_pct":         atr_pct,
+        "telegram_sent":   telegram_sent,      # n8n failsafe: send if False
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# V16: GET /signals/active — Current SignalTracker state
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.get("/signals/active")
+async def get_active_signals():
+    """V16: Return all currently tracked active signals from memory."""
+    signals = signal_tracker_v16.get_active_signals()
+    return {
+        "status":        "ok",
+        "active_count":  signal_tracker_v16.active_count(),
+        "signals":       signals,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# V16: GET /signals/daily-report — Today's signal performance
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.get("/signals/daily-report")
+async def get_daily_report(send_telegram: bool = True):
+    """
+    V16: Aggregate today's signals from DB and optionally send Telegram report.
+    Can be triggered manually or via n8n cron at midnight.
+    """
+    from datetime import date
+    today = date.today().strftime("%Y-%m-%d")
+    midnight = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
+
+    try:
+        from sqlalchemy import select as sa_select, and_
+        async with async_session() as session:
+            result = await session.execute(
+                sa_select(Signal).where(
+                    Signal.created_at >= midnight
+                ).order_by(Signal.signal_number)
+            )
+            signals_today = result.scalars().all()
+    except Exception as e:
+        return {"status": "error", "reason": f"DB query failed: {str(e)[:120]}"}
+
+    total     = len(signals_today)
+    tp_count  = sum(1 for s in signals_today if s.result == "TP")
+    sl_count  = sum(1 for s in signals_today if s.result == "SL")
+    inv_count = sum(1 for s in signals_today if s.result in ("INVALID", "CANCELLED"))
+    pending   = sum(1 for s in signals_today if s.status in ("PENDING", "ENTRY_HIT", "DRAWDOWN_10", "DRAWDOWN_20"))
+    win_rate  = (tp_count / (tp_count + sl_count) * 100) if (tp_count + sl_count) > 0 else 0.0
+
+    signal_log = [
+        {
+            "number": s.signal_number or 0,
+            "symbol": s.symbol,
+            "side":   s.side,
+            "result": s.result or ("PENDING" if s.status in ("PENDING","ENTRY_HIT","DRAWDOWN_10","DRAWDOWN_20") else s.status),
+        }
+        for s in signals_today
+    ]
+
+    if send_telegram:
+        try:
+            telegram = TelegramNotifier()
+            await telegram.send_daily_report(
+                date_str      = today,
+                total_signals = total,
+                tp_count      = tp_count,
+                sl_count      = sl_count,
+                invalid_count = inv_count,
+                pending_count = pending,
+                win_rate      = win_rate,
+                signal_log    = signal_log,
+            )
+        except Exception as e:
+            logger.error(f"[V16] Daily report Telegram failed: {e}")
+
+    return {
+        "status":       "ok",
+        "date":         today,
+        "total":        total,
+        "tp":           tp_count,
+        "sl":           sl_count,
+        "invalidated":  inv_count,
+        "pending":      pending,
+        "win_rate_pct": round(win_rate, 1),
+        "signals":      signal_log,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# V16: POST /signals/{signal_id}/trigger — Mark entry zone hit
+# Called by n8n Signal Tracking Engine every 30s
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.post("/signals/{signal_id}/trigger")
+async def trigger_signal(signal_id: int, price: float = 0.0):
+    """
+    V16 Lifecycle: Mark a PENDING signal as ENTRY_HIT.
+    Called by n8n tracking workflow when price enters the entry zone.
+    Updates DB and syncs in-memory SignalTracker state.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        async with async_session() as session:
+            sig = await session.get(Signal, signal_id)
+            if not sig:
+                return {"status": "not_found", "signal_id": signal_id}
+            if sig.status not in ("PENDING",):
+                return {"status": "already_processed", "signal_id": signal_id, "current_status": sig.status}
+
+            sig.status      = "ENTRY_HIT"
+            sig.entry_hit_at = now
+            sig.updated_at  = now
+            await session.commit()
+
+        # Sync in-memory tracker
+        state = signal_tracker_v16._signals.get(signal_id)
+        if state:
+            state.status      = "ENTRY_HIT"
+            state.entry_hit_at = now
+            state.peak_price  = price if price > 0 else state.entry_price
+            state.trough_price = price if price > 0 else state.entry_price
+
+        logger.info(f"  ✅ [V16 TRIGGER] Signal #{signal_id} ENTRY_HIT @ {price}")
+        return {
+            "status":      "triggered",
+            "signal_id":   signal_id,
+            "price":       price,
+            "triggered_at": now.isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"  [V16 TRIGGER] Failed for #{signal_id}: {e}")
+        return {"status": "error", "signal_id": signal_id, "reason": str(e)[:120]}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# V16: POST /signals/{signal_id}/close — Mark TP or SL hit
+# ═══════════════════════════════════════════════════════════════════════
+
+class SignalCloseRequest(BaseModel):
+    result:       str    # "tp" | "sl"
+    closed_price: float = 0.0
+    pnl_percent:  float = 0.0
+
+
+@router.post("/signals/{signal_id}/close")
+async def close_signal(signal_id: int, req: SignalCloseRequest):
+    """
+    V16 Lifecycle: Mark a signal as TP_HIT or SL_HIT.
+    Stores closed_price, pnl_percent, and appropriate timestamp.
+    Called by n8n tracking workflow when TP or SL price is reached.
+    """
+    result_upper = req.result.upper()
+    if result_upper not in ("TP", "SL"):
+        return {"status": "error", "reason": "result must be 'tp' or 'sl'"}
+
+    final_status = "TP_HIT" if result_upper == "TP" else "SL_HIT"
+    now = datetime.now(timezone.utc)
+
+    try:
+        async with async_session() as session:
+            sig = await session.get(Signal, signal_id)
+            if not sig:
+                return {"status": "not_found", "signal_id": signal_id}
+            if sig.status in ("TP_HIT", "SL_HIT", "INVALIDATED", "CANCELLED"):
+                return {"status": "already_closed", "signal_id": signal_id, "current_status": sig.status}
+
+            sig.status       = final_status
+            sig.result       = result_upper
+            sig.closed_price = req.closed_price
+            sig.pnl_percent  = req.pnl_percent
+            sig.closed_at    = now
+            sig.updated_at   = now
+            if result_upper == "TP":
+                sig.tp_hit_at = now
+            else:
+                sig.sl_hit_at = now
+            await session.commit()
+
+        # Remove from in-memory tracker
+        signal_tracker_v16._signals.pop(signal_id, None)
+
+        logger.info(
+            f"  {'✅' if result_upper == 'TP' else '❌'} [V16 CLOSE] "
+            f"Signal #{signal_id} {final_status} @ {req.closed_price} "
+            f"PnL={req.pnl_percent:+.2f}%"
+        )
+        return {
+            "status":       "closed",
+            "signal_id":    signal_id,
+            "result":       result_upper,
+            "final_status": final_status,
+            "closed_price": req.closed_price,
+            "pnl_percent":  req.pnl_percent,
+            "closed_at":    now.isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"  [V16 CLOSE] Failed for #{signal_id}: {e}")
+        return {"status": "error", "signal_id": signal_id, "reason": str(e)[:120]}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# V16: POST /signals/{signal_id}/invalidate — Reversal / opposite block
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.post("/signals/{signal_id}/invalidate")
+async def invalidate_signal(signal_id: int, reason: str = "reversal"):
+    """
+    V16 Lifecycle: Mark a signal as INVALIDATED due to reversal or opposite signal.
+    Called by n8n tracking workflow when a trend flip is detected.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        async with async_session() as session:
+            sig = await session.get(Signal, signal_id)
+            if not sig:
+                return {"status": "not_found", "signal_id": signal_id}
+            if sig.status in ("TP_HIT", "SL_HIT", "INVALIDATED", "CANCELLED"):
+                return {"status": "already_closed", "signal_id": signal_id, "current_status": sig.status}
+
+            sig.status        = "INVALIDATED"
+            sig.result        = "INVALID"
+            sig.invalidated_at = now
+            sig.closed_at     = now
+            sig.updated_at    = now
+            await session.commit()
+
+        # Remove from in-memory tracker
+        signal_tracker_v16._signals.pop(signal_id, None)
+
+        logger.info(f"  ⚠️ [V16 INVALIDATE] Signal #{signal_id} INVALIDATED — reason: {reason}")
+        return {
+            "status":         "invalidated",
+            "signal_id":      signal_id,
+            "reason":         reason,
+            "invalidated_at": now.isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"  [V16 INVALIDATE] Failed for #{signal_id}: {e}")
+        return {"status": "error", "signal_id": signal_id, "reason": str(e)[:120]}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# V16: GET /signals/report/yesterday — Previous day full performance
+# ═══════════════════════════════════════════════════════════════════════
+
+@router.get("/signals/report/yesterday")
+async def get_yesterday_report(send_telegram: bool = True):
+    """
+    V16: Full performance report for the PREVIOUS calendar day.
+    Includes total, TP/SL/invalid counts, win rate, best and worst trades.
+    Triggered by midnight n8n cron.
+    """
+    from datetime import date, timedelta
+    yesterday = date.today() - timedelta(days=1)
+    start = datetime.combine(yesterday, datetime.min.time()).replace(tzinfo=timezone.utc)
+    end   = datetime.combine(date.today(), datetime.min.time()).replace(tzinfo=timezone.utc)
+
+    try:
+        from sqlalchemy import select as sa_select
+        async with async_session() as session:
+            result = await session.execute(
+                sa_select(Signal)
+                .where(Signal.created_at >= start)
+                .where(Signal.created_at < end)
+                .order_by(Signal.signal_number)
+            )
+            day_signals = result.scalars().all()
+    except Exception as e:
+        return {"status": "error", "reason": f"DB failed: {str(e)[:120]}"}
+
+    total     = len(day_signals)
+    tp_sigs   = [s for s in day_signals if s.result == "TP"]
+    sl_sigs   = [s for s in day_signals if s.result == "SL"]
+    inv_sigs  = [s for s in day_signals if s.result in ("INVALID", "CANCELLED")]
+    tp_count  = len(tp_sigs)
+    sl_count  = len(sl_sigs)
+    inv_count = len(inv_sigs)
+    win_rate  = (tp_count / (tp_count + sl_count) * 100) if (tp_count + sl_count) > 0 else 0.0
+
+    # Best / Worst trade by pnl_percent
+    closed = [s for s in day_signals if s.pnl_percent is not None]
+    best_trade  = max(closed, key=lambda s: s.pnl_percent, default=None)
+    worst_trade = min(closed, key=lambda s: s.pnl_percent, default=None)
+
+    signal_log = [
+        {
+            "number": s.signal_number or 0,
+            "symbol": s.symbol,
+            "side":   s.side,
+            "result": s.result or (s.status or "PENDING"),
+            "pnl":    round(s.pnl_percent, 2) if s.pnl_percent is not None else None,
+        }
+        for s in day_signals
+    ]
+
+    best_info  = {"symbol": best_trade.symbol,  "pnl": round(best_trade.pnl_percent, 2)}  if best_trade  else None
+    worst_info = {"symbol": worst_trade.symbol, "pnl": round(worst_trade.pnl_percent, 2)} if worst_trade else None
+
+    if send_telegram and total > 0:
+        try:
+            telegram = TelegramNotifier()
+            # Build enhanced daily report message
+            lines = [
+                "📊 <b>DAILY SIGNAL REPORT</b>",
+                f"\nDate: <b>{yesterday.strftime('%Y-%m-%d')}</b>",
+                "",
+                f"Total Signals: <b>{total}</b>",
+                f"TP Hit: <b>✅ {tp_count}</b>",
+                f"SL Hit: <b>❌ {sl_count}</b>",
+                f"Invalidated: <b>⚠️ {inv_count}</b>",
+                "",
+                f"Win Rate: <b>{win_rate:.1f}%</b>",
+                "",
+                "─" * 20,
+                "",
+                "<b>Signal Results:</b>",
+            ]
+            for s in signal_log:
+                num   = f"#{s['number']:03d}" if s["number"] else "#???"
+                icon  = "✅" if s["result"] == "TP" else ("❌" if s["result"] == "SL" else "⚠️")
+                pnl_s = f" ({s['pnl']:+.1f}%)" if s["pnl"] is not None else ""
+                lines.append(f"{num} {s['symbol']} → {icon} {s['result']}{pnl_s}")
+
+            if best_info:
+                lines += ["", f"🏆 Best: <b>{best_info['symbol']}</b> +{best_info['pnl']}%"]
+            if worst_info:
+                lines += [f"💔 Worst: <b>{worst_info['symbol']}</b> {worst_info['pnl']:+.1f}%"]
+
+            await telegram.send("\n".join(lines))
+        except Exception as e:
+            logger.error(f"[V16] Yesterday report Telegram failed: {e}")
+
+    return {
+        "status":       "ok",
+        "date":         yesterday.strftime("%Y-%m-%d"),
+        "total":        total,
+        "tp":           tp_count,
+        "sl":           sl_count,
+        "invalidated":  inv_count,
+        "win_rate_pct": round(win_rate, 1),
+        "best_trade":   best_info,
+        "worst_trade":  worst_info,
+        "signals":      signal_log,
+    }

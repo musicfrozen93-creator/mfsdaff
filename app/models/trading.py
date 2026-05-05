@@ -31,6 +31,35 @@ class Signal(Base):
     regime = Column(String(30), nullable=True)           # TRENDING_BULL | TRENDING_BEAR | SIDEWAYS_RANGE | etc.
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
 
+    # V16: Signal Engine tracking fields
+    signal_number   = Column(Integer, nullable=True, index=True)     # Daily sequential #001, #002 ...
+    entry_price     = Column(Float, nullable=True)                   # Price at signal detection
+    tp_price        = Column(Float, nullable=True)                   # Take profit absolute price
+    sl_price        = Column(Float, nullable=True)                   # Stop loss absolute price
+    tp_pct          = Column(Float, nullable=True)                   # TP % from entry
+    sl_pct          = Column(Float, nullable=True)                   # SL % from entry
+    entry_zone_low  = Column(Float, nullable=True)                   # Smart entry zone lower bound
+    entry_zone_high = Column(Float, nullable=True)                   # Smart entry zone upper bound
+    # Status lifecycle: PENDING → ENTRY_HIT → TP_HIT | SL_HIT | INVALIDATED | CANCELLED
+    status          = Column(String(20), default="PENDING", nullable=True, index=True)
+    result          = Column(String(20), nullable=True)              # TP | SL | INVALID | CANCELLED
+    peak_price      = Column(Float, nullable=True)                   # Highest price seen after entry
+    trough_price    = Column(Float, nullable=True)                   # Lowest price seen after entry
+    drawdown_pct    = Column(Float, nullable=True)                   # Max drawdown observed
+    entry_hit_at    = Column(DateTime, nullable=True)                # When price entered entry zone
+    closed_at       = Column(DateTime, nullable=True)                # When signal resolved (TP/SL/etc)
+    # V16 lifecycle timestamps
+    tp_hit_at       = Column(DateTime, nullable=True)                # When TP was hit
+    sl_hit_at       = Column(DateTime, nullable=True)                # When SL was hit
+    invalidated_at  = Column(DateTime, nullable=True)                # When signal was invalidated
+    # V16 result storage
+    closed_price    = Column(Float, nullable=True)                   # Price at close (TP/SL hit)
+    pnl_percent     = Column(Float, nullable=True)                   # % PnL from entry to close
+    atr             = Column(Float, nullable=True)                   # ATR value at signal time
+    atr_pct         = Column(Float, nullable=True)                   # ATR% at signal time
+    btc_bias        = Column(String(20), nullable=True)              # BULLISH | BEARISH | NEUTRAL
+    updated_at      = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
     # Relationships
     trades = relationship("Trade", back_populates="signal", lazy="selectin")
     trade_skips = relationship("TradeSkip", back_populates="signal", lazy="selectin")
@@ -355,3 +384,19 @@ class OpenPosition(Base):
     opened_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
     closed_at = Column(DateTime, nullable=True)
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# V16 Signal Engine — Daily counter for sequential signal numbering
+# ═══════════════════════════════════════════════════════════════════════
+
+class SignalCounter(Base):
+    """
+    V16: One row per date. last_number increments for each new signal.
+    Used to produce SIGNAL #001, #002 ... that reset daily at midnight.
+    """
+    __tablename__ = "signal_counter"
+
+    id          = Column(Integer, primary_key=True, autoincrement=True)
+    date        = Column(String(10), nullable=False, unique=True, index=True)  # YYYY-MM-DD
+    last_number = Column(Integer, nullable=False, default=0)
+    created_at  = Column(DateTime, default=datetime.utcnow, nullable=False)

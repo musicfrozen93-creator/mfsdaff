@@ -368,3 +368,44 @@ ALTER TABLE trades ADD COLUMN IF NOT EXISTS opened_at         TIMESTAMP DEFAULT 
 -- Index for fast Protection Engine queries
 CREATE INDEX IF NOT EXISTS idx_trades_protection ON trades(protection_status);
 
+-- =======================================================================
+-- V16 Signal Engine — Pure signal tracking (no Binance execution)
+-- All statements are idempotent (IF NOT EXISTS / ADD COLUMN IF NOT EXISTS).
+-- =======================================================================
+
+-- signals: V16 tracking fields
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS signal_number    INTEGER;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_price      DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS tp_price         DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS sl_price         DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS tp_pct           DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS sl_pct           DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_zone_low   DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_zone_high  DOUBLE PRECISION;
+-- Status lifecycle: PENDING → ENTRY_HIT → TP_HIT | SL_HIT | INVALIDATED | CANCELLED
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS status           VARCHAR(20) DEFAULT 'PENDING';
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS result           VARCHAR(20);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS peak_price       DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS trough_price     DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS drawdown_pct     DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS entry_hit_at     TIMESTAMP;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS closed_at        TIMESTAMP;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS atr              DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS atr_pct          DOUBLE PRECISION;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS btc_bias         VARCHAR(20);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS updated_at       TIMESTAMP DEFAULT NOW();
+
+-- Indexes for signal tracker queries
+CREATE INDEX IF NOT EXISTS idx_signals_status        ON signals(status);
+CREATE INDEX IF NOT EXISTS idx_signals_signal_number ON signals(signal_number);
+CREATE INDEX IF NOT EXISTS idx_signals_updated       ON signals(updated_at);
+
+-- V16: Daily signal counter — one row per date for sequential numbering
+CREATE TABLE IF NOT EXISTS signal_counter (
+    id           SERIAL PRIMARY KEY,
+    date         VARCHAR(10) NOT NULL UNIQUE,   -- YYYY-MM-DD
+    last_number  INTEGER NOT NULL DEFAULT 0,
+    created_at   TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_signal_counter_date ON signal_counter(date);
+

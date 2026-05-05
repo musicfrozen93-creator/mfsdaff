@@ -74,6 +74,9 @@ class AIDecision:
     ai_model: str = ""
     ai_latency_ms: int = 0
     ai_fallback: bool = False
+    # V16: Smart entry detection
+    entry_confirmation_required: bool = False   # True = wait for pullback/bounce before entry
+    smart_entry_reason: str = ""                # Explanation of entry condition status
 
 
 class ScalpingEngine:
@@ -217,6 +220,68 @@ class ScalpingEngine:
         if atr <= 0:
             return False
         return body > atr * 2
+
+    # ─── V16: Smart Entry Logic ───────────────────────────────────────────
+
+    def _check_smart_entry(
+        self,
+        action: str,
+        closes: np.ndarray,
+        highs: np.ndarray,
+        rsi: float,
+        ema_fast: np.ndarray,
+        ema_slow: np.ndarray,
+        atr: float,
+    ) -> tuple[bool, str]:
+        """
+        V16: Check if price is in a valid smart-entry zone.
+        Returns (entry_confirmed: bool, reason: str).
+
+        LONG entry confirmed when ANY of:
+          • Price pulled back within 1.5% of EMA20/21
+          • RSI < 30 (oversold)
+          • Price has retraced 2–5% from recent high (last 10 bars)
+
+        SHORT entry confirmed when ANY of:
+          • Price bounced within 1.5% of EMA20/21
+          • RSI > 70 (overbought)
+        """
+        price = float(closes[-1])
+        ema_f = float(ema_fast[-1])
+        ema_s = float(ema_slow[-1])
+
+        if action == "BUY":
+            # 1. Near EMA pullback zone
+            ema_ref = max(ema_f, ema_s)
+            near_ema = price <= ema_ref * 1.015 and price >= ema_ref * 0.985
+            if near_ema:
+                return True, f"Smart entry: near EMA ({price:.4f} vs EMA {ema_ref:.4f})"
+
+            # 2. RSI oversold
+            if rsi < 30:
+                return True, f"Smart entry: RSI oversold ({rsi:.1f})"
+
+            # 3. Retrace 2-5% from recent high
+            recent_high = float(np.max(highs[-10:])) if len(highs) >= 10 else float(highs[-1])
+            if recent_high > 0:
+                retrace_pct = (recent_high - price) / recent_high * 100
+                if 2.0 <= retrace_pct <= 5.0:
+                    return True, f"Smart entry: pullback {retrace_pct:.1f}% from recent high"
+
+            return False, f"Entry not confirmed: price={price:.4f} EMA={ema_ref:.4f} RSI={rsi:.1f} (waiting for pullback)"
+
+        else:  # SELL
+            # 1. Near EMA bounce zone
+            ema_ref = min(ema_f, ema_s)
+            near_ema = price >= ema_ref * 0.985 and price <= ema_ref * 1.015
+            if near_ema:
+                return True, f"Smart entry: near EMA ({price:.4f} vs EMA {ema_ref:.4f})"
+
+            # 2. RSI overbought
+            if rsi > 70:
+                return True, f"Smart entry: RSI overbought ({rsi:.1f})"
+
+            return False, f"Entry not confirmed: price={price:.4f} EMA={ema_ref:.4f} RSI={rsi:.1f} (waiting for bounce)"
 
     # ─── V7 Layer 1: Weighted Confidence Engine (replaces 10-point confluence) ─
 
@@ -603,6 +668,16 @@ class ScalpingEngine:
                 regime=regime,
             )
 
+            # V16: Smart entry check
+            if tech_action != "HOLD":
+                entry_ok, entry_reason = self._check_smart_entry(
+                    action=tech_action, closes=closes, highs=highs,
+                    rsi=rsi, ema_fast=ema_9, ema_slow=ema_21, atr=atr,
+                )
+                decision.entry_confirmation_required = not entry_ok
+                decision.smart_entry_reason = entry_reason
+                logger.info(f"  V16 Smart Entry [{tech_action}]: confirmed={entry_ok} | {entry_reason}")
+
             # ── Layer 2: OpenAI Verification (only if Layer 1 produced a signal) ──
             if tech_action != "HOLD" and tech_confidence >= 60:
                 indicators_for_ai = {
@@ -821,6 +896,8 @@ class ScalpingEngine:
             "atr": decision.atr,
             "atr_pct": decision.atr_pct,
             "current_price": decision.current_price,
+            "ema_fast": decision.ema_fast,
+            "ema_slow": decision.ema_slow,
             "vwap": decision.vwap,
             "volume_spike": decision.volume_spike,
             "candle_type": decision.candle_type,
@@ -842,5 +919,8 @@ class ScalpingEngine:
             "ai_model": decision.ai_model,
             "ai_latency_ms": decision.ai_latency_ms,
             "ai_fallback": decision.ai_fallback,
+            # V16: Smart entry
+            "entry_confirmation_required": decision.entry_confirmation_required,
+            "smart_entry_reason": decision.smart_entry_reason,
         }
         return clean_json_types(raw)
