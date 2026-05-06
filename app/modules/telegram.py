@@ -457,46 +457,28 @@ class TelegramNotifier:
 
             skip_block = "\n<b>Skipped:</b>\n" + "\n".join(skip_lines_list)
 
-        # V18: TP1 = midpoint, TP2 = full target
-        if side == "BUY":
-            tp1_price = entry_price * (1 + (tp_pct * 0.5) / 100)
-            tp2_price = tp_price
-        else:
-            tp1_price = entry_price * (1 - (tp_pct * 0.5) / 100)
-            tp2_price = tp_price
-
-        tp1_line = f"🎯 TP1: <b>${tp1_price:,.6f}</b>"
-        tp2_line = f"🎯 TP2: <b>${tp2_price:,.6f}</b> ({tp_sign}{tp_pct:.1f}%)"
-        status_line = "🟡 <b>WAITING FOR ENTRY</b>"
-        strat_display = (strategy_type or "momentum_continuation").replace("_", " ").title()
-
+        # Assemble final message
         msg = (
-            f"{title_line}\n\n"
-            f"💱 Pair: <b>{symbol}</b>\n"
-            f"Side: <b>{direction}</b>\n"
+            f"{title}\n"
             f"\n"
-            f"📍 Entry Zone:\n"
-            f"  <b>${min(entry_zone_low, entry_zone_high):,.6f}</b>"
-            f" – <b>${max(entry_zone_low, entry_zone_high):,.6f}</b>\n"
+            f"{direction}\n"
+            f"Symbol: <b>{symbol}</b>\n"
+            f"Entry: <b>{entry_str}</b> @ {leverage_str}\n"
             f"\n"
-            f"🛡 SL: <b>${sl_price:,.6f}</b> ({sl_sign}{sl_pct:.1f}%)\n"
-            f"{tp1_line}\n"
-            f"{tp2_line}\n"
-            f"\n"
-            f"Confidence: <b>{confidence}%</b>\n"
-            f"Strategy: <b>{strat_display}</b>"
-            f"{regime_line}"
-            f"{btc_line}"
+            f"{accounts_block}"
+            f"{tp_block}\n"
+            f"{roi_line}"
             f"{rr_line}"
-            f"\n\n"
-            f"Status: {status_line}"
+            f"{grade_line}"
+            f"{strategy_line}"
+            f"{regime_line}\n"
+            f"\n"
+            f"{protection_line}"
+            f"{proof_line}"
             f"{reason_block}"
+            f"{skip_block}"
         )
-        try:
-            return await self.send(msg)
-        except Exception as e:
-            logger.error("[TELEGRAM SEND FAILED] send_signal_alert: %s", e)
-            return False
+        return msg
 
     async def send_execution_followup(
 
@@ -1554,116 +1536,72 @@ class TelegramNotifier:
 
         # Grade
 
-        grade_emoji = {"A": "⭐", "B": "🔷", "C": "🔸"}.get(setup_grade, "")
-
-        grade_line  = f"\nGrade: <b>{grade_emoji} {setup_grade}</b>" if setup_grade else ""
-
-        # Regime
-
-        regime_map = {
-
-            "TRENDING_BULL":      "🟢 Trending Bull",
-
-            "TRENDING_BEAR":      "🔴 Trending Bear",
-
-            "SIDEWAYS_RANGE":     "↔️ Sideways",
-
-            "BREAKOUT_EXPANSION": "💥 Breakout",
-
-            "HIGH_VOLATILITY":    "⚠️ High Volatility",
-
-            "DEAD_MARKET":        "💤 Dead Market",
-
-        }
-
-        regime_line = f"\nRegime: <b>{regime_map.get(regime, regime)}</b>" if regime else ""
-
-        # Entry zone
-
-        if entry_zone_low > 0 and entry_zone_high > 0:
-
-            zone_str = f"<b>${min(entry_zone_low, entry_zone_high):,.6f} – ${max(entry_zone_low, entry_zone_high):,.6f}</b>"
-
-        else:
-
-            zone_str = f"<b>${entry_price:,.6f}</b>"
-
-        # BTC bias
-
-        bias_map = {
-
-            "BULLISH": "🟢 Bullish ✓" if side == "BUY" else "🟢 Bullish ⚠️",
-
-            "BEARISH": "🔴 Bearish ✓" if side == "SELL" else "🔴 Bearish ⚠️",
-
-            "NEUTRAL": "⬜ Neutral",
-
-        }
-
-        btc_line = f"\nBTC Bias: <b>{bias_map.get(btc_bias, btc_bias)}</b>"
-
-        # TP/SL
-
+        # V18: Signal format
         tp_sign = "+" if side == "BUY" else "-"
-
         sl_sign = "-" if side == "BUY" else "+"
 
-        tp_line = f"🎯 TP: <b>${tp_price:,.6f}</b> ({tp_sign}{tp_pct:.1f}%)"
+        # Entry zone string
+        if entry_zone_low > 0 and entry_zone_high > 0:
+            zone_low  = min(entry_zone_low, entry_zone_high)
+            zone_high = max(entry_zone_low, entry_zone_high)
+        else:
+            zone_low = zone_high = entry_price
 
-        sl_line = f"🛡 SL: <b>${sl_price:,.6f}</b> ({sl_sign}{sl_pct:.1f}%)"
+        # TP1 (midpoint), TP2 (full target)
+        if side == "BUY":
+            tp1_price = entry_price * (1 + (tp_pct * 0.5) / 100)
+        else:
+            tp1_price = entry_price * (1 - (tp_pct * 0.5) / 100)
+        tp2_price = tp_price
 
-        # R:R
+        # Regime
+        regime_map = {
+            "TRENDING_BULL":      "🟢 Trending Bull",
+            "TRENDING_BEAR":      "🔴 Trending Bear",
+            "SIDEWAYS_RANGE":     "↔️ Sideways",
+            "BREAKOUT_EXPANSION": "💥 Breakout",
+            "HIGH_VOLATILITY":    "⚠️ High Volatility",
+            "DEAD_MARKET":        "💤 Dead Market",
+        }
+        regime_line = f"\nRegime: <b>{regime_map.get(regime, regime)}</b>" if regime else ""
+
+        # BTC bias
+        bias_map = {
+            "BULLISH": "🟢 Bullish ✓" if side == "BUY" else "🟢 Bullish ⚠️",
+            "BEARISH": "🔴 Bearish ✓" if side == "SELL" else "🔴 Bearish ⚠️",
+            "NEUTRAL": "⬜ Neutral",
+        }
+        btc_line = f"\nBTC Bias: <b>{bias_map.get(btc_bias, btc_bias)}</b>"
 
         rr_line = f"\nR:R = <b>1:{risk_reward:.1f}</b>" if risk_reward > 0 else ""
-
-        # ATR
-
-        atr_line = f"\nATR: <b>{atr_pct:.2f}%</b>" if atr_pct > 0 else ""
-
-        # Reason
-
         reason_block = f"\n\n<b>AI Reason:</b>\n<i>{reason[:280]}</i>" if reason else ""
+        strat_display = (strategy_type or "momentum_continuation").replace("_", " ").title()
 
         msg = (
-
             f"{title_line}\n\n"
-
-            f"Coin: <b>{symbol}</b>\n"
-
-            f"Direction: <b>{direction}</b>\n"
-
-            f"Type: <b>{strat_emoji}</b>"
-
-            f"{grade_line}"
-
+            f"💱 Pair: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"\n"
+            f"📍 Entry Zone:\n"
+            f"  <b>${zone_low:,.6f}</b> – <b>${zone_high:,.6f}</b>\n"
+            f"\n"
+            f"🛡 SL: <b>${sl_price:,.6f}</b> ({sl_sign}{sl_pct:.1f}%)\n"
+            f"🎯 TP1: <b>${tp1_price:,.6f}</b>\n"
+            f"🎯 TP2: <b>${tp2_price:,.6f}</b> ({tp_sign}{tp_pct:.1f}%)\n"
+            f"\n"
+            f"Confidence: <b>{confidence}%</b>\n"
+            f"Strategy: <b>{strat_display}</b>"
             f"{regime_line}"
-
             f"{btc_line}"
-
-            f"\nConfidence: <b>{confidence}%</b>\n\n"
-
-            f"Entry Zone: {zone_str}\n"
-
-            f"{tp_line}\n"
-
-            f"{sl_line}"
-
             f"{rr_line}"
-
-            f"{atr_line}"
-
+            f"\n\n"
+            f"Status: 🟡 <b>WAITING FOR ENTRY</b>"
             f"{reason_block}"
-
         )
-
         try:
-
             return await self.send(msg)
-
         except Exception as e:
-
-            logger.error(f"[V18] send_signal_alert failed: {e}")
-
+            logger.error("[TELEGRAM SEND FAILED] send_signal_alert: %s", e)
             return False
 
     async def send_signal_entry_triggered(
