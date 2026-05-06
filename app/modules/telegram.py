@@ -50,6 +50,50 @@ class TelegramNotifier:
             logger.error(f"Telegram notification failed: {e}")
             return False
 
+    async def send_simple(self, message: str) -> bool:
+        """
+        V17: Send a plain message with Markdown parse mode.
+        Used by daily_report, stale signal detection, and simple alerts.
+        Falls back to HTML send() if Markdown fails.
+        """
+        if not self.token or not self.chat_id:
+            logger.warning("Telegram not configured — skipping send_simple")
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{self.base_url}/sendMessage",
+                    json={
+                        "chat_id": self.chat_id,
+                        "text": message,
+                        "parse_mode": "Markdown",
+                        "disable_web_page_preview": True,
+                    },
+                )
+                resp.raise_for_status()
+                return True
+        except Exception:
+            # Fallback: try without parse mode
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    resp = await client.post(
+                        f"{self.base_url}/sendMessage",
+                        json={
+                            "chat_id": self.chat_id,
+                            "text": message,
+                            "disable_web_page_preview": True,
+                        },
+                    )
+                    resp.raise_for_status()
+                    return True
+            except Exception as e2:
+                logger.error(f"Telegram send_simple failed: {e2}")
+                return False
+
+    async def send_message(self, message: str) -> bool:
+        """Alias for send_simple — for backward compatibility."""
+        return await self.send_simple(message)
+
     # ═══════════════════════════════════════════════════════════════════
     # V4: ONE CLEAN FINAL MESSAGE — Trade Executed
     # ═══════════════════════════════════════════════════════════════════

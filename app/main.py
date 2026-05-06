@@ -15,9 +15,11 @@ from app.utils.logger import setup_logger
 from app.database import init_db, close_db
 from app.utils.seed_admin import seed_admin
 from app.utils.subscription_guard import run_subscription_expiry_check
-from app.modules.learning_engine import learning_engine  # V7: Adaptive strategy system
-from app.modules.signal_tracker_v16 import signal_tracker_v16  # V16: Signal monitor
+from app.modules.learning_engine import learning_engine
+from app.modules.signal_tracker_v16 import signal_tracker_v16
 from app.modules.telegram import TelegramNotifier
+from app.modules.signal_activation_monitor import router as monitor_router  # V17
+from app.modules.daily_report import router as daily_report_router          # V17
 
 # Setup logging
 setup_logger()
@@ -26,14 +28,14 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 V16 Signal Engine starting up...")
+    logger.info("🚀 V17 Signal Engine starting up...")
     await init_db()
     await seed_admin()
     await run_subscription_expiry_check()
     await learning_engine.seed_strategy_registry()
-    logger.info("✅ All V16 systems initialized (Signal Engine active — no Binance execution)")
+    logger.info("✅ All V17 systems initialized (Signal Engine active — no Binance execution)")
 
-    # V16: Start signal monitor background task
+    # V17: Start signal monitor background task (30s cycle)
     import asyncio as _asyncio
     monitor_task = _asyncio.create_task(_signal_monitor_loop())
 
@@ -63,7 +65,7 @@ async def _signal_monitor_loop():
 
     while True:
         try:
-            await _asyncio.sleep(60)   # check every minute
+            await _asyncio.sleep(30)   # V17: check every 30 seconds (was 60s)
 
             active = signal_tracker_v16.get_active_signals()
             if not active:
@@ -102,13 +104,14 @@ async def _signal_monitor_loop():
 
 
 app = FastAPI(
-    title="V16 AI Signal Engine — Crypto Futures",
+    title="V17 AI Signal Engine — Crypto Futures",
     description=(
-        "V16 High-Quality Signal Engine: AI signal generation, BTC directional filter, "
+        "V17 High-Quality Signal Engine: AI signal generation, BTC directional filter, "
         "ATR-based TP/SL, virtual signal tracking, daily performance reports, "
-        "and Telegram alerts. No auto-trading."
+        "and Telegram alerts. No auto-trading. V17: recalibrated confidence engine, "
+        "adaptive volume spike, improved SHORT detection, 30s monitor loop."
     ),
-    version="16.0.0",
+    version="17.0.0",
     lifespan=lifespan,
 )
 
@@ -121,20 +124,22 @@ app.add_middleware(
 )
 
 # Include routers
-app.include_router(scanner.router,  prefix="/api/v1", tags=["Scanner"])
-app.include_router(analyzer.router, prefix="/api/v1", tags=["Analyzer"])
-app.include_router(executor.router, prefix="/api/v1", tags=["Executor"])
-app.include_router(status.router,   prefix="/api/v1", tags=["Status"])
-app.include_router(accounts.router, prefix="/api/v1", tags=["Accounts"])
-app.include_router(admin.router,    tags=["Admin"])
+app.include_router(scanner.router,       prefix="/api/v1", tags=["Scanner"])
+app.include_router(analyzer.router,      prefix="/api/v1", tags=["Analyzer"])
+app.include_router(executor.router,      prefix="/api/v1", tags=["Executor"])
+app.include_router(status.router,        prefix="/api/v1", tags=["Status"])
+app.include_router(accounts.router,      prefix="/api/v1", tags=["Accounts"])
+app.include_router(admin.router,         tags=["Admin"])
+app.include_router(monitor_router,       prefix="/api/v1", tags=["Monitor"])       # V17
+app.include_router(daily_report_router,  prefix="/api/v1", tags=["DailyReport"])   # V17
 
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "ok",
-        "service": "crypto-signal-engine-v16",
-        "version": "16.0.0",
+        "service": "crypto-signal-engine-v17",
+        "version": "17.0.0",
         "mode": "SIGNAL_ONLY — no Binance execution",
         "features": [
             "btc_directional_bias_filter",
@@ -148,6 +153,15 @@ async def health_check():
             "daily_performance_report",
             "ai_pre_filter",
             "5min_analysis_cache",
+            # V17 new features
+            "adaptive_volume_spike",
+            "improved_short_detection",
+            "momentum_bypass_trigger",
+            "30s_monitor_loop",
+            "watchlist_spam_suppression",
+            "symbol_signal_cooldown",
+            "stale_signal_detection",
+            "daily_report_endpoint",
         ],
         "active_signals": signal_tracker_v16.active_count(),
     }

@@ -43,12 +43,12 @@ _SCALP_DRAWDOWN_SL   = -5.0    # Scalp: SL trigger at -5% (force close)
 _SWING_DRAWDOWN_WARN = -10.0   # Swing: first warning at -10%
 _SWING_DRAWDOWN_CRIT = -20.0   # Swing: critical warning at -20%
 
-# ── Capacity limits ───────────────────────────────────────────────────────────────────────
-MAX_ACTIVE_SIGNALS = 5    # Max total active signals at one time
+# ── Capacity limits ─────────────────────────────────────────────────────────────────────
+MAX_ACTIVE_SIGNALS = 15   # V17: raised from 5 — was blocking too many valid signals
 MAX_PER_COIN       = 2    # Max active signals per coin (same symbol)
 
-# ── Opposite signal confidence threshold ────────────────────────────────────────────
-OPPOSITE_MIN_CONFIDENCE = 80   # Only invalidate if new signal confidence ≥ 80
+# ── Opposite signal confidence threshold ─────────────────────────────────────────────
+OPPOSITE_MIN_CONFIDENCE = 70   # V17: lowered from 80 — catch more reversals
 
 
 # ── Internal Signal State ────────────────────────────────────────────
@@ -196,6 +196,25 @@ class SignalTracker:
                 # ── PENDING: watch for entry zone hit ──────────────────
                 if state.status == "PENDING":
                     in_zone = state.entry_zone_low <= price <= state.entry_zone_high
+
+                    # V17: Momentum bypass — activate even if just outside zone
+                    # if price within 0.5% of zone boundary with momentum confirmation
+                    if not in_zone:
+                        near_low  = price >= state.entry_zone_low  * 0.995  # within 0.5% below zone
+                        near_high = price <= state.entry_zone_high * 1.005  # within 0.5% above zone
+                        if state.side == "BUY" and near_low:
+                            in_zone = True  # V17: momentum entry — price approaching from below
+                            logger.info(
+                                f"  ⚡ Signal #{state.signal_number:03d} MOMENTUM BYPASS "
+                                f"{state.symbol} @ {price:.4f} (near zone low={state.entry_zone_low:.4f})"
+                            )
+                        elif state.side == "SELL" and near_high:
+                            in_zone = True  # V17: momentum entry — price approaching from above
+                            logger.info(
+                                f"  ⚡ Signal #{state.signal_number:03d} MOMENTUM BYPASS "
+                                f"{state.symbol} @ {price:.4f} (near zone high={state.entry_zone_high:.4f})"
+                            )
+
                     if in_zone:
                         state.status = "ENTRY_HIT"
                         state.entry_hit_at = datetime.now(timezone.utc)
@@ -218,6 +237,26 @@ class SignalTracker:
                                 )
                             except Exception as te:
                                 logger.warning(f"Telegram entry trigger failed: {te}")
+                    else:
+                        # V17: Stale signal detection — warn if near timeout with no approach
+                        timeout_pct = state.age_minutes / state.timeout_minutes
+                        if timeout_pct >= 0.8 and not getattr(state, '_stale_warned', False):
+                            state._stale_warned = True
+                            logger.info(
+                                f"  ⏳ Signal #{state.signal_number:03d} {state.symbol} "
+                                f"stale — {state.age_minutes:.0f}m/{state.timeout_minutes}m, "
+                                f"price={price:.4f} zone=[{state.entry_zone_low:.4f},{state.entry_zone_high:.4f}]"
+                            )
+                            if telegram:
+                                try:
+                                    await telegram.send_simple(
+                                        f"⏳ *Missed Breakout Warning*\n"
+                                        f"#{state.signal_number:03d} {state.symbol} {state.side}\n"
+                                        f"Price: `{price:.4f}` | Zone: `{state.entry_zone_low:.4f}–{state.entry_zone_high:.4f}`\n"
+                                        f"Age: {state.age_minutes:.0f}m / {state.timeout_minutes}m"
+                                    )
+                                except Exception:
+                                    pass
                     continue  # Don't check TP/SL until entry is hit
 
                 # ── ENTRY_HIT / DRAWDOWN: watch TP, SL, drawdown ───────

@@ -176,14 +176,14 @@ class MarketRegimeRouter:
             atr_pct_1h = (atr_1h / price_1h) * 100 if price_1h > 0 else 0
             volatility_high = atr_pct_1h > 3.0
 
-            # ── 5-min BTC move: >1.5% in last 5 minutes = volatile stop ───────
+            # ── 5-min BTC move: >1.5% in last 5 minutes = volatile warning ───────
             c5m = _closes(raw_5m)
             btc_5m_move = abs((c5m[-1] - c5m[-2]) / c5m[-2] * 100) if len(c5m) >= 2 else 0.0
             btc_5m_volatile = btc_5m_move > 1.5
             if btc_5m_volatile:
                 logger.warning(
-                    f"  ⚠️ V16 BTC 5m spike: {btc_5m_move:.2f}% — signals PAUSED"
-                )
+                    f"  ⚠️ V17 BTC 5m spike: {btc_5m_move:.2f}% — reducing confidence (not pausing)"
+                )  # V17: no longer hard-pauses signals, just warns
 
             # ── Decide bias ───────────────────────────────────────────
             bull_score = (2 if macro_bull else 0) + bull_count + (1 if hh_hl else 0)
@@ -192,11 +192,11 @@ class MarketRegimeRouter:
             if bull_score >= 4:
                 bias = "BULLISH"
                 long_mult  = 1.0
-                short_mult = 0.75   # reduce SHORT confidence 25% in bull market
+                short_mult = 0.85   # V17: reduced penalty from 0.75 — SHORT still valid in bull
                 reason = f"BTC bullish: macro={'bull' if macro_bull else 'bear'} TF={bull_count}/3 bull HH/HL={hh_hl}"
             elif bear_score >= 4:
                 bias = "BEARISH"
-                long_mult  = 0.75   # reduce LONG confidence 25% in bear market
+                long_mult  = 0.85   # V17: reduced penalty from 0.75 — LONG still valid in bear
                 short_mult = 1.0
                 reason = f"BTC bearish: macro={'bear' if macro_bear else 'bull'} TF={bear_count}/3 bear LH/LL={lh_ll}"
             else:
@@ -210,6 +210,9 @@ class MarketRegimeRouter:
             if btc_5m_volatile:
                 reason += f" | BTC 5m SPIKE +{btc_5m_move:.2f}%"
 
+            # V17: is_unstable flag — ATR > 2% means reduce confidence
+            is_unstable = atr_pct_1h > 2.0
+
             result = {
                 "bias": bias,
                 "volatility_high": volatility_high,
@@ -221,6 +224,9 @@ class MarketRegimeRouter:
                 "bull_score": bull_score,
                 "bear_score": bear_score,
                 "atr_pct_1h": round(atr_pct_1h, 3),
+                "is_unstable": is_unstable,
+                # V17: confidence reduction for volatile markets
+                "volatility_confidence_adj": -5 if btc_5m_volatile else (0 if not is_unstable else -3),
             }
             logger.info(f"  🔶 V16 BTC Bias: {bias} | {reason}")
             self._btc_bias_cache = result
@@ -391,6 +397,7 @@ class MarketRegimeRouter:
             return "TRENDING_BEAR", conf, f"Bearish trend: EMA dist={ema_dist:.3f}%"
 
         # 6. SIDEWAYS RANGE — EMAs close, moderate volatility
+        # V17: Allow more trade types in SIDEWAYS (was too restrictive)
         return "SIDEWAYS_RANGE", 70, f"Sideways range: EMA dist={ema_dist:.3f}%, ATR%={atr_pct:.2f}"
 
     def _get_strategy_weights(self, regime: str) -> dict:
@@ -411,11 +418,11 @@ class MarketRegimeRouter:
                 "sniper": 0.5,
             },
             "SIDEWAYS_RANGE": {
-                "scalp_trend_pullback": 0.3,
-                "scalp_breakout": 0.3,
+                "scalp_trend_pullback": 0.7,   # V17: raised from 0.3 — trend plays valid in range
+                "scalp_breakout": 0.5,          # V17: raised from 0.3
                 "scalp_range_reversal": 1.0,
-                "swing": 0.4,
-                "sniper": 0.3,
+                "swing": 0.6,                   # V17: raised from 0.4
+                "sniper": 0.4,                  # V17: raised from 0.3
             },
             "BREAKOUT_EXPANSION": {
                 "scalp_trend_pullback": 0.5,

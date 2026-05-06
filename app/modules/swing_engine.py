@@ -123,7 +123,6 @@ class SwingEngine:
 
         # LONG continuation
         if ema20_val > ema50_val and price > ema50_val:
-            # Price near EMA20 (within 1 ATR)
             dist_to_ema = abs(price - ema20_val)
             if dist_to_ema < atr * 1.5 and price >= ema20_val * 0.995:
                 score = 50
@@ -131,16 +130,16 @@ class SwingEngine:
                     score += 10
                 if ema_dist > 1.0:
                     score += 10
-                if vol_ratio > 0.8:
+                if vol_ratio > 0.6:  # V17: lowered from 0.8
                     score += 5
-                if closes[-1] > closes[-2]:  # Bouncing candle
+                if closes[-1] > closes[-2]:
                     score += 10
-                # Recent pullback (price was lower 2-5 candles ago)
                 recent_low = min(float(lows[-3]), float(lows[-4]), float(lows[-5]))
                 if recent_low < ema20_val:
                     score += 15
 
-                if score >= settings.SWING_MIN_CONFIDENCE:
+                swing_min = 70  # V17: lowered from settings.SWING_MIN_CONFIDENCE (80)
+                if score >= swing_min:
                     return SwingSetup(
                         symbol="", side="BUY", setup_type="trend_continuation",
                         confidence=min(score, 98),
@@ -153,21 +152,27 @@ class SwingEngine:
         # SHORT continuation
         if ema20_val < ema50_val and price < ema50_val:
             dist_to_ema = abs(price - ema20_val)
-            if dist_to_ema < atr * 1.5 and price <= ema20_val * 1.005:
+            # V17: widened from 1.005 to 1.012 — more SHORT setups qualify
+            if dist_to_ema < atr * 1.5 and price <= ema20_val * 1.012:
                 score = 50
                 if rsi > 35 and rsi < 60:
                     score += 10
                 if ema_dist > 1.0:
                     score += 10
-                if vol_ratio > 0.8:
+                if vol_ratio > 0.6:  # V17: lowered from 0.8
                     score += 5
                 if closes[-1] < closes[-2]:
                     score += 10
                 recent_high = max(float(highs[-3]), float(highs[-4]), float(highs[-5]))
                 if recent_high > ema20_val:
                     score += 15
+                # V17: Lower-high detection bonus
+                if len(highs) >= 6 and float(highs[-1]) < float(highs[-4]):
+                    score += 8
+                    logger.debug(f"  Swing SHORT: lower-high detected +8")
 
-                if score >= settings.SWING_MIN_CONFIDENCE:
+                swing_min = 70  # V17: lowered from settings.SWING_MIN_CONFIDENCE (80)
+                if score >= swing_min:
                     return SwingSetup(
                         symbol="", side="SELL", setup_type="trend_continuation",
                         confidence=min(score, 98),

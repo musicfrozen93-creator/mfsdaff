@@ -36,14 +36,23 @@ from app.utils.serialization import clean_json_types
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# ─── V16: Analysis cache (5-min TTL) — prevents re-running AI on same coin ───
+# V16: Analysis cache (5-min TTL)
 import time as _time
 _analysis_cache: dict[str, dict]  = {}   # symbol → {"ts": float, "result": dict}
 _CACHE_TTL_S = 300.0                     # 5 minutes
 
-# V16: Quiet market timer (15-min throttle for 'no signal' message)
+# V16: Quiet market timer
 _last_quiet_sent: float = 0.0
 _QUIET_INTERVAL_S = 900.0               # 15 minutes
+
+# V17: Symbol signal cooldown — suppress re-signalling same symbol within 20 min
+# unless confidence improved >= 10pts
+_symbol_signal_cooldown: dict[str, dict] = {}  # symbol -> {"ts": float, "confidence": int, "side": str}
+_SIGNAL_COOLDOWN_S = 1200.0  # 20 minutes
+
+# V17: Watchlist spam suppression — same symbol+side suppressed for 30 min
+_watchlist_post_ts: dict[str, float] = {}  # "SYMBOL_SIDE" -> last_post_ts
+_WATCHLIST_COOLDOWN_S = 1800.0  # 30 minutes
 
 
 def _is_cache_fresh(symbol: str) -> bool:
@@ -65,27 +74,21 @@ def _store_cache(symbol: str, result: dict) -> None:
 
 def _passes_prefilter(coin) -> bool:
     """
-    V16 pre-filter: fast technical gate before running AI.
-    Coin must pass ≥2 of 4 criteria to qualify for AI analysis.
-    Saves ~60-70% of AI API calls by skipping low-quality coins.
-
-    Criteria:
-      1. Volume spike: price_change_pct vs absolute move (proxy for volume)
-      2. ATR-proxy: abs(price_change_pct) > 1.5%
-      3. EMA structure: spread_pct < 0.08% (tight = liquid, trending)
-      4. Momentum: score > 55 (from scanner composite score)
+    V17 pre-filter: relaxed technical gate.
+    Coin must pass >=2 of 4 criteria.
+    V17 changes: abs_chg lowered 1.5%->0.8%, score threshold 55->45
     """
     score = 0
     abs_chg = abs(coin.price_change_pct)
 
-    if abs_chg > 1.5:
-        score += 1   # Criterion 2: volatility present
-    if abs_chg > 2.5:
-        score += 1   # Bonus for strong move
-    if coin.spread_pct < 0.08:
-        score += 1   # Criterion 3: tight spread = liquid
-    if getattr(coin, "score", 0) > 55:
-        score += 1   # Criterion 4: high quality score from scanner
+    if abs_chg > 0.8:    # V17: lowered from 1.5 — catch slower-moving setups
+        score += 1
+    if abs_chg > 2.0:    # V17: lowered from 2.5
+        score += 1
+    if coin.spread_pct < 0.10:  # V17: relaxed from 0.08
+        score += 1
+    if getattr(coin, "score", 0) > 45:  # V17: lowered from 55
+        score += 1
 
     return score >= 2
 
@@ -568,11 +571,30 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
 
     # Symbol cooldown filter
     filtered = []
+    now_ts = _time.time()
     for sig in all_signals:
-        if sig.get("action") in ("BUY", "SELL"):
-            cooled, _ = await strategy_tracker.check_symbol_cooldown(sig.get("symbol", ""))
+        sym = sig.get("symbol", "")
+        action = sig.get("action", "HOLD")
+        conf = sig.get("confidence", 0)
+        if action in ("BUY", "SELL"):
+            # Platform cooldown
+            cooled, _ = await strategy_tracker.check_symbol_cooldown(sym)
             if cooled:
                 continue
+            # V17: Per-symbol signal cooldown
+            cooldown_entry = _symbol_signal_cooldown.get(sym)
+            if cooldown_entry:
+                age = now_ts - cooldown_entry["ts"]
+                conf_improvement = conf - cooldown_entry["confidence"]
+                same_side = cooldown_entry["side"] == action
+                if age < _SIGNAL_COOLDOWN_S and same_side and conf_improvement < 10:
+                    logger.debug(
+                        f"  [COOLDOWN] {sym} {action} suppressed: "
+                        f"age={age:.0f}s conf_delta={conf_improvement:+d}"
+                    )
+                    continue
+            # Update cooldown
+            _symbol_signal_cooldown[sym] = {"ts": now_ts, "confidence": conf, "side": action}
         filtered.append(sig)
 
     filtered.sort(key=lambda x: x.get("confidence", 0), reverse=True)
@@ -718,14 +740,29 @@ async def analyze_swing_batch(req: SwingBatchRequest):
     except Exception:
         pass
 
-    # Step 5: Send grouped swing watchlist Telegram (one message)
-    all_watchlist = new_watchlist_setups  # show newly found setups
+    # Step 5: Send grouped swing watchlist Telegram (one message) with spam suppression
+    all_watchlist = new_watchlist_setups
     if all_watchlist:
-        try:
-            telegram = TelegramNotifier()
-            await telegram.send_swing_watchlist(all_watchlist)
-        except Exception as tw_err:
-            logger.debug(f"Swing watchlist telegram failed: {tw_err}")
+        now_ts = _time.time()
+        # V17: Filter out recently posted symbol+side pairs
+        to_post = []
+        for s in all_watchlist:
+            key = f"{s['symbol']}_{s['side']}"
+            last_ts = _watchlist_post_ts.get(key, 0)
+            if (now_ts - last_ts) >= _WATCHLIST_COOLDOWN_S:
+                to_post.append(s)
+                _watchlist_post_ts[key] = now_ts
+            else:
+                logger.debug(
+                    f"  [WATCHLIST SUPPRESS] {s['symbol']} {s['side']} "
+                    f"posted {(now_ts-last_ts)/60:.0f}m ago"
+                )
+        if to_post:
+            try:
+                telegram = TelegramNotifier()
+                await telegram.send_swing_watchlist(to_post)
+            except Exception as tw_err:
+                logger.debug(f"Swing watchlist telegram failed: {tw_err}")
 
     has_signals = len(triggered_setups) > 0
 

@@ -251,37 +251,50 @@ class ScalpingEngine:
         ema_s = float(ema_slow[-1])
 
         if action == "BUY":
-            # 1. Near EMA pullback zone
+            # 1. Near EMA pullback zone — V17: widened from 1.5% to 2.5%
             ema_ref = max(ema_f, ema_s)
-            near_ema = price <= ema_ref * 1.015 and price >= ema_ref * 0.985
+            near_ema = price <= ema_ref * 1.025 and price >= ema_ref * 0.975
             if near_ema:
                 return True, f"Smart entry: near EMA ({price:.4f} vs EMA {ema_ref:.4f})"
 
-            # 2. RSI oversold
-            if rsi < 30:
-                return True, f"Smart entry: RSI oversold ({rsi:.1f})"
+            # 2. RSI oversold — V17: widened from 30 to 35
+            if rsi < 35:
+                return True, f"Smart entry: RSI recovering ({rsi:.1f})"
 
-            # 3. Retrace 2-5% from recent high
+            # 3. Retrace 1.5-7% from recent high — V17: wider band
             recent_high = float(np.max(highs[-10:])) if len(highs) >= 10 else float(highs[-1])
             if recent_high > 0:
                 retrace_pct = (recent_high - price) / recent_high * 100
-                if 2.0 <= retrace_pct <= 5.0:
+                if 1.5 <= retrace_pct <= 7.0:
                     return True, f"Smart entry: pullback {retrace_pct:.1f}% from recent high"
 
-            return False, f"Entry not confirmed: price={price:.4f} EMA={ema_ref:.4f} RSI={rsi:.1f} (waiting for pullback)"
+            # 4. V17: Volume expansion breakout — volume spike = momentum entry OK
+            if atr > 0 and len(closes) > 1:
+                candle_body = abs(float(closes[-1]) - float(closes[-2]))
+                if candle_body > atr * 0.5:
+                    return True, f"Smart entry: momentum breakout candle (body={candle_body:.4f})"
+
+            return True, f"Smart entry: default allow (price={price:.4f} EMA={ema_ref:.4f} RSI={rsi:.1f})"  # V17: default allow, don't block
 
         else:  # SELL
-            # 1. Near EMA bounce zone
+            # 1. Near EMA bounce zone — V17: widened
             ema_ref = min(ema_f, ema_s)
-            near_ema = price >= ema_ref * 0.985 and price <= ema_ref * 1.015
+            near_ema = price >= ema_ref * 0.975 and price <= ema_ref * 1.025
             if near_ema:
                 return True, f"Smart entry: near EMA ({price:.4f} vs EMA {ema_ref:.4f})"
 
-            # 2. RSI overbought
-            if rsi > 70:
-                return True, f"Smart entry: RSI overbought ({rsi:.1f})"
+            # 2. RSI overbought — V17: widened from 70 to 65
+            if rsi > 65:
+                return True, f"Smart entry: RSI elevated ({rsi:.1f})"
 
-            return False, f"Entry not confirmed: price={price:.4f} EMA={ema_ref:.4f} RSI={rsi:.1f} (waiting for bounce)"
+            # 3. V17: Bounce from recent low (for shorts after rebound)
+            recent_low = float(np.min(highs[-10:])) if len(highs) >= 10 else float(highs[-1])
+            if recent_low > 0 and price > 0:
+                bounce_pct = (price - recent_low) / recent_low * 100
+                if 1.5 <= bounce_pct <= 7.0:
+                    return True, f"Smart entry: SHORT bounce {bounce_pct:.1f}% from recent low"
+
+            return True, f"Smart entry: default allow SHORT (price={price:.4f} EMA={ema_ref:.4f} RSI={rsi:.1f})"  # V17: default allow
 
     # ─── V7 Layer 1: Weighted Confidence Engine (replaces 10-point confluence) ─
 
@@ -350,15 +363,25 @@ class ScalpingEngine:
             high=high, low=low, open_price=open_price, close_price=close_price,
         )
 
-        # Pick the best side
-        if long_result.score >= short_result.score and long_result.score >= 60:
+        # V17: Pick the best side — lowered threshold to 58
+        if long_result.score >= short_result.score and long_result.score >= 58:
             action = "BUY" if not long_result.rejected else "HOLD"
+            # V17: Log rejection reason for transparency
+            if long_result.rejected:
+                logger.info(f"  [LONG REJECTED] {long_result.reject_reason}")
             return action, long_result.score, long_result.reason
-        elif short_result.score >= 60:
+        elif short_result.score >= 58:
             action = "SELL" if not short_result.rejected else "HOLD"
+            if short_result.rejected:
+                logger.info(f"  [SHORT REJECTED] {short_result.reject_reason}")
             return action, short_result.score, short_result.reason
         else:
             best = max(long_result.score, short_result.score)
+            # V17: Detailed rejection logging
+            logger.debug(
+                f"  [HOLD] L={long_result.score}({'rejected: '+long_result.reject_reason if long_result.rejected else 'scored'})"
+                f" S={short_result.score}({'rejected: '+short_result.reject_reason if short_result.rejected else 'scored'})"
+            )
             return "HOLD", best, f"Insufficient confidence: L={long_result.score}, S={short_result.score}"
 
     # ─── Layer 2: OpenAI Verification ─────────────────────────────────
@@ -469,18 +492,20 @@ class ScalpingEngine:
     @staticmethod
     def determine_setup_grade(confidence: int, volume_spike: bool = False) -> str:
         """
-        V7: Setup grade based on confidence tiers.
-        A = Elite (90+)
-        B = Strong (80-89) or Tradable with volume spike
-        C = Standard (70-79)
-        D = Weak (60-69)
+        V17: Realistic setup grades — D should only mean genuinely weak.
+        A = Elite (88+)
+        B = Strong (75-87) or 70+ with volume spike
+        C = Acceptable (65-74)
+        D = Weak (58-64) — only truly marginal setups
         """
-        if confidence >= 90:
+        if confidence >= 88:
             return "A"
-        elif confidence >= 80 or (confidence >= 75 and volume_spike):
+        elif confidence >= 75 or (confidence >= 70 and volume_spike):
             return "B"
-        elif confidence >= 70:
+        elif confidence >= 65:
             return "C"
+        elif confidence >= 58:
+            return "D"
         else:
             return "D"
 
@@ -537,7 +562,14 @@ class ScalpingEngine:
             avg_vol = float(np.mean(volumes[-21:-1])) if len(volumes) > 21 else float(np.mean(volumes))
             cur_vol = float(volumes[-1])
             volume_ratio = float(cur_vol / avg_vol) if avg_vol > 0 else 1.0
-            volume_spike = bool(volume_ratio > 1.5)
+            # V17: Adaptive volume spike — moderate increase + acceleration counts
+            vol_prev = float(volumes[-2]) if len(volumes) > 2 else cur_vol
+            vol_acceleration = cur_vol > vol_prev * 1.1  # accelerating
+            volume_spike = bool(
+                volume_ratio > 1.5  # strong spike
+                or (volume_ratio > 1.2 and vol_acceleration)  # moderate + accelerating
+                or (volume_ratio > 1.1 and volume_ratio > float(np.mean(volumes[-5:-1])) / avg_vol * 1.15 if len(volumes) > 5 and avg_vol > 0 else False)  # above recent avg
+            )
 
             # Candle type
             o, h, l, c = opens[-1], highs[-1], lows[-1], closes[-1]
@@ -819,30 +851,34 @@ class ScalpingEngine:
         if spread_pct > settings.MAX_SPREAD_ENTRY_PCT or atr_pct > settings.MAX_VOLATILITY_PCT:
             return "HOLD", 0, "Spread/volatility too high for reversal"
 
-        # LONG reversal at lower BB / oversold
-        if bb_position == "LOWER" and rsi < 35:
+        # LONG reversal at lower BB / oversold — V17: widened RSI threshold
+        if bb_position == "LOWER" and rsi < 42:  # was 35
             score = 45
             if rsi < 25:
                 score += 15
-            elif rsi < 30:
+            elif rsi < 32:
                 score += 10
-            if candle_type == "BULLISH":  # Reversal candle
+            elif rsi < 42:
+                score += 5  # V17: partial score for wider range
+            if candle_type == "BULLISH":
                 score += 15
             if volume_spike:
                 score += 10
             if price < vwap:
                 score += 5
 
-            if score >= 65:
+            if score >= 60:  # V17: lowered from 65
                 return "BUY", min(score, 100), f"Range reversal at lower BB | RSI={rsi:.0f}"
 
-        # SHORT reversal at upper BB / overbought
-        if bb_position == "UPPER" and rsi > 65:
+        # SHORT reversal at upper BB / overbought — V17: widened RSI threshold
+        if bb_position == "UPPER" and rsi > 58:  # was 65
             score = 45
             if rsi > 75:
                 score += 15
-            elif rsi > 70:
+            elif rsi > 68:
                 score += 10
+            elif rsi > 58:
+                score += 5  # V17: partial score for wider range
             if candle_type == "BEARISH":
                 score += 15
             if volume_spike:
@@ -850,7 +886,7 @@ class ScalpingEngine:
             if price > vwap:
                 score += 5
 
-            if score >= 65:
+            if score >= 60:  # V17: lowered from 65
                 return "SELL", min(score, 100), f"Range reversal at upper BB | RSI={rsi:.0f}"
 
         return "HOLD", 0, "No reversal setup"
@@ -874,7 +910,7 @@ class ScalpingEngine:
 
         best = None
         for name, (action, conf, reason), weight in strategies:
-            if action == "HOLD" or conf < 60:
+            if action == "HOLD" or conf < 55:  # V17: lowered from 60
                 continue
             adjusted_conf = int(conf * weight)
             adjusted_conf = max(50, min(adjusted_conf, 100))  # V7: cap at 100

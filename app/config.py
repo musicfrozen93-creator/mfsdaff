@@ -138,13 +138,13 @@ class Settings:
     # V7: Daily profit lock
     DAILY_PROFIT_LOCK_PCT: float = float(os.getenv("DAILY_PROFIT_LOCK_PCT", "3.0"))  # Lock gains at +3%
 
-    # ── V10 Split Confidence System ──────────────────────────────────────
-    # Scalp confidence gates (lower than swing — scalp signals are inherently faster)
-    SCALP_MIN_CONFIDENCE: int = int(os.getenv("SCALP_MIN_CONFIDENCE", "75"))          # Execute threshold
-    SCALP_WATCHLIST_CONFIDENCE: int = int(os.getenv("SCALP_WATCHLIST_CONFIDENCE", "55"))  # Near-miss alert
+    # ── V10 Split Confidence System ────────────────────────────────────
+    # V17: Lowered scalp from 75->70, swing from 80->72
+    SCALP_MIN_CONFIDENCE: int = int(os.getenv("SCALP_MIN_CONFIDENCE", "70"))           # V17: was 75
+    SCALP_WATCHLIST_CONFIDENCE: int = int(os.getenv("SCALP_WATCHLIST_CONFIDENCE", "55"))  # unchanged
     # Swing confidence gates
-    SWING_MIN_CONFIDENCE_EXECUTE: int = int(os.getenv("SWING_MIN_CONFIDENCE_EXECUTE", "80"))  # Execute threshold
-    SWING_WATCHLIST_CONFIDENCE: int = int(os.getenv("SWING_WATCHLIST_CONFIDENCE", "70"))      # Watchlist threshold
+    SWING_MIN_CONFIDENCE_EXECUTE: int = int(os.getenv("SWING_MIN_CONFIDENCE_EXECUTE", "72"))  # V17: was 80
+    SWING_WATCHLIST_CONFIDENCE: int = int(os.getenv("SWING_WATCHLIST_CONFIDENCE", "62"))      # V17: was 70
 
     # ── V10 Trigger Zone Tolerance ───────────────────────────────────────
     # Prevents missing near-price entries due to tick-level mismatch
@@ -212,9 +212,10 @@ class Settings:
     PM_ORPHAN_SYNC_ENABLED: bool = os.getenv("PM_ORPHAN_SYNC_ENABLED", "true").lower() == "true"
 
     # ── V13 Per-Mode Confidence Gates ────────────────────────────────────
-    V13_SCALP_MIN_CONFIDENCE: int = int(os.getenv("V13_SCALP_MIN_CONFIDENCE", "72"))
-    V13_SWING_MIN_CONFIDENCE: int = int(os.getenv("V13_SWING_MIN_CONFIDENCE", "75"))
-    V13_SNIPER_MIN_CONFIDENCE: int = int(os.getenv("V13_SNIPER_MIN_CONFIDENCE", "82"))
+    # V17: Lowered thresholds for all modes
+    V13_SCALP_MIN_CONFIDENCE: int = int(os.getenv("V13_SCALP_MIN_CONFIDENCE", "68"))   # V17: was 72
+    V13_SWING_MIN_CONFIDENCE: int = int(os.getenv("V13_SWING_MIN_CONFIDENCE", "70"))   # V17: was 75
+    V13_SNIPER_MIN_CONFIDENCE: int = int(os.getenv("V13_SNIPER_MIN_CONFIDENCE", "78"))  # V17: was 82
 
     # ── V13 Leverage Caps (per mode) ─────────────────────────────────────
     V13_SCALP_LEVERAGE_MAX: int = int(os.getenv("V13_SCALP_LEVERAGE_MAX", "15"))
@@ -285,6 +286,25 @@ class Settings:
     V13_SLIPPAGE_EST_PCT: float = float(os.getenv("V13_SLIPPAGE_EST_PCT", "0.05")) # estimated slippage
     # Skip trade if net ROI after fees < this value
     V13_MIN_NET_ROI_AFTER_FEES: float = float(os.getenv("V13_MIN_NET_ROI_AFTER_FEES", "3.0"))
+
+    # ── V17 Engine Calibration Settings ───────────────────────────────────
+    # Volume spike adaptive threshold
+    V17_VOLUME_SPIKE_THRESHOLD: float = float(os.getenv("V17_VOLUME_SPIKE_THRESHOLD", "1.2"))    # base ratio (was 1.5)
+    V17_VOLUME_ACCELERATION_PCT: float = float(os.getenv("V17_VOLUME_ACCELERATION_PCT", "1.1"))  # acceleration multiplier
+    # Signal cooldown (suppress same symbol re-signal within N seconds)
+    V17_SIGNAL_COOLDOWN_S: int = int(os.getenv("V17_SIGNAL_COOLDOWN_S", "1200"))   # 20 minutes
+    V17_SIGNAL_COOLDOWN_CONF_IMPROVE: int = int(os.getenv("V17_SIGNAL_COOLDOWN_CONF_IMPROVE", "10"))  # override if +10pts
+    # Watchlist spam suppression (same symbol+side)
+    V17_WATCHLIST_COOLDOWN_S: int = int(os.getenv("V17_WATCHLIST_COOLDOWN_S", "1800"))  # 30 minutes
+    # Trigger activation momentum bypass
+    V17_TRIGGER_BYPASS_PCT: float = float(os.getenv("V17_TRIGGER_BYPASS_PCT", "0.5"))   # within 0.5% of zone
+    # BTC bias multiplier (both directions)
+    V17_BTC_AGAINST_MULT: float = float(os.getenv("V17_BTC_AGAINST_MULT", "0.85"))     # was 0.75
+    # Confidence floor (absolute minimum to emit any signal)
+    V17_CONFIDENCE_FLOOR: int = int(os.getenv("V17_CONFIDENCE_FLOOR", "58"))           # was 60
+    # Signal tracker capacity
+    V17_MAX_ACTIVE_SIGNALS: int = int(os.getenv("V17_MAX_ACTIVE_SIGNALS", "15"))       # was 5
+    V17_OPPOSITE_MIN_CONFIDENCE: int = int(os.getenv("V17_OPPOSITE_MIN_CONFIDENCE", "70"))  # was 80
 
     # ── V13 Learning Engine (Patch 3) ────────────────────────────────────
     V13_LEARNING_TRADE_INTERVAL: int = int(os.getenv("V13_LEARNING_TRADE_INTERVAL", "20"))  # every 20 trades

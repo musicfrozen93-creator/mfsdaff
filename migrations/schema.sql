@@ -409,3 +409,53 @@ CREATE TABLE IF NOT EXISTS signal_counter (
 );
 CREATE INDEX IF NOT EXISTS idx_signal_counter_date ON signal_counter(date);
 
+-- =======================================================================
+-- V17 Engine Calibration — Diagnostics + Spam Suppression Tables
+-- All statements are idempotent (IF NOT EXISTS).
+-- =======================================================================
+
+-- V17: Signal diagnostics — full rejection pipeline transparency
+CREATE TABLE IF NOT EXISTS signal_diagnostics (
+    id              SERIAL PRIMARY KEY,
+    symbol          VARCHAR(20) NOT NULL,
+    side            VARCHAR(10) NOT NULL,          -- BUY | SELL | HOLD
+    action          VARCHAR(10) NOT NULL,          -- HOLD | BUY | SELL
+    confidence      INTEGER DEFAULT 0,
+    rejection_stage VARCHAR(50),                   -- entry_quality | confidence | btc_filter | cooldown | prefilter
+    rejection_reason TEXT,                         -- human-readable reason
+    long_score      INTEGER DEFAULT 0,
+    short_score     INTEGER DEFAULT 0,
+    volume_ratio    DOUBLE PRECISION DEFAULT 0.0,
+    volume_spike    BOOLEAN DEFAULT FALSE,
+    rsi             DOUBLE PRECISION DEFAULT 0.0,
+    ema_dist_pct    DOUBLE PRECISION DEFAULT 0.0,
+    regime          VARCHAR(30),
+    btc_bias        VARCHAR(20),
+    strategy_type   VARCHAR(50),
+    created_at      TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_signal_diag_symbol   ON signal_diagnostics(symbol);
+CREATE INDEX IF NOT EXISTS idx_signal_diag_created  ON signal_diagnostics(created_at);
+CREATE INDEX IF NOT EXISTS idx_signal_diag_stage    ON signal_diagnostics(rejection_stage);
+
+-- V17: Watchlist spam cooldown — tracks last post time per symbol+side
+CREATE TABLE IF NOT EXISTS watchlist_cooldown (
+    id          SERIAL PRIMARY KEY,
+    symbol      VARCHAR(20) NOT NULL,
+    side        VARCHAR(10) NOT NULL,
+    last_posted TIMESTAMP NOT NULL DEFAULT NOW(),
+    post_count  INTEGER DEFAULT 1,
+    confidence  INTEGER DEFAULT 0,
+    trigger_price DOUBLE PRECISION,
+    UNIQUE (symbol, side)
+);
+CREATE INDEX IF NOT EXISTS idx_watchlist_cd_symbol ON watchlist_cooldown(symbol);
+CREATE INDEX IF NOT EXISTS idx_watchlist_cd_posted ON watchlist_cooldown(last_posted);
+
+-- V17: signals table additions for enhanced tracking
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS rejection_stage   VARCHAR(50);
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS long_score        INTEGER DEFAULT 0;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS short_score       INTEGER DEFAULT 0;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS volume_ratio      DOUBLE PRECISION DEFAULT 0.0;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS is_volume_spike   BOOLEAN DEFAULT FALSE;
+
