@@ -457,439 +457,46 @@ class TelegramNotifier:
 
             skip_block = "\n<b>Skipped:</b>\n" + "\n".join(skip_lines_list)
 
-        msg = (
-
-            f"{title}\n\n"
-
-            f"Coin: <b>{symbol}</b>\n"
-
-            f"Side: <b>{direction}</b>\n"
-
-            f"Confidence: <b>{confidence}%</b>"
-
-            f"{grade_line}"
-
-            f"{strategy_line}"
-
-            f"{regime_line}\n\n"
-
-            f"{accounts_block}"
-
-            f"Entry: <b>{entry_str}</b>\n"
-
-            f"Leverage: <b>{leverage_str}</b>\n"
-
-            f"Method: <b>{order_method}</b>"
-
-            f"{roi_line}\n\n"
-
-            f"{tp_block}"
-
-            f"{rr_line}\n\n"
-
-            f"<b>Protection:</b>\n{protection_line}"
-
-            f"{proof_line}"
-
-            f"{reason_block}"
-
-            f"{skip_block}"
-
-        )
-
-        return msg
-
-    async def send_execution_result(
-
-        self,
-
-        symbol: str,
-
-        side: str,
-
-        confidence: int,
-
-        executed_count: int,
-
-        skipped_count: int,
-
-        skip_reasons: dict,
-
-        entry_price: float,
-
-        fill_price: float,
-
-        leverage: int,
-
-        take_profit: float,
-
-        stop_loss: float,
-
-        tp_pct: float = 0.0,
-
-        sl_pct: float = 0.0,
-
-        tp_roi_pct: float = 0.0,
-
-        sl_roi_pct: float = 0.0,
-
-        margin_pct: float = 0.0,        # kept for API compat, NOT shown
-
-        margin_usdt: float = 0.0,       # kept for API compat, NOT shown
-
-        account_balance: float = 0.0,   # kept for API compat, NOT shown
-
-        reason: str = "",
-
-        setup_grade: str = "",
-
-        order_method: str = "MARKET",
-
-        strategy_type: str = "",
-
-        regime: str = "",
-
-        sl_attached: bool = True,
-
-        tp_attached: bool = True,
-
-        sl_order_id: str = "",
-
-        tp_order_id: str = "",
-
-        risk_reward: float = 0.0,
-
-        partial_tp_enabled: bool = False,
-
-        tp1_price: float = 0.0,
-
-        tp2_price: float = 0.0,
-
-        protection_mode: str = "",
-
-    ):
-
-        """V13: Multi-account execution message. Uses unified builder."""
-
-        msg = self._build_trade_opened_message(
-
-            symbol=symbol, side=side, confidence=confidence,
-
-            entry_price=entry_price, fill_price=fill_price,
-
-            leverage=leverage, take_profit=take_profit, stop_loss=stop_loss,
-
-            tp_roi_pct=tp_roi_pct, sl_roi_pct=sl_roi_pct,
-
-            tp_pct=tp_pct, sl_pct=sl_pct, risk_reward=risk_reward,
-
-            setup_grade=setup_grade, strategy_type=strategy_type,
-
-            regime=regime, reason=reason, order_method=order_method,
-
-            executed_count=executed_count, skipped_count=skipped_count,
-
-            skip_reasons=skip_reasons or {},
-
-            protection_mode=protection_mode,
-
-            sl_attached=sl_attached, tp_attached=tp_attached,
-
-            sl_order_id=sl_order_id, tp_order_id=tp_order_id,
-
-            partial_tp_enabled=partial_tp_enabled,
-
-            tp1_price=tp1_price, tp2_price=tp2_price,
-
-        )
-
-        await self.send(msg)
-
-    async def trade_opened(
-
-        self,
-
-        symbol: str,
-
-        side: str,
-
-        entry_price: float,
-
-        leverage: int,
-
-        position_size: float = 0.0,
-
-        take_profit: float = 0.0,
-
-        stop_loss: float = 0.0,
-
-        confidence: int = 0,
-
-        tp_pct: float = 0.0,
-
-        sl_pct: float = 0.0,
-
-        setup_grade: str = "",
-
-        daily_pnl_pct: float = 0.0,
-
-        account_label: str = "",       # API compat, never shown
-
-        tp_roi_pct: float = 0.0,
-
-        sl_roi_pct: float = 0.0,
-
-        risk_reward: float = 0.0,
-
-        strategy_type: str = "",
-
-        regime: str = "",
-
-        reason: str = "",
-
-        order_method: str = "MARKET",
-
-        fill_price: float = 0.0,
-
-    ):
-
-        """
-
-        V13: Single-account trade notification.
-
-        Old simple template REMOVED — always uses unified full-detail builder.
-
-        Called by /execute and /execute-full routes.
-
-        """
-
-        msg = self._build_trade_opened_message(
-
-            symbol=symbol, side=side, confidence=confidence,
-
-            entry_price=entry_price, fill_price=fill_price,
-
-            leverage=leverage, take_profit=take_profit, stop_loss=stop_loss,
-
-            tp_roi_pct=tp_roi_pct, sl_roi_pct=sl_roi_pct,
-
-            tp_pct=tp_pct, sl_pct=sl_pct, risk_reward=risk_reward,
-
-            setup_grade=setup_grade, strategy_type=strategy_type,
-
-            regime=regime, reason=reason, order_method=order_method,
-
-            executed_count=1, skipped_count=0, skip_reasons={},
-
-            protection_mode="external_engine",
-
-        )
-
-        await self.send(msg)
-
-    # ═══════════════════════════════════════════════════════════════════
-
-    # V14: SIGNAL-FIRST ARCHITECTURE
-
-    #   Phase 1 → send_signal_detected()  fires BEFORE account execution
-
-    #   Phase 2 → send_execution_followup() fires only if accounts fill
-
-    # ═══════════════════════════════════════════════════════════════════
-
-    async def send_signal_detected(
-
-        self,
-
-        symbol: str,
-
-        side: str,
-
-        confidence: int,
-
-        strategy_type: str = "",
-
-        regime: str = "",
-
-        setup_grade: str = "",
-
-        entry_price: float = 0.0,
-
-        take_profit: float = 0.0,
-
-        stop_loss: float = 0.0,
-
-        tp_pct: float = 0.0,
-
-        sl_pct: float = 0.0,
-
-        tp_roi_pct: float = 0.0,
-
-        sl_roi_pct: float = 0.0,
-
-        leverage_suggestion: str = "",
-
-        reason: str = "",
-
-        # V15: pullback zone bounds
-
-        entry_zone_low: float = 0.0,
-
-        entry_zone_high: float = 0.0,
-
-        pullback_monitoring: bool = False,
-
-    ):
-
-        """
-
-        V15 Phase 1: Send signal alert BEFORE Binance execution is attempted.
-
-        Fires for every valid setup that passes all AI / confidence / filter gates.
-
-        Execution may or may not happen afterward — signal is always sent here first.
-
-        Shows Entry Zone as a range (signal_price ± pullback %) for pullback mode.
-
-        """
-
-        direction = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
-
-        # Strategy display
-
-        if strategy_type.startswith("swing"):
-
-            strat_display = "🌊 Swing"
-
-        elif strategy_type.startswith("sniper"):
-
-            strat_display = "🎯 Sniper"
-
+        # V18: TP1 = midpoint, TP2 = full target
+        if side == "BUY":
+            tp1_price = entry_price * (1 + (tp_pct * 0.5) / 100)
+            tp2_price = tp_price
         else:
+            tp1_price = entry_price * (1 - (tp_pct * 0.5) / 100)
+            tp2_price = tp_price
 
-            strat_display = "⚡ Scalp"
-
-        # Grade line
-
-        grade_emoji = {"A": "⭐", "B": "🔷", "C": "🔸"}.get(setup_grade, "")
-
-        grade_line = f"\nGrade: <b>{grade_emoji} {setup_grade}</b>" if setup_grade else ""
-
-        # Regime line
-
-        regime_display = ""
-
-        if regime:
-
-            regime_map = {
-
-                "TRENDING_BULL": "🟢 Trending Bull",
-
-                "TRENDING_BEAR": "🔴 Trending Bear",
-
-                "SIDEWAYS_RANGE": "↔️ Sideways",
-
-                "BREAKOUT_EXPANSION": "💥 Breakout",
-
-                "HIGH_VOLATILITY": "⚠️ High Volatility",
-
-                "DEAD_MARKET": "💤 Dead Market",
-
-            }
-
-            regime_display = regime_map.get(regime, regime)
-
-        regime_line = f"\nRegime: <b>{regime_display}</b>" if regime_display else ""
-
-        # V15: Entry zone — show range if pullback monitoring, else single price
-
-        if pullback_monitoring and entry_zone_low > 0 and entry_zone_high > 0:
-
-            zone_str = f"<b>${min(entry_zone_low, entry_zone_high):,.6f} – ${max(entry_zone_low, entry_zone_high):,.6f}</b>"
-
-        elif entry_price > 0:
-
-            zone_str = f"<b>${entry_price:,.6f}</b>"
-
-        else:
-
-            zone_str = "<b>market</b>"
-
-        lev_str = leverage_suggestion if leverage_suggestion else "auto"
-
-        # V15: TP/SL shown as percentages (fixed model)
-
-        tp_line = ""
-
-        if tp_pct > 0:
-
-            tp_line = f"\nTP: <b>{tp_pct:.0f}%</b>"
-
-            if take_profit > 0:
-
-                tp_line += f" (${take_profit:,.6f})"
-
-        sl_line = ""
-
-        if sl_pct > 0:
-
-            sl_line = f"\nSL: <b>{sl_pct:.0f}%</b>"
-
-            if stop_loss > 0:
-
-                sl_line += f" (${stop_loss:,.6f})"
-
-        # V15: Execution status
-
-        if pullback_monitoring:
-
-            exec_status = "<i>⏳ Monitoring for pullback entry…</i>"
-
-        else:
-
-            exec_status = "<i>Attempting account execution…</i>"
-
-        # Reason block
-
-        reason_block = f"\n\n<b>Reason:</b>\n<i>{reason[:300]}</i>" if reason else ""
+        tp1_line = f"🎯 TP1: <b>${tp1_price:,.6f}</b>"
+        tp2_line = f"🎯 TP2: <b>${tp2_price:,.6f}</b> ({tp_sign}{tp_pct:.1f}%)"
+        status_line = "🟡 <b>WAITING FOR ENTRY</b>"
+        strat_display = (strategy_type or "momentum_continuation").replace("_", " ").title()
 
         msg = (
-
-            f"📡 <b>SIGNAL DETECTED</b>\n\n"
-
-            f"Coin: <b>{symbol}</b>\n"
-
+            f"{title_line}\n\n"
+            f"💱 Pair: <b>{symbol}</b>\n"
             f"Side: <b>{direction}</b>\n"
-
-            f"Type: <b>{strat_display}</b>"
-
-            f"{grade_line}"
-
-            f"{regime_line}\n"
-
-            f"Confidence: <b>{confidence}%</b>\n\n"
-
-            f"Entry Zone: {zone_str}\n"
-
-            f"Leverage Suggestion: <b>{lev_str}</b>"
-
-            f"{tp_line}"
-
-            f"{sl_line}\n\n"
-
-            f"Execution Status: {exec_status}"
-
+            f"\n"
+            f"📍 Entry Zone:\n"
+            f"  <b>${min(entry_zone_low, entry_zone_high):,.6f}</b>"
+            f" – <b>${max(entry_zone_low, entry_zone_high):,.6f}</b>\n"
+            f"\n"
+            f"🛡 SL: <b>${sl_price:,.6f}</b> ({sl_sign}{sl_pct:.1f}%)\n"
+            f"{tp1_line}\n"
+            f"{tp2_line}\n"
+            f"\n"
+            f"Confidence: <b>{confidence}%</b>\n"
+            f"Strategy: <b>{strat_display}</b>"
+            f"{regime_line}"
+            f"{btc_line}"
+            f"{rr_line}"
+            f"\n\n"
+            f"Status: {status_line}"
             f"{reason_block}"
-
         )
-
         try:
-
-            await self.send(msg)
-
+            return await self.send(msg)
         except Exception as e:
-
-            logger.error(f"[V15] send_signal_detected failed: {e}")
+            logger.error("[TELEGRAM SEND FAILED] send_signal_alert: %s", e)
+            return False
 
     async def send_execution_followup(
 
@@ -1738,60 +1345,14 @@ class TelegramNotifier:
         return await self.send("\n".join(lines))
 
     async def send_swing_watchlist(self, setups: list) -> bool:
-
-        """
-
-        V11: Send ONE grouped SWING watchlist message instead of per-coin spam.
-
-        Format:
-
-            🌊 SWING WATCHLIST
-
-            1. ETHUSDT 🟢 LONG 78% — ema20 pullback
-
-            2. LINKUSDT 🔴 SHORT 75% — breakout retest
-
-            Total: 2 | Execute at 80%+
-
-        """
-
-        if not setups:
-
-            return False
-
-        lines = ["🌊 <b>SWING WATCHLIST</b>", ""]
-
-        for i, s in enumerate(setups[:15], 1):
-
-            sym = s.get("symbol", "?")
-
-            raw_side = s.get("action") or s.get("side", "BUY")
-
-            side_icon = "🟢 LONG" if raw_side == "BUY" else "🔴 SHORT"
-
-            conf = s.get("confidence", 0)
-
-            setup = (s.get("setup_type") or s.get("strategy_type") or "").replace("swing_", "").replace("_", " ")
-
-            trigger = s.get("trigger_price", 0)
-
-            t_str = f" | trigger ${trigger:,.4f}" if trigger > 0 else ""
-
-            lines.append(
-
-                f"{i}. <b>{sym}</b> {side_icon} <b>{conf}%</b>"
-
-                + (f" — {setup}" if setup else "")
-
-                + t_str
-
-            )
-
-        lines += ["", f"Total: <b>{len(setups)}</b> swing setup(s)"]
-
-        lines += ["<i>Will execute when confidence >= 80% and trigger is hit.</i>"]
-
-        return await self.send("\n".join(lines))
+        """V18: DEPRECATED — watchlist messages replaced by direct signals.
+        This method is a no-op stub kept for backward compatibility."""
+        logger.info(
+            "[V18 DEPRECATED] send_swing_watchlist called with %d setups"
+            " — SUPPRESSED (V18 direct-signal mode active)",
+            len(setups)
+        )
+        return False
 
     async def send_stale_trade_alert(
 
