@@ -1,19 +1,17 @@
 """
-V5.5 Analyzer API — Multi-Strategy Orchestrator
+V18 Analyzer API — Backend-First Direct Signal Architecture
 
 Endpoints:
-  POST /analyze       — Single coin analysis
-  POST /analyze-batch — Batch analysis with ALL 4 engines
+  POST /analyze        — Single coin analysis
+  POST /analyze-batch  — Batch analysis with ALL 4 engines
+  POST /analyze-scalp  — Scalp-only batch (V18: auto-registers signals directly)
+  POST /analyze-swing  — Swing-only batch  (V18: high-conf → direct signal, sub-threshold → watchlist)
 
-V5.5 Flow:
-  1. Detect market regime (ENGINE D)
-  2. Apply session multiplier
-  3. Scalp analysis with 3 sub-strategies (ENGINE A)
-  4. Swing watchlist update + new scan (ENGINE B)
-  5. Sniper/news scan with quality filter (ENGINE C)
-  6. Run engine conflict resolver
-  7. Apply bad symbol cooldowns
-  8. Merge and rank all signals with strategy weight adjustments
+V18 Signal Flow:
+  Python Backend: AI detects setup → _register_signal_direct() → DB save → Telegram
+  n8n: scheduling | lifecycle monitoring | TP/SL tracking | daily reports
+
+N8N IS NOT USED FOR SIGNAL ROUTING — all signal creation happens here.
 """
 
 import asyncio
@@ -32,6 +30,26 @@ from app.modules.telegram import TelegramNotifier
 from app.modules.signal_tracker_v16 import signal_tracker_v16  # V16
 from app.config import settings
 from app.utils.serialization import clean_json_types
+
+# V18: Backend-first signal registration — imported lazily to avoid circular imports
+async def _post_signal_direct(coin: dict, regime: str, source: str) -> dict:
+    """Thin wrapper that imports and calls _register_signal_direct."""
+    from app.routers.executor import _register_signal_direct
+    return await _register_signal_direct(
+        symbol        = coin["symbol"],
+        action        = coin.get("action", "HOLD"),
+        confidence    = int(coin.get("confidence", 0)),
+        current_price = float(coin.get("current_price", 0.0)),
+        strategy_type = coin.get("strategy_type", "scalp_trend_pullback"),
+        reason        = coin.get("reason", ""),
+        atr           = float(coin.get("atr", 0.0)),
+        atr_pct       = float(coin.get("atr_pct", 0.0)),
+        spread_pct    = float(coin.get("spread_pct", 0.0)),
+        rsi           = float(coin.get("rsi", 50.0)),
+        regime        = regime,
+        setup_grade   = coin.get("setup_grade", ""),
+        source        = source,
+    )
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -473,8 +491,8 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
     if prefilter_skipped > 0:
         logger.info(f"  V16 Pre-filter: {len(prefilter_passed)} pass / {prefilter_skipped} skipped")
 
-    # Limit AI batch to top 8 for cost control
-    ai_batch = prefilter_passed[:8]
+    # V18: Raised from 8 → 15 — wider coverage for direct signal posting
+    ai_batch = prefilter_passed[:15]
     cache_hits = 0
 
     async def analyze_scalp_coin(symbol: str, spread: float):
@@ -599,9 +617,9 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
 
     filtered.sort(key=lambda x: x.get("confidence", 0), reverse=True)
 
-    # Split: tradeable vs watchlist
-    SCALP_MIN = settings.SCALP_MIN_CONFIDENCE       # 65
-    SCALP_WATCH = settings.SCALP_WATCHLIST_CONFIDENCE  # 55
+    # ── V18: Split + direct-post signals ──────────────────────────────
+    SCALP_MIN   = settings.SCALP_MIN_CONFIDENCE         # 70
+    SCALP_WATCH = settings.SCALP_WATCHLIST_CONFIDENCE   # 55
 
     tradeable = [
         c for c in filtered
@@ -614,21 +632,49 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
         and SCALP_WATCH <= c.get("confidence", 0) < SCALP_MIN
     ]
 
+    # V18: Auto-register every tradeable scalp signal directly in Python.
+    # No n8n routing needed — backend posts to DB + Telegram immediately.
+    signals_posted = 0
+    signal_results = []
+    for coin in tradeable:
+        try:
+            result = await _post_signal_direct(coin, regime, source="scalp_engine")
+            if result.get("status") == "signal_generated":
+                signals_posted += 1
+                signal_results.append({
+                    "symbol": coin["symbol"],
+                    "signal_id_label": result.get("signal_id_label"),
+                    "confidence": result.get("confidence"),
+                    "side": result.get("side"),
+                })
+                logger.info(
+                    f"  ⚡ [V18 SCALP SIGNAL] {result.get('signal_id_label')} "
+                    f"{coin['symbol']} {coin.get('action')} conf={result.get('confidence')}%"
+                )
+            else:
+                logger.info(
+                    f"  [V18 SCALP SKIP] {coin['symbol']}: {result.get('status')} — "
+                    f"{result.get('reason', '')[:80]}"
+                )
+        except Exception as se:
+            logger.error(f"  [V18 SCALP POST] {coin['symbol']} failed: {se}")
+
     logger.info(
-        f"  V11 Scalp result: {len(analyzed)} scalp | {len(sniper_signals)} sniper | "
-        f"Tradeable: {len(tradeable)} | Watchlist: {len(scalp_watchlist)} | "
-        f"Regime: {regime} | Session: {session_mult} | "
-        f"Pre-filter: {len(ai_batch)}/{len(req.coins)} | Cache hits: {cache_hits}"
+        f"  V18 Scalp result: {len(analyzed)} analyzed | {len(sniper_signals)} sniper | "
+        f"Tradeable: {len(tradeable)} | Signals posted: {signals_posted} | "
+        f"Watchlist: {len(scalp_watchlist)} | Regime: {regime} | "
+        f"Session: {session_mult} | Pre-filter: {len(ai_batch)}/{len(req.coins)} | "
+        f"Cache hits: {cache_hits}"
     )
 
-    has_signals = len(tradeable) > 0
+    has_signals = signals_posted > 0
 
     # V16: Quiet market timer — send Telegram at most once per 15 min if no signals
     if not has_signals:
         global _last_quiet_sent
-        now_ts = _time.time()
-        if (now_ts - _last_quiet_sent) >= _QUIET_INTERVAL_S:
-            _last_quiet_sent = now_ts
+        now_ts_q = _time.time()
+        if (now_ts_q - _last_quiet_sent) >= _QUIET_INTERVAL_S:
+            _last_quiet_sent = now_ts_q
             try:
                 telegram_n = TelegramNotifier()
                 await telegram_n.send_quiet_market(
@@ -638,15 +684,17 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
                 logger.debug(f"  Quiet market telegram failed (non-critical): {tq_err}")
 
     return clean_json_types({
-        "status": "ok",
-        "analyzed": len(analyzed),
-        "count": len(filtered[:req.top_n]),
-        "tradeable_count": len(tradeable),
-        "has_signals": len(tradeable) > 0,
-        "regime": regime,
+        "status":           "ok",
+        "analyzed":         len(analyzed),
+        "count":            len(filtered[:req.top_n]),
+        "tradeable_count":  len(tradeable),
+        "signals_posted":   signals_posted,   # V18: how many went to DB+Telegram
+        "has_signals":      has_signals,
+        "regime":           regime,
         "session_multiplier": session_mult,
-        "scalp_watchlist": scalp_watchlist,
-        "coins": tradeable if tradeable else filtered[:req.top_n],
+        "scalp_watchlist":  scalp_watchlist,
+        "signals":          signal_results,   # V18: signal ID labels for n8n logging
+        "coins":            tradeable if tradeable else filtered[:req.top_n],
     })
 
 
@@ -711,25 +759,71 @@ async def analyze_swing_batch(req: SwingBatchRequest):
         logger.warning(f"Swing watchlist update failed: {e}")
 
     # Step 3: Scan top 20 for new swing setups
+    # V18: High-confidence setups → direct signal registration
+    #       Sub-threshold setups → watchlist (monitoring only)
+    SWING_DIRECT_MIN = getattr(settings, "SWING_MIN_CONFIDENCE_EXECUTE", 72)
+    swing_signals_posted = 0
     try:
         top_symbols = [c.symbol for c in req.coins[:20]]
         new_setups = await swing_engine.scan_multiple(top_symbols, regime)
         if new_setups:
-            await swing_engine.save_to_watchlist(new_setups)
-            logger.info(f"  🔭 {len(new_setups)} new swing setups saved to watchlist")
+            direct_setups   = [s for s in new_setups if s.confidence >= SWING_DIRECT_MIN]
+            watchlist_setups = [s for s in new_setups if s.confidence < SWING_DIRECT_MIN]
+
+            # Save sub-threshold to watchlist (future re-eval)
+            if watchlist_setups:
+                await swing_engine.save_to_watchlist(watchlist_setups)
+                logger.info(
+                    f"  🔭 {len(watchlist_setups)} swing setups saved to watchlist "
+                    f"(conf < {SWING_DIRECT_MIN}%)"
+                )
+
+            # V18: Direct register high-confidence swing signals
+            for s in direct_setups:
+                coin_data = {
+                    "symbol":        s.symbol,
+                    "action":        s.side,
+                    "confidence":    s.confidence,
+                    "current_price": s.current_price,
+                    "strategy_type": f"swing_{s.setup_type}",
+                    "reason":        s.reason,
+                    "atr":           0.0,
+                    "atr_pct":       0.0,
+                    "spread_pct":    0.0,
+                    "rsi":           50.0,
+                    "setup_grade":   "B",
+                }
+                try:
+                    result = await _post_signal_direct(coin_data, regime, source="swing_engine")
+                    if result.get("status") == "signal_generated":
+                        swing_signals_posted += 1
+                        logger.info(
+                            f"  🌊 [V18 SWING SIGNAL] {result.get('signal_id_label')} "
+                            f"{s.symbol} {s.side} conf={s.confidence}%"
+                        )
+                    else:
+                        # Rejected by confidence/R:R gate — save to watchlist instead
+                        await swing_engine.save_to_watchlist([s])
+                        logger.info(
+                            f"  [V18 SWING→WATCH] {s.symbol}: {result.get('reason', '')[:80]}"
+                        )
+                except Exception as se:
+                    logger.error(f"  [V18 SWING POST] {s.symbol} failed: {se}")
+                    await swing_engine.save_to_watchlist([s])
+
             new_watchlist_setups = [
                 {
-                    "symbol": s.symbol,
-                    "action": s.side,
-                    "side": s.side,
-                    "confidence": s.confidence,
-                    "setup_type": s.setup_type,
+                    "symbol":        s.symbol,
+                    "action":        s.side,
+                    "side":          s.side,
+                    "confidence":    s.confidence,
+                    "setup_type":    s.setup_type,
                     "trigger_price": s.trigger_price,
                     "current_price": s.current_price,
-                    "reason": s.reason,
+                    "reason":        s.reason,
                     "strategy_type": f"swing_{s.setup_type}",
                 }
-                for s in new_setups
+                for s in watchlist_setups
             ]
     except Exception as e:
         logger.warning(f"Swing new scan failed: {e}")
@@ -764,22 +858,24 @@ async def analyze_swing_batch(req: SwingBatchRequest):
             except Exception as tw_err:
                 logger.debug(f"Swing watchlist telegram failed: {tw_err}")
 
-    has_signals = len(triggered_setups) > 0
+    has_signals = len(triggered_setups) > 0 or swing_signals_posted > 0
 
     logger.info(
-        f"  V11 Swing result: {len(triggered_setups)} triggered | "
-        f"{len(new_watchlist_setups)} new setups | Regime: {regime}"
+        f"  V18 Swing result: {len(triggered_setups)} watchlist-triggered | "
+        f"{swing_signals_posted} direct signals posted | "
+        f"{len(new_watchlist_setups)} new watchlist entries | Regime: {regime}"
     )
 
     return clean_json_types({
-        "status": "ok",
-        "analyzed": len(req.coins),
-        "count": len(triggered_setups),
-        "tradeable_count": len(triggered_setups),
-        "has_signals": has_signals,
-        "regime": regime,
+        "status":                   "ok",
+        "analyzed":                 len(req.coins),
+        "count":                    len(triggered_setups) + swing_signals_posted,
+        "tradeable_count":          len(triggered_setups) + swing_signals_posted,
+        "signals_posted":           swing_signals_posted,   # V18
+        "has_signals":              has_signals,
+        "regime":                   regime,
         "swing_watchlist_triggered": len(triggered_setups),
-        "new_swing_setups": len(new_watchlist_setups),
-        "swing_watchlist": new_watchlist_setups,
-        "coins": triggered_setups,
+        "new_swing_setups":         len(new_watchlist_setups),
+        "swing_watchlist":          new_watchlist_setups,
+        "coins":                    triggered_setups,
     })

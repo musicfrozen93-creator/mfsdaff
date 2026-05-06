@@ -2372,190 +2372,214 @@ async def get_symbol_price(symbol: str):
 # V16: POST /signal — Pure Signal Generation (NO Binance execution)
 # ═══════════════════════════════════════════════════════════════════════
 
-@router.post("/signal")
-async def generate_signal(req: SignalRequest):
+# ═══════════════════════════════════════════════════════════════════════
+# V18: _register_signal_direct() — Backend-first shared signal function
+#
+# Called by:
+#   - POST /signal       (n8n backward-compat)
+#   - /analyze-scalp     (auto-posts scalp signals directly)
+#   - /analyze-swing     (auto-posts swing signals directly)
+#
+# n8n is now ONLY used for: scheduling, lifecycle monitoring, TP/SL
+# tracking, daily report triggering, and diagnostics.
+# Python backend handles ALL signal creation and Telegram delivery.
+# ═══════════════════════════════════════════════════════════════════════
+
+async def _register_signal_direct(
+    symbol: str,
+    action: str,           # BUY | SELL
+    confidence: int,
+    current_price: float,
+    strategy_type: str,
+    reason: str = "",
+    atr: float = 0.0,
+    atr_pct: float = 0.0,
+    spread_pct: float = 0.0,
+    rsi: float = 50.0,
+    regime: str = "",
+    setup_grade: str = "",
+    btc_bias_override: str | None = None,  # skip BTC fetch if already known
+    source: str = "api",   # "api" | "scalp_engine" | "swing_engine"
+) -> dict:
     """
-    V16 Signal Engine — pure signal generation without any Binance trade execution.
+    V18 Core Signal Registration — backend-first, no n8n dependency.
 
     Flow:
-      1. Validate action (BUY/SELL only, skip HOLD)
-      2. Fetch BTC directional bias → apply confidence multiplier
-      3. Reject if confidence < MIN_CONFIDENCE after BTC penalty
-      4. Reject if high BTC volatility + confidence < 75
-      5. Compute ATR-adjusted TP/SL (fixed % model)
-      6. Compute R:R — reject if < 2.0
-      7. Check & invalidate any opposite signals for same coin
-      8. Assign daily sequential signal number
-      9. Persist to signals table with all tracking fields
-     10. Register with SignalTracker for virtual monitoring
-     11. Send Telegram signal alert
-     12. Return signal details
+      1. Validate action / price
+      2. BTC directional bias → confidence multiplier
+      3. Confidence gate
+      4. High-volatility gate
+      5. ATR-adjusted TP/SL computation
+      6. R:R gate (≥ 2.0)
+      7. Opposite signal invalidation
+      8. Daily signal number assignment
+      9. DB persist
+     10. SignalTracker register
+     11. Telegram signal alert
+     12. Return structured result
     """
-    symbol    = req.symbol.upper().strip()
-    action    = req.action.upper().strip()
-    raw_conf  = int(req.confidence)
-    price     = float(req.current_price)
-    atr_pct   = float(req.atr_pct)
-    strategy  = req.strategy_type
-    is_swing  = strategy.startswith("swing")
+    symbol  = symbol.upper().strip()
+    action  = action.upper().strip()
+    raw_conf = int(confidence)
+    price    = float(current_price)
+    atr_pct  = float(atr_pct)
+    strategy = strategy_type or "scalp_trend_pullback"
+    is_swing = strategy.startswith("swing")
 
-    # 1. Skip HOLD
+    # ── 1. Gate: action + price ─────────────────────────────────────────
     if action not in ("BUY", "SELL"):
-        return {"status": "skipped", "symbol": symbol, "reason": f"action={action} not actionable"}
-
+        return {"status": "skipped", "symbol": symbol,
+                "reason": f"action={action} not actionable"}
     if price <= 0:
-        return {"status": "error", "symbol": symbol, "reason": "current_price=0 — cannot compute TP/SL"}
+        return {"status": "error", "symbol": symbol,
+                "reason": "current_price=0 — cannot compute TP/SL"}
 
-    # 2. BTC Directional Bias
-    btc_bias     = "NEUTRAL"
+    # ── 2. BTC Directional Bias ─────────────────────────────────────────
+    btc_bias    = btc_bias_override or "NEUTRAL"
     btc_vol_high = False
-    try:
-        regime_router = MarketRegimeRouter()
-        btc_info      = await regime_router.get_btc_directional_bias()
-        btc_bias      = btc_info.get("bias", "NEUTRAL")
-        btc_vol_high  = btc_info.get("volatility_high", False)
+    adj_conf = raw_conf
+    if btc_bias_override is None:
+        try:
+            regime_router = MarketRegimeRouter()
+            btc_info      = await regime_router.get_btc_directional_bias()
+            btc_bias      = btc_info.get("bias", "NEUTRAL")
+            btc_vol_high  = btc_info.get("volatility_high", False)
+            mult = btc_info.get(
+                "long_confidence_multiplier" if action == "BUY" else "short_confidence_multiplier",
+                1.0
+            )
+            adj_conf = int(raw_conf * mult)
+            logger.info(
+                f"  [V18/{source}] {symbol} {action}: raw={raw_conf} "
+                f"btc={btc_bias} mult={mult} → adj={adj_conf}"
+            )
+        except Exception as e:
+            logger.warning(f"  [V18/{source}] BTC bias failed: {e} — using raw conf")
+            adj_conf = raw_conf
 
-        if action == "BUY":
-            mult = btc_info.get("long_confidence_multiplier", 1.0)
-        else:
-            mult = btc_info.get("short_confidence_multiplier", 1.0)
-
-        adj_conf = int(raw_conf * mult)
-        logger.info(
-            f"  [V16 /signal] {symbol} {action}: raw_conf={raw_conf} btc_bias={btc_bias} "
-            f"mult={mult} → adj_conf={adj_conf}"
-        )
-    except Exception as e:
-        logger.warning(f"  [V16 /signal] BTC bias failed: {e} — using raw confidence")
-        adj_conf = raw_conf
-
-    # 3. Min confidence gate
-    min_conf = settings.MIN_CONFIDENCE if hasattr(settings, "MIN_CONFIDENCE") else 65
+    # ── 3. Min confidence gate ──────────────────────────────────────────
+    min_conf = getattr(settings, "MIN_CONFIDENCE", 65)
     if adj_conf < min_conf:
         return {
-            "status": "rejected",
-            "symbol": symbol,
-            "reason": f"Confidence {adj_conf}% < threshold {min_conf}% after BTC bias penalty",
-            "btc_bias": btc_bias,
-            "raw_confidence": raw_conf,
-            "adj_confidence": adj_conf,
+            "status": "rejected", "symbol": symbol,
+            "reason": f"Confidence {adj_conf}% < threshold {min_conf}% after BTC bias",
+            "btc_bias": btc_bias, "raw_confidence": raw_conf, "adj_confidence": adj_conf,
         }
 
-    # 4. High volatility gate
+    # ── 4. High volatility gate ─────────────────────────────────────────
     if btc_vol_high and adj_conf < 75:
         return {
-            "status": "rejected",
-            "symbol": symbol,
-            "reason": f"BTC high volatility + confidence {adj_conf}% < 75 — skipping risky signal",
+            "status": "rejected", "symbol": symbol,
+            "reason": f"BTC high volatility + conf {adj_conf}% < 75 — skipping risky signal",
             "btc_bias": btc_bias,
         }
 
-    # 5. Compute ATR-adjusted TP/SL
-    # Base %: Scalp 15%TP/5%SL, Swing 40%TP/30%SL
-    # ATR adjustment: ±20% cap on base (never go below 50% of base)
-    if is_swing:
-        base_tp_pct = _SWING_TP_PCT
-        base_sl_pct = _SWING_SL_PCT
-    else:
-        base_tp_pct = _SCALP_TP_PCT
-        base_sl_pct = _SCALP_SL_PCT
-
-    # ATR multiplier: if ATR% is high, widen TP/SL slightly (max 20% wider)
+    # ── 5. ATR-adjusted TP/SL ───────────────────────────────────────────
+    base_tp_pct = _SWING_TP_PCT if is_swing else _SCALP_TP_PCT
+    base_sl_pct = _SWING_SL_PCT if is_swing else _SCALP_SL_PCT
     atr_mult = 1.0
     if atr_pct > 0:
-        atr_mult = min(1.0 + (atr_pct - 1.5) * 0.1, 1.2)  # 1.0 – 1.2 range
-        atr_mult = max(atr_mult, 0.8)  # never shrink below 80%
-
+        atr_mult = min(1.0 + (atr_pct - 1.5) * 0.1, 1.2)
+        atr_mult = max(atr_mult, 0.8)
     tp_pct = round(base_tp_pct * atr_mult, 2)
     sl_pct = round(base_sl_pct * atr_mult, 2)
+
+    pb_min = _SWING_PULLBACK_MIN if is_swing else _SCALP_PULLBACK_MIN
 
     if action == "BUY":
         tp_price = price * (1 + tp_pct / 100)
         sl_price = price * (1 - sl_pct / 100)
-        ez_low   = price * (1 - _SCALP_PULLBACK_MIN / 100) if not is_swing else price * (1 - _SWING_PULLBACK_MIN / 100)
-        ez_high  = price * (1 + 0.3 / 100)    # slight buffer above signal price
+        ez_low   = price * (1 - pb_min / 100)
+        ez_high  = price * (1 + 0.3 / 100)
     else:
         tp_price = price * (1 - tp_pct / 100)
         sl_price = price * (1 + sl_pct / 100)
         ez_low   = price * (1 - 0.3 / 100)
-        ez_high  = price * (1 + (_SCALP_PULLBACK_MIN / 100)) if not is_swing else price * (1 + (_SWING_PULLBACK_MIN / 100))
+        ez_high  = price * (1 + pb_min / 100)
 
-    # 6. R:R gate (must be ≥ 2.0)
+    # ── 6. R:R gate ─────────────────────────────────────────────────────
     rr = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0
     if rr < 2.0:
         return {
-            "status": "rejected",
-            "symbol": symbol,
-            "reason": f"R:R = 1:{rr:.1f} < minimum 1:2.0 — signal quality insufficient",
+            "status": "rejected", "symbol": symbol,
+            "reason": f"R:R = 1:{rr:.1f} < minimum 1:2.0",
         }
 
-    # 7. Invalidate opposite signals for same coin
+    # ── 7. Opposite signal invalidation ─────────────────────────────────
     telegram = TelegramNotifier()
     try:
         invalidated = await signal_tracker_v16.check_and_invalidate_opposite(
             symbol=symbol, new_side=action, new_signal_id=0, telegram=telegram,
         )
         if invalidated:
-            logger.info(f"  [V16] Invalidated {len(invalidated)} opposite signals for {symbol}")
+            logger.info(f"  [V18/{source}] Invalidated {len(invalidated)} opposite for {symbol}")
     except Exception as e:
-        logger.warning(f"  [V16] Opposite-signal check failed: {e}")
+        logger.warning(f"  [V18/{source}] Opposite-signal check failed: {e}")
 
-    # 8. Get daily signal number
+    # ── 8. Signal number ─────────────────────────────────────────────────
     signal_number = await signal_tracker_v16.get_next_signal_number()
+    # V18: Human-readable signal ID label
+    prefix = "SWG" if is_swing else "SCP"
+    signal_id_label = f"{prefix}-{signal_number:03d}"
 
-    # 9. Persist to DB
+    # ── 9. DB persist ────────────────────────────────────────────────────
+    signal_id = None
     try:
         async with async_session() as session:
             db_signal = Signal(
-                symbol        = symbol,
-                side          = action,
-                confidence    = adj_conf,
-                reason        = req.reason[:800] if req.reason else "",
-                ai_called     = True,
-                strategy_type = strategy,
-                regime        = req.regime,
-                signal_number = signal_number,
-                entry_price   = price,
-                tp_price      = round(tp_price, 8),
-                sl_price      = round(sl_price, 8),
-                tp_pct        = tp_pct,
-                sl_pct        = sl_pct,
+                symbol          = symbol,
+                side            = action,
+                confidence      = adj_conf,
+                reason          = reason[:800] if reason else "",
+                ai_called       = True,
+                strategy_type   = strategy,
+                regime          = regime,
+                signal_number   = signal_number,
+                entry_price     = price,
+                tp_price        = round(tp_price, 8),
+                sl_price        = round(sl_price, 8),
+                tp_pct          = tp_pct,
+                sl_pct          = sl_pct,
                 entry_zone_low  = round(ez_low, 8),
                 entry_zone_high = round(ez_high, 8),
-                status        = "PENDING",
-                atr           = float(req.atr),
-                atr_pct       = atr_pct,
-                btc_bias      = btc_bias,
+                status          = "PENDING",
+                atr             = float(atr),
+                atr_pct         = atr_pct,
+                btc_bias        = btc_bias,
             )
             session.add(db_signal)
-            await session.flush()   # get db_signal.id
+            await session.flush()
             signal_id = db_signal.id
             await session.commit()
-    except Exception as e:
-        logger.error(f"  [V16] DB persist failed for {symbol}: {e}")
-        return {"status": "error", "symbol": symbol, "reason": f"DB error: {str(e)[:100]}"}
-
-    # 10. Register with SignalTracker
-    try:
-        await signal_tracker_v16.register(
-            signal_id     = signal_id,
-            signal_number = signal_number,
-            symbol        = symbol,
-            side          = action,
-            entry_price   = price,
-            entry_zone_low  = round(ez_low, 8),
-            entry_zone_high = round(ez_high, 8),
-            tp_price      = round(tp_price, 8),
-            sl_price      = round(sl_price, 8),
-            tp_pct        = tp_pct,
-            sl_pct        = sl_pct,
-            strategy_type = strategy,
-            confidence    = adj_conf,
+        logger.info(
+            f"  📝 [V18/{source}] {signal_id_label} saved: "
+            f"{symbol} {action} conf={adj_conf}"
         )
     except Exception as e:
-        logger.warning(f"  [V16] SignalTracker.register failed: {e}")
+        logger.error(f"  [V18/{source}] DB persist failed for {symbol}: {e}")
+        return {"status": "error", "symbol": symbol, "reason": f"DB error: {str(e)[:100]}"}
 
-    # 11. Telegram alert (backend is primary sender)
+    # ── 10. SignalTracker register ────────────────────────────────────────
+    try:
+        await signal_tracker_v16.register(
+            signal_id       = signal_id,
+            signal_number   = signal_number,
+            symbol          = symbol,
+            side            = action,
+            entry_price     = price,
+            entry_zone_low  = round(ez_low, 8),
+            entry_zone_high = round(ez_high, 8),
+            tp_price        = round(tp_price, 8),
+            sl_price        = round(sl_price, 8),
+            tp_pct          = tp_pct,
+            sl_pct          = sl_pct,
+            strategy_type   = strategy,
+            confidence      = adj_conf,
+        )
+    except Exception as e:
+        logger.warning(f"  [V18/{source}] SignalTracker.register failed: {e}")
+
+    # ── 11. Telegram alert ───────────────────────────────────────────────
     telegram_sent = False
     try:
         telegram_sent = await telegram.send_signal_alert(
@@ -2571,68 +2595,76 @@ async def generate_signal(req: SignalRequest):
             tp_pct          = tp_pct,
             sl_pct          = sl_pct,
             strategy_type   = strategy,
-            setup_grade     = req.setup_grade,
-            regime          = req.regime,
+            setup_grade     = setup_grade,
+            regime          = regime,
             btc_bias        = btc_bias,
-            reason          = req.reason,
+            reason          = reason,
             atr_pct         = atr_pct,
             risk_reward     = rr,
         )
     except Exception as e:
-        logger.error(f"  [V16] Telegram send_signal_alert raised: {e}")
-        telegram_sent = False
-
-    # ─ Structured debug log (always emitted) ──────────────────────────────────────
-    logger.info(
-        f"  ✅ [V16 SIGNAL] "
-        f"signal_id={signal_id} | "
-        f"signal_number={signal_number:03d} | "
-        f"symbol={symbol} | "
-        f"side={action} | "
-        f"confidence={adj_conf}% | "
-        f"btc_bias={btc_bias} | "
-        f"tp={tp_pct}% sl={sl_pct}% rr=1:{rr} | "
-        f"telegram_sent={telegram_sent}"
-    )
-    if not telegram_sent:
-        logger.warning(
-            f"  ⚠️ [V16 TELEGRAM] Backend send FAILED for #{signal_number:03d} {symbol} — "
-            f"n8n failsafe node will handle delivery."
-        )
+        logger.error(f"  [V18/{source}] Telegram send_signal_alert raised: {e}")
 
     logger.info(
-        f"  ✅ [V16] Signal #{signal_number:03d} {symbol} {action} "
-        f"conf={adj_conf}% TP={tp_pct}% SL={sl_pct}% R:R=1:{rr}"
+        f"  ✅ [V18/{source}] {signal_id_label} {symbol} {action} "
+        f"conf={adj_conf}% TP={tp_pct}% SL={sl_pct}% R:R=1:{rr} "
+        f"tg={telegram_sent}"
     )
 
     return {
         "status":          "signal_generated",
         "signal_id":       signal_id,
         "signal_number":   signal_number,
+        "signal_id_label": signal_id_label,   # V18: SCP-001 / SWG-001
         "symbol":          symbol,
-        "side":            action,           # n8n alias for action
+        "side":            action,
         "action":          action,
         "trade_type":      "SWING" if is_swing else "SCALP",
         "raw_confidence":  raw_conf,
         "adj_confidence":  adj_conf,
-        "confidence":      adj_conf,          # convenience alias
+        "confidence":      adj_conf,
         "btc_bias":        btc_bias,
         "entry_price":     price,
-        "entry_low":       round(ez_low, 6),   # n8n alias
-        "entry_high":      round(ez_high, 6),  # n8n alias
+        "entry_low":       round(ez_low, 6),
+        "entry_high":      round(ez_high, 6),
         "entry_zone_low":  round(ez_low, 6),
         "entry_zone_high": round(ez_high, 6),
         "tp_price":        round(tp_price, 6),
         "sl_price":        round(sl_price, 6),
-        "tp":              tp_pct,             # n8n alias
-        "sl":              sl_pct,             # n8n alias
+        "tp":              tp_pct,
+        "sl":              sl_pct,
         "tp_pct":          tp_pct,
         "sl_pct":          sl_pct,
         "risk_reward":     rr,
         "strategy_type":   strategy,
         "atr_pct":         atr_pct,
-        "telegram_sent":   telegram_sent,      # n8n failsafe: send if False
+        "telegram_sent":   telegram_sent,
+        "source":          source,
     }
+
+
+@router.post("/signal")
+async def generate_signal(req: SignalRequest):
+    """
+    V18 Signal Engine — pure signal generation without Binance execution.
+    Delegates to _register_signal_direct() shared function.
+    n8n backward-compatible — same request/response contract as V16.
+    """
+    return await _register_signal_direct(
+        symbol        = req.symbol,
+        action        = req.action,
+        confidence    = req.confidence,
+        current_price = req.current_price,
+        strategy_type = req.strategy_type,
+        reason        = req.reason,
+        atr           = float(req.atr),
+        atr_pct       = float(req.atr_pct),
+        spread_pct    = float(req.spread_pct),
+        rsi           = float(req.rsi),
+        regime        = req.regime,
+        setup_grade   = req.setup_grade,
+        source        = "api",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2683,12 +2715,35 @@ async def get_daily_report(send_telegram: bool = True):
     pending   = sum(1 for s in signals_today if s.status in ("PENDING", "ENTRY_HIT", "DRAWDOWN_10", "DRAWDOWN_20"))
     win_rate  = (tp_count / (tp_count + sl_count) * 100) if (tp_count + sl_count) > 0 else 0.0
 
+    # V18: LONG/SHORT + scalp/swing breakdown
+    long_count  = sum(1 for s in signals_today if s.side == "BUY")
+    short_count = sum(1 for s in signals_today if s.side == "SELL")
+    scalp_count = sum(1 for s in signals_today if not (s.strategy_type or "").startswith("swing"))
+    swing_count = sum(1 for s in signals_today if (s.strategy_type or "").startswith("swing"))
+
+    # V18: Entry hit count + missed entries
+    entry_hit_count = sum(1 for s in signals_today if s.status in (
+        "ENTRY_HIT", "TP_HIT", "SL_HIT", "DRAWDOWN_10", "DRAWDOWN_20"
+    ))
+    missed_count = sum(1 for s in signals_today if s.status in ("EXPIRED", "MISSED"))
+
+    # V18: Average signal duration (entry hit → close)
+    durations = []
+    for s in signals_today:
+        if s.entry_hit_at and s.closed_at:
+            dur = (s.closed_at - s.entry_hit_at).total_seconds() / 60.0
+            if 0 < dur < 10000:
+                durations.append(dur)
+    avg_duration_min = round(sum(durations) / len(durations), 1) if durations else 0.0
+
     signal_log = [
         {
-            "number": s.signal_number or 0,
-            "symbol": s.symbol,
-            "side":   s.side,
-            "result": s.result or ("PENDING" if s.status in ("PENDING","ENTRY_HIT","DRAWDOWN_10","DRAWDOWN_20") else s.status),
+            "number":   s.signal_number or 0,
+            "symbol":   s.symbol,
+            "side":     s.side,
+            "type":     "SWING" if (s.strategy_type or "").startswith("swing") else "SCALP",
+            "result":   s.result or ("PENDING" if s.status in ("PENDING","ENTRY_HIT","DRAWDOWN_10","DRAWDOWN_20") else s.status),
+            "pnl":      round(s.pnl_percent, 2) if getattr(s, "pnl_percent", None) is not None else None,
         }
         for s in signals_today
     ]
@@ -2707,18 +2762,25 @@ async def get_daily_report(send_telegram: bool = True):
                 signal_log    = signal_log,
             )
         except Exception as e:
-            logger.error(f"[V16] Daily report Telegram failed: {e}")
+            logger.error(f"[V18] Daily report Telegram failed: {e}")
 
     return {
-        "status":       "ok",
-        "date":         today,
-        "total":        total,
-        "tp":           tp_count,
-        "sl":           sl_count,
-        "invalidated":  inv_count,
-        "pending":      pending,
-        "win_rate_pct": round(win_rate, 1),
-        "signals":      signal_log,
+        "status":           "ok",
+        "date":             today,
+        "total":            total,
+        "tp":               tp_count,
+        "sl":               sl_count,
+        "invalidated":      inv_count,
+        "pending":          pending,
+        "entry_hit":        entry_hit_count,
+        "missed":           missed_count,
+        "win_rate_pct":     round(win_rate, 1),
+        "long_count":       long_count,
+        "short_count":      short_count,
+        "scalp_count":      scalp_count,
+        "swing_count":      swing_count,
+        "avg_duration_min": avg_duration_min,
+        "signals":          signal_log,
     }
 
 
