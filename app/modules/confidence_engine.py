@@ -383,21 +383,21 @@ class ConfidenceEngine:
         if atr_pct > 5.0:
             return False, f"Extreme volatility: ATR%={atr_pct:.2f}% > 5%", 0
 
-        # 4. Fake pump/dump (wick > 3.0x body) — V17: relaxed from 2.5x
+        # 4. Fake pump/dump (wick > 3.5x body) — V18-debug: relaxed from 3.0x
         if side == "BUY" and body > 0:
-            if upper_wick > body * 3.0:
-                return False, "Fake pump: upper wick > 3x body (rejection)", 0
+            if upper_wick > body * 3.5:
+                return False, "Fake pump: upper wick > 3.5x body (rejection)", 0
         elif side == "SELL" and body > 0:
-            if lower_wick > body * 3.0:
-                return False, "Fake dump: lower wick > 3x body (bounce)", 0
+            if lower_wick > body * 3.5:
+                return False, "Fake dump: lower wick > 3.5x body (bounce)", 0
 
-        # 5. Very low volume (< 0.25x) — V17: relaxed from 0.3x
-        if volume_ratio < 0.25:
-            return False, f"Very low volume: {volume_ratio:.1f}x < 0.25x avg", 0
+        # 5. Very low volume (< 0.15x) — V18-debug: relaxed from 0.25x
+        if volume_ratio < 0.15:
+            return False, f"Very low volume: {volume_ratio:.1f}x < 0.15x avg", 0
 
-        # 6. Extreme chop — V17: relaxed from 0.03% to 0.015%
-        if ema_dist_pct < 0.015:
-            return False, f"Extreme chop: EMA dist={ema_dist_pct:.3f}% < 0.015%", 0
+        # 6. Extreme chop — V18-debug: relaxed from 0.015% to 0.008%
+        if ema_dist_pct < 0.008:
+            return False, f"Extreme chop: EMA dist={ema_dist_pct:.3f}% < 0.008%", 0
 
         # ── Soft Penalties — V17 reduced aggressiveness ───────────────
         penalty = 0
@@ -514,7 +514,7 @@ class ConfidenceEngine:
         )
 
         if not eq_passed:
-            logger.debug(f"  V17 Hard reject [{side}]: {eq_reason}")
+            logger.info(f"  ❌ V18 HARD REJECT [{side}]: {eq_reason}")
             return ConfidenceResult(
                 score=0, tier="NO_TRADE", action="HOLD",
                 reason=f"Entry quality rejected: {eq_reason}",
@@ -564,8 +564,8 @@ class ConfidenceEngine:
                 raw_score += 5.0
                 bonus_descriptions.append("momentum override +5")
 
-        # Step 6: Clamp to 0-92
-        final_score = max(0, min(int(round(raw_score)), 92))
+        # Step 6: Clamp to 0-95 — V18-debug: raised cap from 92
+        final_score = max(0, min(int(round(raw_score)), 95))
 
         # Step 7: Tier
         if final_score >= 88:
@@ -579,8 +579,8 @@ class ConfidenceEngine:
         else:
             tier = "NO_TRADE"
 
-        # Step 8: Action — V17: threshold lowered to 58 (was 60)
-        action = side if final_score >= 58 else "HOLD"
+        # Step 8: Action — V18-debug: threshold lowered to 55 (was 58)
+        action = side if final_score >= 55 else "HOLD"
 
         reason_parts = [
             f"V17 confidence={final_score} [{tier}]",
@@ -609,10 +609,10 @@ class ConfidenceEngine:
         }
 
         logger.debug(
-            f"  V17 Confidence [{side}]: {final_score} [{tier}] | "
-            f"T={trend_score:.0f} V={volume_score:.0f} M={momentum_score:.0f} "
-            f"S={structure_score:.0f} B={btc_score:.0f} L={spread_score:.0f} "
-            f"bonus={bonus} penalty={eq_penalty}"
+            f"  📊 V18 Confidence [{side}]: {final_score} [{tier}] | "
+            f"T={trend_score:.0f}/25 V={volume_score:.0f}/20 M={momentum_score:.0f}/15 "
+            f"S={structure_score:.0f}/15 B={btc_score:.0f}/15 L={spread_score:.0f}/10 "
+            f"bonus={bonus} penalty={eq_penalty} raw={raw_score:.0f}"
         )
 
         return ConfidenceResult(

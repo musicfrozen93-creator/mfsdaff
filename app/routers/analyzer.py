@@ -134,7 +134,7 @@ _CACHE_TTL_S = 300.0                     # 5 minutes
 
 _last_quiet_sent: float = 0.0
 
-_QUIET_INTERVAL_S = 900.0               # 15 minutes
+_QUIET_INTERVAL_S = 3600.0               # V18-debug: 60 minutes (was 15 min) — reduce spam
 
 
 
@@ -228,7 +228,7 @@ def _passes_prefilter(coin) -> bool:
 
 
 
-    return score >= 2
+    return score >= 1  # V18-debug: relaxed from 2 to 1 — let more coins through to AI analysis
 
 
 
@@ -1062,7 +1062,7 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
 
             "action": ai_result.get("action", "HOLD"),
 
-            "confidence": int(ai_result.get("confidence", 0) * session_mult),
+            "confidence": int(ai_result.get("confidence", 0)),  # V18-debug: removed session_mult double-apply
 
             "reason": ai_result.get("reason", ""),
 
@@ -1246,11 +1246,11 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
 
 
 
-    # ── V18: Split + direct-post signals ──────────────────────────────
+    # ── V18-debug: Split + direct-post signals (RELAXED for debugging) ──────
 
-    SCALP_MIN   = settings.SCALP_MIN_CONFIDENCE         # 70
+    SCALP_MIN   = 58  # V18-debug: hardcoded 58 (was settings.SCALP_MIN_CONFIDENCE=70)
 
-    SCALP_WATCH = settings.SCALP_WATCHLIST_CONFIDENCE   # 55
+    SCALP_WATCH = 50  # V18-debug: hardcoded 50 (was settings.SCALP_WATCHLIST_CONFIDENCE=55)
 
 
 
@@ -1276,11 +1276,26 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
 
 
 
+    # V18-debug: Per-coin diagnostic dump for ALL analyzed coins
+    for coin_diag in analyzed:
+        sym_d = coin_diag.get("symbol", "?")
+        act_d = coin_diag.get("action", "HOLD")
+        conf_d = coin_diag.get("confidence", 0)
+        reason_d = coin_diag.get("reason", "")[:100]
+        grade_d = coin_diag.get("setup_grade", "?")
+        strategy_d = coin_diag.get("strategy_type", "?")
+        rsi_d = coin_diag.get("rsi", 0)
+        logger.info(
+            f"  🔍 [DIAG] {sym_d}: {act_d} conf={conf_d} grade={grade_d} "
+            f"strategy={strategy_d} RSI={rsi_d:.0f} | {reason_d}"
+        )
+
+
     logger.info(
 
-        "[SIGNAL DEBUG] /analyze-scalp: tradeable=%s watchlist=%s filtered=%s regime=%s session_mult=%s",
+        "[SIGNAL DEBUG] /analyze-scalp: tradeable=%s watchlist=%s filtered=%s regime=%s session_mult=%s SCALP_MIN=%s",
 
-        len(tradeable), len(scalp_watchlist), len(filtered), regime, session_mult
+        len(tradeable), len(scalp_watchlist), len(filtered), regime, session_mult, SCALP_MIN
 
     )
 
@@ -1346,7 +1361,7 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
 
     logger.info(
 
-        f"  V18 Scalp result: {len(analyzed)} analyzed | {len(sniper_signals)} sniper | "
+        f"  V18-debug Scalp result: {len(analyzed)} analyzed | {len(sniper_signals)} sniper | "
 
         f"Tradeable: {len(tradeable)} | Signals posted: {signals_posted} | "
 
@@ -1363,10 +1378,51 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
     has_signals = signals_posted > 0
 
 
+    # ── V18-debug: LIVE TEST MODE ───────────────────────────────────
+    # If zero signals posted but we have candidates with conf >= 55,
+    # force-send the TOP 1 signal to verify pipeline works end-to-end.
+    if not has_signals and filtered:
+        # Find best non-HOLD candidate
+        best_candidates = [
+            c for c in filtered
+            if c.get("action") not in ("HOLD", None) and c.get("confidence", 0) >= 55
+        ]
+        if best_candidates:
+            best = best_candidates[0]  # already sorted by confidence desc
+            logger.warning(
+                f"  🧪 [LIVE TEST MODE] Force-sending top signal: "
+                f"{best['symbol']} {best.get('action')} conf={best.get('confidence')}"
+            )
+            try:
+                # V18-prod: Tag debug signals clearly for Telegram visibility
+                best["reason"] = f"⚠️ DEBUG SIGNAL | {best.get('reason', '')}"
+                test_result = await _post_signal_direct(best, regime, source="live_test_mode")
+                if test_result.get("status") == "signal_generated":
+                    signals_posted += 1
+                    has_signals = True
+                    signal_results.append({
+                        "symbol": best["symbol"],
+                        "signal_id_label": test_result.get("signal_id_label"),
+                        "confidence": test_result.get("confidence"),
+                        "side": test_result.get("side"),
+                        "source": "live_test_mode",
+                    })
+                    logger.info(
+                        f"  ✅ [LIVE TEST] Signal posted: {test_result.get('signal_id_label')} "
+                        f"{best['symbol']} conf={test_result.get('confidence')}%"
+                    )
+                else:
+                    logger.warning(
+                        f"  ❌ [LIVE TEST] Rejected: {best['symbol']} — "
+                        f"{test_result.get('status')}: {test_result.get('reason', '')[:100]}"
+                    )
+            except Exception as lt_err:
+                logger.error(f"  [LIVE TEST] Force-send failed: {lt_err}")
 
-    # V16: Quiet market timer — send Telegram at most once per 15 min if no signals
 
-    if not has_signals:
+    # V18-debug: Quiet market — ONLY send if zero candidates analyzed (not just zero tradeable)
+
+    if not has_signals and len(analyzed) == 0:
 
         global _last_quiet_sent
 

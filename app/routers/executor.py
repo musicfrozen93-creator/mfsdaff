@@ -2475,7 +2475,7 @@ async def _register_signal_direct(
     logger.info("[SIGNAL DEBUG] Gate 3 PASSED: %s adj_conf=%s min_conf=%s", symbol, adj_conf, min_conf)
 
     # ── 4. High volatility gate ─────────────────────────────────────────
-    if btc_vol_high and adj_conf < 75:
+    if btc_vol_high and adj_conf < 60:  # V18-debug: was 75
         return {
             "status": "rejected", "symbol": symbol,
             "reason": f"BTC high volatility + conf {adj_conf}% < 75 — skipping risky signal",
@@ -2507,7 +2507,7 @@ async def _register_signal_direct(
 
     # ── 6. R:R gate ─────────────────────────────────────────────────────
     rr = round(tp_pct / sl_pct, 2) if sl_pct > 0 else 0
-    if rr < 2.0:
+    if rr < 1.5:  # V18-debug: was 2.0
         return {
             "status": "rejected", "symbol": symbol,
             "reason": f"R:R = 1:{rr:.1f} < minimum 1:2.0",
@@ -2524,13 +2524,16 @@ async def _register_signal_direct(
     except Exception as e:
         logger.warning(f"  [V18/{source}] Opposite-signal check failed: {e}")
 
-    # ── 8. Signal number ─────────────────────────────────────────────────
+    # -- 8. Signal number -------------------------------------------------------
     signal_number = await signal_tracker_v16.get_next_signal_number()
     # V18: Human-readable signal ID label
     prefix = "SWG" if is_swing else "SCP"
     signal_id_label = f"{prefix}-{signal_number:03d}"
+    # V18-prod: Tag debug-forced signals clearly
+    if source == "live_test_mode":
+        signal_id_label = f"DBG-{signal_id_label}"
 
-    # ── 9. DB persist ────────────────────────────────────────────────────
+    # -- 9. DB persist ----------------------------------------------------------
     signal_id = None
     try:
         async with async_session() as session:

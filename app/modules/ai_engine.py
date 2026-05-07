@@ -363,22 +363,22 @@ class ScalpingEngine:
             high=high, low=low, open_price=open_price, close_price=close_price,
         )
 
-        # V17: Pick the best side — lowered threshold to 58
-        if long_result.score >= short_result.score and long_result.score >= 58:
+        # V18-debug: Pick the best side — lowered threshold to 55
+        if long_result.score >= short_result.score and long_result.score >= 55:
             action = "BUY" if not long_result.rejected else "HOLD"
             # V17: Log rejection reason for transparency
             if long_result.rejected:
                 logger.info(f"  [LONG REJECTED] {long_result.reject_reason}")
             return action, long_result.score, long_result.reason
-        elif short_result.score >= 58:
+        elif short_result.score >= 55:
             action = "SELL" if not short_result.rejected else "HOLD"
             if short_result.rejected:
                 logger.info(f"  [SHORT REJECTED] {short_result.reject_reason}")
             return action, short_result.score, short_result.reason
         else:
             best = max(long_result.score, short_result.score)
-            # V17: Detailed rejection logging
-            logger.debug(
+            # V18-debug: Detailed rejection logging at INFO level
+            logger.info(
                 f"  [HOLD] L={long_result.score}({'rejected: '+long_result.reject_reason if long_result.rejected else 'scored'})"
                 f" S={short_result.score}({'rejected: '+short_result.reject_reason if short_result.rejected else 'scored'})"
             )
@@ -910,7 +910,7 @@ class ScalpingEngine:
 
         best = None
         for name, (action, conf, reason), weight in strategies:
-            if action == "HOLD" or conf < 55:  # V17: lowered from 60
+            if action == "HOLD" or conf < 50:  # V18-debug: lowered from 55
                 continue
             adjusted_conf = int(conf * weight)
             adjusted_conf = max(50, min(adjusted_conf, 100))  # V7: cap at 100

@@ -522,7 +522,7 @@ class MarketRegimeRouter:
         for sig in scalp_signals:
             sym = sig.get("symbol", "")
             action = sig.get("action", "HOLD")
-            if action in ("BUY", "SELL") and sig.get("confidence", 0) >= 70:
+            if action in ("BUY", "SELL") and sig.get("confidence", 0) >= 55:  # V18-debug: was 70
                 direction_map.setdefault(sym, {"BUY": [], "SELL": []})
                 direction_map[sym][action].append("scalp")
                 all_signals.append(sig)
@@ -530,7 +530,7 @@ class MarketRegimeRouter:
         for sig in swing_signals:
             sym = sig.get("symbol", "")
             action = sig.get("action", "HOLD")
-            if action in ("BUY", "SELL") and sig.get("confidence", 0) >= 70:
+            if action in ("BUY", "SELL") and sig.get("confidence", 0) >= 55:  # V18-debug: was 70
                 direction_map.setdefault(sym, {"BUY": [], "SELL": []})
                 direction_map[sym][action].append("swing")
                 all_signals.append(sig)
@@ -538,7 +538,7 @@ class MarketRegimeRouter:
         for sig in sniper_signals:
             sym = sig.get("symbol", "")
             action = sig.get("action", "HOLD")
-            if action in ("BUY", "SELL") and sig.get("confidence", 0) >= 70:
+            if action in ("BUY", "SELL") and sig.get("confidence", 0) >= 55:  # V18-debug: was 70
                 direction_map.setdefault(sym, {"BUY": [], "SELL": []})
                 direction_map[sym][action].append("sniper")
                 all_signals.append(sig)
@@ -595,16 +595,16 @@ class MarketRegimeRouter:
 
         # London + NY overlap (13:00-16:00 UTC) = best liquidity
         if 13 <= hour < 16:
-            return 1.1  # Slight boost
+            return 1.05  # V18-debug: slight boost (was 1.1)
         # London session (08:00-16:00 UTC)
         elif 8 <= hour < 16:
             return 1.0
         # New York session (13:00-21:00 UTC)
         elif 13 <= hour < 21:
             return 1.0
-        # Asia session (00:00-08:00 UTC) — floor raised to 0.92 to prevent confidence kills
+        # Asia session (00:00-08:00 UTC) — V18-debug: raised floor to 0.95 (was 0.92)
         elif 0 <= hour < 8:
-            return 0.92
-        # Dead hours (21:00-00:00 UTC) — floor raised to 0.90
+            return 0.95
+        # Dead hours (21:00-00:00 UTC) — V18-debug: raised floor to 0.97 (was 0.90)
         else:
-            return 0.90
+            return 0.97
