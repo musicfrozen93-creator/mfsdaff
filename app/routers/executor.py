@@ -2529,9 +2529,6 @@ async def _register_signal_direct(
     # V18: Human-readable signal ID label
     prefix = "SWG" if is_swing else "SCP"
     signal_id_label = f"{prefix}-{signal_number:03d}"
-    # V18-prod: Tag debug-forced signals clearly
-    if source == "live_test_mode":
-        signal_id_label = f"DBG-{signal_id_label}"
 
     # -- 9. DB persist ----------------------------------------------------------
     signal_id = None

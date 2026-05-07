@@ -134,7 +134,7 @@ _CACHE_TTL_S = 300.0                     # 5 minutes
 
 _last_quiet_sent: float = 0.0
 
-_QUIET_INTERVAL_S = 3600.0               # V18-debug: 60 minutes (was 15 min) — reduce spam
+_QUIET_INTERVAL_S = 900.0               # V19: restored to 15 min (was 3600s debug)
 
 
 
@@ -145,14 +145,6 @@ _QUIET_INTERVAL_S = 3600.0               # V18-debug: 60 minutes (was 15 min) �
 _symbol_signal_cooldown: dict[str, dict] = {}  # symbol -> {"ts": float, "confidence": int, "side": str}
 
 _SIGNAL_COOLDOWN_S = 1200.0  # 20 minutes
-
-
-
-# V17: Watchlist spam suppression — same symbol+side suppressed for 30 min
-
-_watchlist_post_ts: dict[str, float] = {}  # "SYMBOL_SIDE" -> last_post_ts
-
-_WATCHLIST_COOLDOWN_S = 1800.0  # 30 minutes
 
 
 
@@ -228,7 +220,7 @@ def _passes_prefilter(coin) -> bool:
 
 
 
-    return score >= 1  # V18-debug: relaxed from 2 to 1 — let more coins through to AI analysis
+    return score >= 2  # V19: restored — keeps noise out of AI pipeline
 
 
 
@@ -1246,11 +1238,11 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
 
 
 
-    # ── V18-debug: Split + direct-post signals (RELAXED for debugging) ──────
+    # V19: Split + direct-post signals (using config thresholds)
 
-    SCALP_MIN   = 58  # V18-debug: hardcoded 58 (was settings.SCALP_MIN_CONFIDENCE=70)
+    SCALP_MIN   = settings.SCALP_MIN_CONFIDENCE   # V19: config (60)
 
-    SCALP_WATCH = 50  # V18-debug: hardcoded 50 (was settings.SCALP_WATCHLIST_CONFIDENCE=55)
+    SCALP_WATCH = settings.SCALP_WATCHLIST_CONFIDENCE  # V19: config (55)
 
 
 
@@ -1276,19 +1268,20 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
 
 
 
-    # V18-debug: Per-coin diagnostic dump for ALL analyzed coins
+    # V19: Compact per-coin diagnostic (safe types, no crash risk)
     for coin_diag in analyzed:
-        sym_d = coin_diag.get("symbol", "?")
-        act_d = coin_diag.get("action", "HOLD")
-        conf_d = coin_diag.get("confidence", 0)
-        reason_d = coin_diag.get("reason", "")[:100]
-        grade_d = coin_diag.get("setup_grade", "?")
-        strategy_d = coin_diag.get("strategy_type", "?")
-        rsi_d = coin_diag.get("rsi", 0)
-        logger.info(
-            f"  🔍 [DIAG] {sym_d}: {act_d} conf={conf_d} grade={grade_d} "
-            f"strategy={strategy_d} RSI={rsi_d:.0f} | {reason_d}"
-        )
+        try:
+            logger.debug(
+                "  🔍 [DIAG] %s: %s conf=%s grade=%s strategy=%s | %s",
+                coin_diag.get("symbol", "?"),
+                coin_diag.get("action", "HOLD"),
+                coin_diag.get("confidence", 0),
+                coin_diag.get("setup_grade", "?"),
+                coin_diag.get("strategy_type", "?"),
+                str(coin_diag.get("reason", ""))[:80],
+            )
+        except Exception:
+            pass  # Never let diagnostics crash the pipeline
 
 
     logger.info(
@@ -1361,7 +1354,7 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
 
     logger.info(
 
-        f"  V18-debug Scalp result: {len(analyzed)} analyzed | {len(sniper_signals)} sniper | "
+        f"  V19 Scalp result: {len(analyzed)} analyzed | {len(sniper_signals)} sniper | "
 
         f"Tradeable: {len(tradeable)} | Signals posted: {signals_posted} | "
 
@@ -1378,51 +1371,10 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
     has_signals = signals_posted > 0
 
 
-    # ── V18-debug: LIVE TEST MODE ───────────────────────────────────
-    # If zero signals posted but we have candidates with conf >= 55,
-    # force-send the TOP 1 signal to verify pipeline works end-to-end.
-    if not has_signals and filtered:
-        # Find best non-HOLD candidate
-        best_candidates = [
-            c for c in filtered
-            if c.get("action") not in ("HOLD", None) and c.get("confidence", 0) >= 55
-        ]
-        if best_candidates:
-            best = best_candidates[0]  # already sorted by confidence desc
-            logger.warning(
-                f"  🧪 [LIVE TEST MODE] Force-sending top signal: "
-                f"{best['symbol']} {best.get('action')} conf={best.get('confidence')}"
-            )
-            try:
-                # V18-prod: Tag debug signals clearly for Telegram visibility
-                best["reason"] = f"⚠️ DEBUG SIGNAL | {best.get('reason', '')}"
-                test_result = await _post_signal_direct(best, regime, source="live_test_mode")
-                if test_result.get("status") == "signal_generated":
-                    signals_posted += 1
-                    has_signals = True
-                    signal_results.append({
-                        "symbol": best["symbol"],
-                        "signal_id_label": test_result.get("signal_id_label"),
-                        "confidence": test_result.get("confidence"),
-                        "side": test_result.get("side"),
-                        "source": "live_test_mode",
-                    })
-                    logger.info(
-                        f"  ✅ [LIVE TEST] Signal posted: {test_result.get('signal_id_label')} "
-                        f"{best['symbol']} conf={test_result.get('confidence')}%"
-                    )
-                else:
-                    logger.warning(
-                        f"  ❌ [LIVE TEST] Rejected: {best['symbol']} — "
-                        f"{test_result.get('status')}: {test_result.get('reason', '')[:100]}"
-                    )
-            except Exception as lt_err:
-                logger.error(f"  [LIVE TEST] Force-send failed: {lt_err}")
 
+    # V19: Quiet market — send if no signals posted (restored from broken V18 condition)
 
-    # V18-debug: Quiet market — ONLY send if zero candidates analyzed (not just zero tradeable)
-
-    if not has_signals and len(analyzed) == 0:
+    if not has_signals:
 
         global _last_quiet_sent
 
@@ -1458,7 +1410,7 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
 
         "tradeable_count":  len(tradeable),
 
-        "signals_posted":   signals_posted,   # V18: how many went to DB+Telegram
+        "signals_posted":   signals_posted,
 
         "has_signals":      has_signals,
 
@@ -1468,7 +1420,7 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
 
         "scalp_watchlist":  scalp_watchlist,
 
-        "signals":          signal_results,   # V18: signal ID labels for n8n logging
+        "signals":          signal_results,
 
         "coins":            tradeable if tradeable else filtered[:req.top_n],
 

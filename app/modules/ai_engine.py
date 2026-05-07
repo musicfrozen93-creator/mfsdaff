@@ -377,8 +377,8 @@ class ScalpingEngine:
             return action, short_result.score, short_result.reason
         else:
             best = max(long_result.score, short_result.score)
-            # V18-debug: Detailed rejection logging at INFO level
-            logger.info(
+            # V19: HOLD details at DEBUG (fires per-coin, high-frequency)
+            logger.debug(
                 f"  [HOLD] L={long_result.score}({'rejected: '+long_result.reject_reason if long_result.rejected else 'scored'})"
                 f" S={short_result.score}({'rejected: '+short_result.reject_reason if short_result.rejected else 'scored'})"
             )
