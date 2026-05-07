@@ -2475,7 +2475,7 @@ async def _register_signal_direct(
     logger.info("[SIGNAL DEBUG] Gate 3 PASSED: %s adj_conf=%s min_conf=%s", symbol, adj_conf, min_conf)
 
     # ── 4. High volatility gate ─────────────────────────────────────────
-    if btc_vol_high and adj_conf < 60:  # V18-debug: was 75
+    if btc_vol_high and adj_conf < 55:  # V19: lowered from 60
         return {
             "status": "rejected", "symbol": symbol,
             "reason": f"BTC high volatility + conf {adj_conf}% < 75 — skipping risky signal",

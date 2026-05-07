@@ -1333,8 +1333,8 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
                 fc.get("symbol"), fe, _traceback.format_exc()
             )
 
-    # -- Also try normal path for any non-HOLD with conf >= 55 --
-    tradeable = [c for c in non_hold if c.get("confidence", 0) >= 55][:3]
+    # -- Also try normal path for any non-HOLD with conf >= 48 --
+    tradeable = [c for c in non_hold if c.get("confidence", 0) >= 48][:3]
     for coin in tradeable:
         try:
             logger.warning(

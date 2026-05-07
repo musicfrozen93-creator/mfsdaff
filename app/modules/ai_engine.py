@@ -363,26 +363,27 @@ class ScalpingEngine:
             high=high, low=low, open_price=open_price, close_price=close_price,
         )
 
-        # V18-debug: Pick the best side — lowered threshold to 55
-        if long_result.score >= short_result.score and long_result.score >= 55:
+        # V19: Pick the best side — confluence threshold lowered to 48
+        if long_result.score >= short_result.score and long_result.score >= 48:
             action = "BUY" if not long_result.rejected else "HOLD"
             # V17: Log rejection reason for transparency
             if long_result.rejected:
                 logger.info(f"  [LONG REJECTED] {long_result.reject_reason}")
             return action, long_result.score, long_result.reason
-        elif short_result.score >= 55:
+        elif short_result.score >= 48:
             action = "SELL" if not short_result.rejected else "HOLD"
             if short_result.rejected:
                 logger.info(f"  [SHORT REJECTED] {short_result.reject_reason}")
             return action, short_result.score, short_result.reason
         else:
             best = max(long_result.score, short_result.score)
-            # V19: HOLD details at DEBUG (fires per-coin, high-frequency)
-            logger.debug(
+            # V19: HOLD details at INFO for diagnostic visibility
+            logger.info(
                 f"  [HOLD] L={long_result.score}({'rejected: '+long_result.reject_reason if long_result.rejected else 'scored'})"
                 f" S={short_result.score}({'rejected: '+short_result.reject_reason if short_result.rejected else 'scored'})"
+                f" | threshold=48"
             )
-            return "HOLD", best, f"Insufficient confidence: L={long_result.score}, S={short_result.score}"
+            return "HOLD", best, f"Insufficient confidence: L={long_result.score}, S={short_result.score} (need 48)"
 
     # ─── Layer 2: OpenAI Verification ─────────────────────────────────
 
@@ -910,10 +911,10 @@ class ScalpingEngine:
 
         best = None
         for name, (action, conf, reason), weight in strategies:
-            if action == "HOLD" or conf < 50:  # V18-debug: lowered from 55
+            if action == "HOLD" or conf < 45:  # V19: lowered from 50 — preserve weak signals
                 continue
             adjusted_conf = int(conf * weight)
-            adjusted_conf = max(50, min(adjusted_conf, 100))  # V7: cap at 100
+            adjusted_conf = max(45, min(adjusted_conf, 100))  # V19: floor at 45 (was 50)
             if best is None or adjusted_conf > best[1]:
                 best = (action, adjusted_conf, f"[{name}] {reason}", name)
 

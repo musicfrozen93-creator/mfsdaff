@@ -45,7 +45,7 @@ class Settings:
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # ── Trading parameters ───────────────────────────────────────────
-    MIN_CONFIDENCE: int = int(os.getenv("MIN_CONFIDENCE", "55"))  # V18-debug: lowered from 60 to 55
+    MIN_CONFIDENCE: int = int(os.getenv("MIN_CONFIDENCE", "50"))  # V19: lowered to 50 — let directional signals through
 
     # ── Scanner filters ──────────────────────────────────────────────
     MIN_VOLUME_24H: float = 3_000_000.0
@@ -140,8 +140,8 @@ class Settings:
 
     # ── V10 Split Confidence System ────────────────────────────────────
     # V17: Lowered scalp from 75->70, swing from 80->72
-    SCALP_MIN_CONFIDENCE: int = int(os.getenv("SCALP_MIN_CONFIDENCE", "60"))           # V18-prod: stable default (analyzer overrides to 58 during test)
-    SCALP_WATCHLIST_CONFIDENCE: int = int(os.getenv("SCALP_WATCHLIST_CONFIDENCE", "55"))  # unchanged
+    SCALP_MIN_CONFIDENCE: int = int(os.getenv("SCALP_MIN_CONFIDENCE", "50"))           # V19: lowered to 50 — preserve weak directional signals
+    SCALP_WATCHLIST_CONFIDENCE: int = int(os.getenv("SCALP_WATCHLIST_CONFIDENCE", "45"))  # V19: lowered to 45
     # Swing confidence gates
     SWING_MIN_CONFIDENCE_EXECUTE: int = int(os.getenv("SWING_MIN_CONFIDENCE_EXECUTE", "65"))  # V18-debug: was 72
     SWING_WATCHLIST_CONFIDENCE: int = int(os.getenv("SWING_WATCHLIST_CONFIDENCE", "62"))      # V17: was 70
@@ -213,7 +213,7 @@ class Settings:
 
     # ── V13 Per-Mode Confidence Gates ────────────────────────────────────
     # V17: Lowered thresholds for all modes
-    V13_SCALP_MIN_CONFIDENCE: int = int(os.getenv("V13_SCALP_MIN_CONFIDENCE", "58"))   # V18-debug: was 68
+    V13_SCALP_MIN_CONFIDENCE: int = int(os.getenv("V13_SCALP_MIN_CONFIDENCE", "48"))   # V19: lowered to 48
     V13_SWING_MIN_CONFIDENCE: int = int(os.getenv("V13_SWING_MIN_CONFIDENCE", "65"))   # V18-debug: was 70
     V13_SNIPER_MIN_CONFIDENCE: int = int(os.getenv("V13_SNIPER_MIN_CONFIDENCE", "78"))  # V17: was 82
 
@@ -301,7 +301,7 @@ class Settings:
     # BTC bias multiplier (both directions)
     V17_BTC_AGAINST_MULT: float = float(os.getenv("V17_BTC_AGAINST_MULT", "0.85"))     # was 0.75
     # Confidence floor (absolute minimum to emit any signal)
-    V17_CONFIDENCE_FLOOR: int = int(os.getenv("V17_CONFIDENCE_FLOOR", "55"))           # V18-debug: was 58
+    V17_CONFIDENCE_FLOOR: int = int(os.getenv("V17_CONFIDENCE_FLOOR", "48"))           # V19: lowered to 48 — match confluence threshold
     # Signal tracker capacity
     V17_MAX_ACTIVE_SIGNALS: int = int(os.getenv("V17_MAX_ACTIVE_SIGNALS", "15"))       # was 5
     V17_OPPOSITE_MIN_CONFIDENCE: int = int(os.getenv("V17_OPPOSITE_MIN_CONFIDENCE", "70"))  # was 80

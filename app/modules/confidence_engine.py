@@ -105,7 +105,7 @@ class ConfidenceEngine:
         return min(score, 25.0), " | ".join(details)
 
     # ═══════════════════════════════════════════════════════════════════
-    # PILLAR 2: Volume Quality (20 points max)
+    # PILLAR 2: Volume Quality (10 points max) — V19: reduced from 20 to stop over-penalizing
     # ═══════════════════════════════════════════════════════════════════
 
     @staticmethod
@@ -116,31 +116,32 @@ class ConfidenceEngine:
         details = []
 
         if volume_spike:
-            score += 8.0
+            score += 4.0  # V19: was 8.0
             details.append("volume spike")
 
         # V17: Lowered ratio thresholds — adaptive
         if volume_ratio >= 2.0:
-            score += 8.0
+            score += 4.0  # V19: was 8.0
             details.append(f"extreme vol {volume_ratio:.1f}x")
         elif volume_ratio >= 1.3:
-            score += 6.0
+            score += 3.0  # V19: was 6.0
             details.append(f"high vol {volume_ratio:.1f}x")
         elif volume_ratio >= 0.9:
-            score += 4.0  # V17: raised from 3.0 for normal vol
+            score += 2.0  # V19: was 4.0 — normal vol should not penalize
             details.append(f"normal vol {volume_ratio:.1f}x")
         elif volume_ratio >= 0.6:
-            score += 2.0  # V17: raised from 1.0
+            score += 1.0  # V19: was 2.0
             details.append(f"low vol {volume_ratio:.1f}x")
         else:
+            score += 0.5  # V19: give 0.5 even for very low vol — stop zero-score
             details.append(f"very low vol {volume_ratio:.1f}x")
 
         # Consistency bonus
         if volume_ratio >= 1.1:  # V17: lowered from 1.2
-            score += 4.0
+            score += 2.0  # V19: was 4.0
             details.append("consistent flow")
 
-        return min(score, 20.0), " | ".join(details)
+        return min(score, 10.0), " | ".join(details)  # V19: cap at 10 (was 20)
 
     # ═══════════════════════════════════════════════════════════════════
     # PILLAR 3: Momentum (15 points max)
@@ -539,11 +540,14 @@ class ConfidenceEngine:
         )
         spread_score, spread_detail = self._score_spread(spread_pct)
 
-        # Step 3: Sum
+        # Step 3: Sum (V19: pillars total 90 max after volume rebalance)
         raw_score = (
             trend_score + volume_score + momentum_score
             + structure_score + btc_score + spread_score
         )
+        # V19: Normalize from 90-point scale back to 100-point scale
+        # This ensures the threshold system still works correctly after volume reduction
+        raw_score = raw_score * (100.0 / 90.0)
 
         # Step 4: Entry pattern bonuses
         bonus, bonus_descriptions = self.check_entry_patterns(
@@ -564,10 +568,10 @@ class ConfidenceEngine:
                 raw_score += 5.0
                 bonus_descriptions.append("momentum override +5")
 
-        # Step 6: Clamp to 0-95 — V18-debug: raised cap from 92
+        # Step 6: Clamp to 0-95
         final_score = max(0, min(int(round(raw_score)), 95))
 
-        # Step 7: Tier
+        # Step 7: Tier — V19: added WEAK tier to preserve directional bias
         if final_score >= 88:
             tier = "ELITE"
         elif final_score >= 80:
@@ -575,17 +579,20 @@ class ConfidenceEngine:
         elif final_score >= 70:
             tier = "TRADABLE"
         elif final_score >= 60:
-            tier = "WEAK"
+            tier = "MODERATE"
+        elif final_score >= 48:
+            tier = "WEAK"  # V19: was NO_TRADE — now preserves direction
         else:
             tier = "NO_TRADE"
 
-        # Step 8: Action — V18-debug: threshold lowered to 55 (was 58)
-        action = side if final_score >= 55 else "HOLD"
+        # Step 8: Action — V19: threshold lowered to 48 (was 55)
+        # Preserves directional bias for weak signals instead of destroying with HOLD
+        action = side if final_score >= 48 else "HOLD"
 
         reason_parts = [
             f"V17 confidence={final_score} [{tier}]",
             f"T:{trend_score:.0f}/25",
-            f"V:{volume_score:.0f}/20",
+            f"V:{volume_score:.0f}/10",
             f"M:{momentum_score:.0f}/15",
             f"S:{structure_score:.0f}/15",
             f"B:{btc_score:.0f}/15",
@@ -608,11 +615,11 @@ class ConfidenceEngine:
             "raw_total": round(raw_score, 1),
         }
 
-        logger.debug(
-            f"  📊 V18 Confidence [{side}]: {final_score} [{tier}] | "
-            f"T={trend_score:.0f}/25 V={volume_score:.0f}/20 M={momentum_score:.0f}/15 "
+        logger.info(
+            f"  📊 V19 Confidence [{side}]: {final_score} [{tier}] | "
+            f"T={trend_score:.0f}/25 V={volume_score:.0f}/10 M={momentum_score:.0f}/15 "
             f"S={structure_score:.0f}/15 B={btc_score:.0f}/15 L={spread_score:.0f}/10 "
-            f"bonus={bonus} penalty={eq_penalty} raw={raw_score:.0f}"
+            f"bonus={bonus} penalty={eq_penalty} raw={raw_score:.0f} action={action}"
         )
 
         return ConfidenceResult(

@@ -418,11 +418,11 @@ class MarketRegimeRouter:
                 "sniper": 0.5,
             },
             "SIDEWAYS_RANGE": {
-                "scalp_trend_pullback": 0.7,   # V17: raised from 0.3 — trend plays valid in range
-                "scalp_breakout": 0.5,          # V17: raised from 0.3
+                "scalp_trend_pullback": 0.95,   # V19: was 0.7 — trend plays valid in range
+                "scalp_breakout": 0.85,          # V19: was 0.5 — breakouts happen in range too
                 "scalp_range_reversal": 1.0,
-                "swing": 0.6,                   # V17: raised from 0.4
-                "sniper": 0.4,                  # V17: raised from 0.3
+                "swing": 0.85,                   # V19: was 0.6
+                "sniper": 0.75,                  # V19: was 0.4
             },
             "BREAKOUT_EXPANSION": {
                 "scalp_trend_pullback": 0.5,
@@ -522,7 +522,7 @@ class MarketRegimeRouter:
         for sig in scalp_signals:
             sym = sig.get("symbol", "")
             action = sig.get("action", "HOLD")
-            if action in ("BUY", "SELL") and sig.get("confidence", 0) >= 55:  # V18-debug: was 70
+            if action in ("BUY", "SELL") and sig.get("confidence", 0) >= 48:  # V19: lowered to 48
                 direction_map.setdefault(sym, {"BUY": [], "SELL": []})
                 direction_map[sym][action].append("scalp")
                 all_signals.append(sig)
@@ -530,7 +530,7 @@ class MarketRegimeRouter:
         for sig in swing_signals:
             sym = sig.get("symbol", "")
             action = sig.get("action", "HOLD")
-            if action in ("BUY", "SELL") and sig.get("confidence", 0) >= 55:  # V18-debug: was 70
+            if action in ("BUY", "SELL") and sig.get("confidence", 0) >= 48:  # V19: lowered to 48
                 direction_map.setdefault(sym, {"BUY": [], "SELL": []})
                 direction_map[sym][action].append("swing")
                 all_signals.append(sig)
@@ -538,7 +538,7 @@ class MarketRegimeRouter:
         for sig in sniper_signals:
             sym = sig.get("symbol", "")
             action = sig.get("action", "HOLD")
-            if action in ("BUY", "SELL") and sig.get("confidence", 0) >= 55:  # V18-debug: was 70
+            if action in ("BUY", "SELL") and sig.get("confidence", 0) >= 48:  # V19: lowered to 48
                 direction_map.setdefault(sym, {"BUY": [], "SELL": []})
                 direction_map[sym][action].append("sniper")
                 all_signals.append(sig)
