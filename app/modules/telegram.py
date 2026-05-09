@@ -74,19 +74,21 @@ class TelegramNotifier:
         reason: str = "",
     ) -> str:
         """
-        Signal-only message builder.
-        No execution references, no account info, no fill prices, no protection status.
-        Pure AI signal with actionable TP/SL levels.
+        V14 Professional signal message builder.
+        Full premium format with TP/SL/ROI/RR/leverage/protection/analysis.
+        No execution references, no account info — pure AI signal intelligence.
         """
+        from datetime import datetime, timezone
+
         direction = "\U0001f7e2 LONG" if side == "BUY" else "\U0001f534 SHORT"
 
         # Mode-specific title
         if strategy_type.startswith("swing"):
-            title = "\U0001f30a <b>SWING SIGNAL — AI Engine</b>"
+            title = "\U0001f30a <b>SWING SIGNAL \u2014 AI Engine V14</b>"
         elif strategy_type.startswith("sniper"):
-            title = "\U0001f3af <b>SNIPER SIGNAL — AI Engine</b>"
+            title = "\U0001f3af <b>SNIPER SIGNAL \u2014 AI Engine V14</b>"
         else:
-            title = "\U0001f680 <b>SCALP SIGNAL — AI Engine</b>"
+            title = "\U0001f680 <b>SCALP SIGNAL \u2014 AI Engine V14</b>"
 
         # Grade line
         grade_emoji = {"A": "\u2b50", "B": "\U0001f537", "C": "\U0001f538"}.get(setup_grade, "")
@@ -119,30 +121,36 @@ class TelegramNotifier:
         entry_str = f"${entry_price:,.6f}" if entry_price > 0 else "market"
         leverage_str = f"{leverage}x" if leverage > 0 else "auto"
 
+        # TP/SL price block with percentages
+        if take_profit > 0 and stop_loss > 0:
+            tp_pct_display = f" (+{tp_pct:.2f}%)" if tp_pct > 0 else ""
+            sl_pct_display = f" (-{sl_pct:.2f}%)" if sl_pct > 0 else ""
+            tp_block = (
+                f"TP Price: <b>${take_profit:,.6f}</b>{tp_pct_display}\n"
+                f"SL Price: <b>${stop_loss:,.6f}</b>{sl_pct_display}"
+            )
+        else:
+            tp_block = "TP/SL: <i>calculate based on your risk</i>"
+
         # TP/SL ROI line
         if tp_roi_pct > 0 and sl_roi_pct > 0:
             roi_line = f"\nTP ROI: <b>+{tp_roi_pct:.0f}%</b> | SL ROI: <b>-{sl_roi_pct:.0f}%</b>"
         else:
             roi_line = ""
 
-        # TP/SL price block
-        if take_profit > 0 and stop_loss > 0:
-            tp_pct_display = f" (+{tp_pct:.2f}%)" if tp_pct > 0 else ""
-            sl_pct_display = f" (-{sl_pct:.2f}%)" if sl_pct > 0 else ""
-            tp_block = (
-                f"TP Target: <b>${take_profit:,.6f}</b>{tp_pct_display}\n"
-                f"SL Target: <b>${stop_loss:,.6f}</b>{sl_pct_display}"
-            )
-        else:
-            tp_block = "TP/SL: <i>calculate based on your risk</i>"
-
         # R:R line
         rr_line = f"\n\nR:R = <b>1:{risk_reward:.1f}</b>" if risk_reward > 0 else ""
+
+        # Protection line
+        protection_line = "\U0001f6e1\ufe0f <b>External Engine Active</b>"
 
         # Reason block
         reason_block = ""
         if reason:
             reason_block = f"\n\n<b>Analysis:</b>\n<i>{reason[:300]}</i>"
+
+        # Timestamp
+        ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
         msg = (
             f"{title}\n\n"
@@ -156,8 +164,11 @@ class TelegramNotifier:
             f"Leverage: <b>{leverage_str}</b>"
             f"{roi_line}\n\n"
             f"{tp_block}"
-            f"{rr_line}"
-            f"{reason_block}"
+            f"{rr_line}\n\n"
+            f"<b>Protection:</b>\n{protection_line}"
+            f"{reason_block}\n\n"
+            f"<i>Signal from AI analysis \u2014 no execution dependency</i>\n"
+            f"<i>\U0001f552 {ts}</i>"
         )
         return msg
 

@@ -54,6 +54,10 @@ class TradeState:
     v11_entry_blocked: bool = False       # Set True when daily gate fires
     v11_block_reason: str = ""           # Reason string for the block
 
+    # V14: Signal dedup memory — prevents duplicate Telegram broadcasts
+    # Key = "SYMBOL:SIDE:strategy_prefix" → { "sent_at": timestamp, "confidence": int }
+    signal_fingerprints: Dict[str, dict] = field(default_factory=dict)
+
     # Stats
     total_trades: int = 0
     winning_trades: int = 0
@@ -95,6 +99,8 @@ class StateManager:
             self.state.daily_pnl_usdt = 0.0
             self.state.v11_entry_blocked = False
             self.state.v11_block_reason = ""
+            # V14: Prune old signal fingerprints
+            self._prune_stale_fingerprints()
 
     # ─── Daily Limits Check ───────────────────────────────────────────
 
@@ -300,6 +306,89 @@ class StateManager:
         if until > now:
             return True, int(until - now)
         return False, 0
+
+    # ── V14: Signal Dedup Memory ──────────────────────────────────────
+
+    # Cooldown durations per strategy mode (seconds)
+    _SIGNAL_COOLDOWNS = {
+        "scalp":  45 * 60,    # 45 minutes for scalp
+        "sniper": 45 * 60,    # 45 minutes for sniper
+        "swing":  6 * 3600,   # 6 hours for swing
+    }
+    # Minimum confidence improvement to override cooldown
+    _CONFIDENCE_IMPROVEMENT_THRESHOLD = 10
+
+    @staticmethod
+    def _signal_fingerprint(symbol: str, side: str, strategy_type: str) -> str:
+        """Build dedup key: BTCUSDT:BUY:scalp"""
+        prefix = "scalp"
+        st = (strategy_type or "").lower()
+        if st.startswith("swing"):
+            prefix = "swing"
+        elif st.startswith("sniper"):
+            prefix = "sniper"
+        return f"{symbol}:{side}:{prefix}"
+
+    def is_signal_duplicate(
+        self, symbol: str, side: str, strategy_type: str, confidence: int
+    ) -> tuple[bool, str]:
+        """
+        V14: Check if this signal was already sent recently.
+
+        Returns (is_duplicate, reason).
+        A signal is NOT duplicate if:
+          - Never sent before
+          - Cooldown expired (scalp=45m, swing=6h)
+          - Confidence improved by 10+ points since last send
+        """
+        key = self._signal_fingerprint(symbol, side, strategy_type)
+        prev = self.state.signal_fingerprints.get(key)
+
+        if not prev:
+            return False, ""
+
+        now = time.time()
+        sent_at = prev.get("sent_at", 0)
+        prev_conf = prev.get("confidence", 0)
+
+        # Determine cooldown for this strategy mode
+        prefix = key.split(":")[-1]  # scalp / swing / sniper
+        cooldown = self._SIGNAL_COOLDOWNS.get(prefix, 45 * 60)
+
+        elapsed = now - sent_at
+        if elapsed >= cooldown:
+            return False, ""  # Cooldown expired — allow
+
+        # Allow if confidence materially improved
+        conf_improvement = confidence - prev_conf
+        if conf_improvement >= self._CONFIDENCE_IMPROVEMENT_THRESHOLD:
+            return False, ""  # Significant improvement — allow
+
+        remaining_min = int((cooldown - elapsed) / 60)
+        return True, (
+            f"Duplicate signal blocked: {symbol} {side} ({prefix}) "
+            f"already sent {int(elapsed/60)}m ago (conf {prev_conf}→{confidence}, "
+            f"need +{self._CONFIDENCE_IMPROVEMENT_THRESHOLD} or wait {remaining_min}m)"
+        )
+
+    def record_signal_sent(
+        self, symbol: str, side: str, strategy_type: str, confidence: int
+    ):
+        """V14: Record that a signal was sent to Telegram."""
+        key = self._signal_fingerprint(symbol, side, strategy_type)
+        self.state.signal_fingerprints[key] = {
+            "sent_at": time.time(),
+            "confidence": confidence,
+        }
+
+    def _prune_stale_fingerprints(self):
+        """V14: Remove signal fingerprints older than 24h."""
+        now = time.time()
+        cutoff = now - 86400
+        self.state.signal_fingerprints = {
+            k: v for k, v in self.state.signal_fingerprints.items()
+            if v.get("sent_at", 0) > cutoff
+        }
 
     # ─── Stats ────────────────────────────────────────────────────────
 

@@ -544,8 +544,10 @@ async def _signal_only_inner(req: MultiExecuteRequest):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# V14: REGISTER SIGNAL — fire-and-forget, called by n8n IN PARALLEL with
-#      Telegram delivery. Failure here NEVER blocks signal delivery.
+# V14: REGISTER SIGNAL — computes TP/SL, checks dedup, sends Telegram.
+#      Called by n8n after signal validation.  Telegram is sent HERE
+#      (with full professional formatting) so the n8n message-build node
+#      is no longer needed.  Duplicate signals are blocked in-memory.
 # ═══════════════════════════════════════════════════════════════════════
 
 class RegisterSignalRequest(BaseModel):
@@ -554,6 +556,8 @@ class RegisterSignalRequest(BaseModel):
     confidence: Any = 70
     reason: str = ""
     current_price: Any = 0.0
+    atr_pct: Any = 0.0
+    spread_pct: Any = 0.0
     strategy_type: str = "scalp_trend_pullback"
     regime: str = ""
     indicators: dict = {}
@@ -566,9 +570,9 @@ class RegisterSignalRequest(BaseModel):
         except (ValueError, TypeError):
             return 70
 
-    @field_validator("current_price", mode="before")
+    @field_validator("current_price", "atr_pct", "spread_pct", mode="before")
     @classmethod
-    def coerce_current_price(cls, v):
+    def coerce_float(cls, v):
         try:
             return float(str(v)) if v is not None else 0.0
         except (ValueError, TypeError):
@@ -591,21 +595,27 @@ class RegisterSignalRequest(BaseModel):
 @router.post("/register-signal")
 async def register_signal(req: RegisterSignalRequest):
     """
-    V14: Lightweight signal registration endpoint.
-    Called by n8n workflow IN PARALLEL with Telegram delivery.
-    
+    V14: Full signal registration + Telegram delivery endpoint.
+    Called by n8n workflow AFTER signal validation passes.
+
     This endpoint:
-      - Saves the signal to DB
-      - Records state (cooldowns, daily counts)
-      - Logs the signal for audit
-    
-    CRITICAL: This endpoint's success/failure does NOT affect Telegram
-    delivery. The n8n workflow sends to Telegram and calls this endpoint
-    simultaneously. If this fails, Telegram still delivers the signal.
+      1. Checks signal dedup (blocks duplicate broadcasts)
+      2. Computes full TP/SL/ROI/leverage via RiskEngine
+      3. Sends PROFESSIONAL Telegram signal with all trade data
+      4. Saves signal to DB
+      5. Records state (cooldowns, daily counts)
+      6. Returns full computed data to n8n
+
+    CRITICAL: Signal dedup prevents the same symbol+side+strategy
+    from being broadcast multiple times within the cooldown window
+    (scalp=45min, swing=6hr) unless confidence improved by 10+ points.
     """
     try:
         symbol = req.symbol.upper().strip()
         side = req.action.upper().strip()
+
+        if side not in ("BUY", "SELL"):
+            return {"status": "error", "message": f"Invalid action: {req.action}"}
 
         logger.info(
             f"📝 [V14 REGISTER] Signal received: {symbol} {side} "
@@ -613,10 +623,89 @@ async def register_signal(req: RegisterSignalRequest):
             f"regime={req.regime}"
         )
 
-        if side not in ("BUY", "SELL"):
-            return {"status": "error", "message": f"Invalid action: {req.action}"}
+        # ── DEDUP CHECK — block duplicate signal broadcasts ──────────
+        is_dup, dup_reason = state_manager.is_signal_duplicate(
+            symbol, side, req.strategy_type, req.confidence
+        )
+        if is_dup:
+            logger.info(f"🔇 [V14 DEDUP] {dup_reason}")
+            return {
+                "status": "duplicate_blocked",
+                "message": dup_reason,
+                "symbol": symbol,
+                "side": side,
+            }
 
-        # Save signal to DB (non-blocking)
+        # ── Calculate TP/SL via RiskEngine (NO Binance API needed) ───
+        risk_engine = RiskEngine()
+        entry_price = req.current_price if req.current_price > 0 else 0.0
+
+        leverage = risk_engine.get_leverage(req.confidence, req.strategy_type, req.atr_pct)
+        tp_roi_pct, sl_roi_pct = risk_engine.get_tp_sl_roi(
+            req.confidence, strategy_type=req.strategy_type
+        )
+        tp_price_pct = risk_engine.roi_to_price_pct(tp_roi_pct, leverage)
+        sl_price_pct = risk_engine.roi_to_price_pct(sl_roi_pct, leverage)
+        setup_grade = risk_engine.determine_setup_grade(
+            req.confidence, req.indicators.get("volume_spike", False)
+        )
+
+        # Calculate TP/SL price levels
+        if entry_price > 0:
+            if side == "BUY":
+                take_profit = round(entry_price * (1 + tp_price_pct), 6)
+                stop_loss   = round(entry_price * (1 - sl_price_pct), 6)
+            else:
+                take_profit = round(entry_price * (1 - tp_price_pct), 6)
+                stop_loss   = round(entry_price * (1 + sl_price_pct), 6)
+
+            sl_distance = abs(entry_price - stop_loss)
+            tp_distance = abs(take_profit - entry_price)
+            risk_reward = round(tp_distance / sl_distance, 2) if sl_distance > 0 else 0
+        else:
+            take_profit = 0.0
+            stop_loss = 0.0
+            risk_reward = 0.0
+
+        tp_pct_display = round(tp_price_pct * 100, 2)
+        sl_pct_display = round(sl_price_pct * 100, 2)
+
+        logger.info(
+            f"📡 [V14] SIGNAL COMPUTED: {symbol} {side} conf={req.confidence} "
+            f"strategy={req.strategy_type} grade={setup_grade} | "
+            f"entry={entry_price} TP={take_profit} SL={stop_loss} "
+            f"lev={leverage}x RR={risk_reward} regime={req.regime}"
+        )
+
+        # ── SEND PROFESSIONAL TELEGRAM SIGNAL ────────────────────────
+        telegram = TelegramNotifier()
+        try:
+            await telegram.send_signal(
+                symbol=symbol,
+                side=side,
+                confidence=req.confidence,
+                entry_price=entry_price,
+                leverage=leverage,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+                tp_pct=tp_pct_display,
+                sl_pct=sl_pct_display,
+                tp_roi_pct=tp_roi_pct,
+                sl_roi_pct=sl_roi_pct,
+                reason=req.reason,
+                setup_grade=setup_grade,
+                strategy_type=req.strategy_type,
+                regime=req.regime,
+                risk_reward=risk_reward,
+            )
+            logger.info(f"✅ [V14] Professional Telegram signal sent for {symbol} {side}")
+        except Exception as tg_err:
+            logger.error(f"❌ [V14] Telegram send failed: {tg_err}")
+
+        # ── RECORD DEDUP FINGERPRINT — only after successful processing ─
+        state_manager.record_signal_sent(symbol, side, req.strategy_type, req.confidence)
+
+        # ── Save signal to DB (non-blocking) ─────────────────────────
         signal_id = None
         try:
             async with async_session() as session:
@@ -633,24 +722,31 @@ async def register_signal(req: RegisterSignalRequest):
         except Exception as db_err:
             logger.warning(f"Signal DB save failed (non-critical): {db_err}")
 
-        # Record in state manager (cooldowns, daily counts)
+        # ── Record in state manager (cooldowns, daily counts) ────────
         try:
             state_manager.record_trade_opened(symbol)
         except Exception as state_err:
             logger.warning(f"State update failed (non-critical): {state_err}")
 
-        logger.info(
-            f"✅ [V14 REGISTER] Signal registered: {symbol} {side} "
-            f"conf={req.confidence} signal_id={signal_id}"
-        )
-
         return {
-            "status": "registered",
+            "status": "signal_sent",
             "symbol": symbol,
             "side": side,
             "confidence": req.confidence,
             "signal_id": signal_id,
             "strategy_type": req.strategy_type,
+            "regime": req.regime,
+            "entry_price": entry_price,
+            "take_profit": take_profit,
+            "stop_loss": stop_loss,
+            "tp_pct": tp_pct_display,
+            "sl_pct": sl_pct_display,
+            "tp_roi_pct": tp_roi_pct,
+            "sl_roi_pct": sl_roi_pct,
+            "leverage": leverage,
+            "risk_reward": risk_reward,
+            "setup_grade": setup_grade,
+            "mode": "signal_only",
         }
 
     except Exception as exc:
@@ -660,6 +756,7 @@ async def register_signal(req: RegisterSignalRequest):
             "message": f"Registration error: {str(exc)[:200]}",
             "symbol": getattr(req, "symbol", "?"),
         }
+
 
 
 # ═══════════════════════════════════════════════════════════════════════
