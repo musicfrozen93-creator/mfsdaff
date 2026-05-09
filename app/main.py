@@ -1,6 +1,6 @@
 """
-V8 Protected Execution Crypto Futures Trading System
-V8: + Hedge Mode detection, pre-trade TP/SL dry-run validation, positionSide-aware orders
+Signal-Only AI Trading Engine
+AI signal generation → Telegram delivery (no Binance execution)
 FastAPI Backend — Main Entry Point
 """
 
@@ -24,25 +24,25 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 V8 Protected Crypto Trading Bot starting up...")
+    logger.info("🚀 Signal-Only AI Engine starting up...")
     await init_db()
     await seed_admin()
     await run_subscription_expiry_check()
     await learning_engine.seed_strategy_registry()
-    logger.info("✅ All V8 systems initialized (Hedge Mode detection active)")
+    logger.info("✅ Signal-Only Engine initialized (AI → Telegram)")
     yield
     await close_db()
-    logger.info("🛑 V7 Crypto Trading Bot shutting down...")
+    logger.info("🛑 Signal-Only AI Engine shutting down...")
 
 
 app = FastAPI(
-    title="V8 Protected Crypto Futures Trading Bot",
+    title="Signal-Only AI Trading Engine",
     description=(
-        "Production-grade automated crypto futures trading system with "
-        "V8 Hedge Mode detection, pre-trade TP/SL validation, atomic protection, "
-        "adaptive learning, multi-account support, and configurable risk guardrails."
+        "AI-powered signal generation engine. Analyzes markets, generates "
+        "BUY/SELL signals with TP/SL targets, and delivers them via Telegram. "
+        "No Binance execution — pure signal intelligence."
     ),
-    version="8.0.0",
+    version="9.0.0-signal",
     lifespan=lifespan,
 )
 
@@ -67,14 +67,15 @@ app.include_router(admin.router,    tags=["Admin"])
 async def health_check():
     return {
         "status": "ok",
-        "service": "crypto-trading-bot-v8",
-        "version": "8.0.0",
+        "service": "signal-only-ai-engine",
+        "version": "9.0.0-signal",
+        "mode": "signal_only",
         "features": [
-            "hedge_mode_detection",
-            "pre_trade_tpsl_validation",
-            "atomic_tpsl_protection",
-            "database_account_loader",
-            "subscription_guard",
-            "adaptive_learning",
+            "ai_signal_generation",
+            "telegram_delivery",
+            "confidence_scoring",
+            "tp_sl_calculation",
+            "regime_detection",
+            "multi_strategy_analysis",
         ],
     }

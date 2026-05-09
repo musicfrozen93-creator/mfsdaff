@@ -51,7 +51,149 @@ class TelegramNotifier:
             return False
 
     # ═══════════════════════════════════════════════════════════════════
-    # V4: ONE CLEAN FINAL MESSAGE — Trade Executed
+    # SIGNAL-ONLY ENGINE — AI Signal Delivery (no execution)
+    # ═══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _build_signal_message(
+        symbol: str,
+        side: str,
+        confidence: int,
+        entry_price: float,
+        leverage: int,
+        take_profit: float,
+        stop_loss: float,
+        tp_roi_pct: float = 0.0,
+        sl_roi_pct: float = 0.0,
+        tp_pct: float = 0.0,
+        sl_pct: float = 0.0,
+        risk_reward: float = 0.0,
+        setup_grade: str = "",
+        strategy_type: str = "",
+        regime: str = "",
+        reason: str = "",
+    ) -> str:
+        """
+        Signal-only message builder.
+        No execution references, no account info, no fill prices, no protection status.
+        Pure AI signal with actionable TP/SL levels.
+        """
+        direction = "\U0001f7e2 LONG" if side == "BUY" else "\U0001f534 SHORT"
+
+        # Mode-specific title
+        if strategy_type.startswith("swing"):
+            title = "\U0001f30a <b>SWING SIGNAL — AI Engine</b>"
+        elif strategy_type.startswith("sniper"):
+            title = "\U0001f3af <b>SNIPER SIGNAL — AI Engine</b>"
+        else:
+            title = "\U0001f680 <b>SCALP SIGNAL — AI Engine</b>"
+
+        # Grade line
+        grade_emoji = {"A": "\u2b50", "B": "\U0001f537", "C": "\U0001f538"}.get(setup_grade, "")
+        grade_line = f"\nGrade: <b>{grade_emoji} {setup_grade}</b>" if setup_grade else ""
+
+        # Strategy type line
+        if strategy_type.startswith("swing"):
+            strat_display = "\U0001f30a Swing"
+        elif strategy_type.startswith("sniper"):
+            strat_display = "\U0001f3af Sniper"
+        else:
+            strat_display = "\u26a1 Scalping"
+        strategy_line = f"\nType: <b>{strat_display}</b>"
+
+        # Regime line
+        regime_display = ""
+        if regime:
+            regime_map = {
+                "TRENDING_BULL": "\U0001f7e2 Trending Bull",
+                "TRENDING_BEAR": "\U0001f534 Trending Bear",
+                "SIDEWAYS_RANGE": "\u2194\ufe0f Sideways",
+                "BREAKOUT_EXPANSION": "\U0001f4a5 Breakout",
+                "HIGH_VOLATILITY": "\u26a0\ufe0f High Volatility",
+                "DEAD_MARKET": "\U0001f4a4 Dead Market",
+            }
+            regime_display = regime_map.get(regime, regime)
+        regime_line = f"\nRegime: <b>{regime_display}</b>" if regime_display else ""
+
+        # Entry price
+        entry_str = f"${entry_price:,.6f}" if entry_price > 0 else "market"
+        leverage_str = f"{leverage}x" if leverage > 0 else "auto"
+
+        # TP/SL ROI line
+        if tp_roi_pct > 0 and sl_roi_pct > 0:
+            roi_line = f"\nTP ROI: <b>+{tp_roi_pct:.0f}%</b> | SL ROI: <b>-{sl_roi_pct:.0f}%</b>"
+        else:
+            roi_line = ""
+
+        # TP/SL price block
+        if take_profit > 0 and stop_loss > 0:
+            tp_pct_display = f" (+{tp_pct:.2f}%)" if tp_pct > 0 else ""
+            sl_pct_display = f" (-{sl_pct:.2f}%)" if sl_pct > 0 else ""
+            tp_block = (
+                f"TP Target: <b>${take_profit:,.6f}</b>{tp_pct_display}\n"
+                f"SL Target: <b>${stop_loss:,.6f}</b>{sl_pct_display}"
+            )
+        else:
+            tp_block = "TP/SL: <i>calculate based on your risk</i>"
+
+        # R:R line
+        rr_line = f"\n\nR:R = <b>1:{risk_reward:.1f}</b>" if risk_reward > 0 else ""
+
+        # Reason block
+        reason_block = ""
+        if reason:
+            reason_block = f"\n\n<b>Analysis:</b>\n<i>{reason[:300]}</i>"
+
+        msg = (
+            f"{title}\n\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Confidence: <b>{confidence}%</b>"
+            f"{grade_line}"
+            f"{strategy_line}"
+            f"{regime_line}\n\n"
+            f"Entry: <b>{entry_str}</b>\n"
+            f"Leverage: <b>{leverage_str}</b>"
+            f"{roi_line}\n\n"
+            f"{tp_block}"
+            f"{rr_line}"
+            f"{reason_block}"
+        )
+        return msg
+
+    async def send_signal(
+        self,
+        symbol: str,
+        side: str,
+        confidence: int,
+        entry_price: float,
+        leverage: int,
+        take_profit: float,
+        stop_loss: float,
+        tp_pct: float = 0.0,
+        sl_pct: float = 0.0,
+        tp_roi_pct: float = 0.0,
+        sl_roi_pct: float = 0.0,
+        reason: str = "",
+        setup_grade: str = "",
+        strategy_type: str = "",
+        regime: str = "",
+        risk_reward: float = 0.0,
+    ):
+        """Signal-only delivery — send AI signal to Telegram immediately."""
+        msg = self._build_signal_message(
+            symbol=symbol, side=side, confidence=confidence,
+            entry_price=entry_price, leverage=leverage,
+            take_profit=take_profit, stop_loss=stop_loss,
+            tp_roi_pct=tp_roi_pct, sl_roi_pct=sl_roi_pct,
+            tp_pct=tp_pct, sl_pct=sl_pct, risk_reward=risk_reward,
+            setup_grade=setup_grade, strategy_type=strategy_type,
+            regime=regime, reason=reason,
+        )
+        await self.send(msg)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # LEGACY: Execution-based messages (kept for backward compat)
     # ═══════════════════════════════════════════════════════════════════
 
     # ═══════════════════════════════════════════════════════════════════
