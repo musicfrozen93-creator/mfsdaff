@@ -29,6 +29,8 @@ from app.modules.swing_engine import SwingEngine
 from app.modules.sniper_engine import SniperEngine
 from app.modules.strategy_tracker import strategy_tracker
 from app.modules.telegram import TelegramNotifier
+from app.modules.market_structure import MarketStructureAnalyzer
+from app.modules.entry_engine import EntryEngine
 from app.config import settings
 from app.utils.serialization import clean_json_types
 
@@ -391,7 +393,7 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
     if not req.coins:
         return {"status": "ok", "count": 0, "analyzed": 0, "has_signals": False, "coins": [], "scalp_watchlist": []}
 
-    logger.info(f"⚡ V11 Scalp batch: {len(req.coins)} coins...")
+    logger.info(f"⚡ V15 Scalp batch: {len(req.coins)} coins...")
 
     # Step 1: Regime (lightweight — just weights, no full analysis)
     regime_router = MarketRegimeRouter()
@@ -405,6 +407,16 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
         regime = "SIDEWAYS_RANGE"
         regime_weights = regime_router._get_strategy_weights("SIDEWAYS_RANGE")
 
+    # V15: Fetch BTC candles for relative strength calculation
+    structure_analyzer = MarketStructureAnalyzer()
+    entry_eng = EntryEngine()
+    btc_candles = []
+    if settings.V15_BTC_RS_ENABLED:
+        try:
+            btc_candles = await structure_analyzer.fetch_btc_candles(interval="5m", limit=100)
+        except Exception as e:
+            logger.warning(f"BTC candle fetch for RS failed: {e}")
+
     # Step 2: Scalp engine
     engine = ScalpingEngine()
     scanner_data = {c.symbol: c for c in req.coins}
@@ -417,20 +429,105 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
                     symbol, spread_pct=spread,
                     regime=regime, regime_weights=regime_weights,
                 )
-                return symbol, engine.to_dict(decision)
+                ai_result = engine.to_dict(decision)
+
+                # V15: Run market structure analysis if we have candle data
+                v15_data = {
+                    "entry_quality_score": -1,
+                    "exhaustion_score": 0,
+                    "reversal_risk": 0,
+                    "btc_relative_strength": 1.0,
+                    "nearest_support": 0.0,
+                    "nearest_resistance": 0.0,
+                    "quality_tier": "",
+                    "ema9": ai_result.get("ema_fast", 0.0),
+                    "ema21": ai_result.get("ema_slow", 0.0),
+                    "bb_lower": ai_result.get("bb_lower", 0.0),
+                    "bb_upper": ai_result.get("bb_upper", 0.0),
+                    "swing_low": 0.0,
+                    "swing_high": 0.0,
+                }
+
+                if (
+                    settings.V15_STRUCTURE_ENABLED
+                    and ai_result.get("action") in ("BUY", "SELL")
+                    and ai_result.get("candles_data")
+                ):
+                    try:
+                        struct = await structure_analyzer.analyze(
+                            symbol,
+                            ai_result["candles_data"],
+                            btc_candles=btc_candles,
+                        )
+                        v15_data["exhaustion_score"] = struct.exhaustion_score
+                        v15_data["reversal_risk"] = struct.reversal_risk
+                        v15_data["btc_relative_strength"] = struct.btc_relative_strength
+                        v15_data["nearest_support"] = struct.nearest_support
+                        v15_data["nearest_resistance"] = struct.nearest_resistance
+
+                        if struct.swing_points:
+                            lows = [p.price for p in struct.swing_points if p.type in ("HL", "LL", "LOW")]
+                            highs = [p.price for p in struct.swing_points if p.type in ("HH", "LH", "HIGH")]
+                            if lows:
+                                v15_data["swing_low"] = lows[-1]
+                            if highs:
+                                v15_data["swing_high"] = highs[-1]
+
+                        # V15: Compute entry quality score
+                        side = ai_result.get("action", "BUY")
+                        price = ai_result.get("current_price", 0.0)
+                        atr = ai_result.get("atr", 0.0)
+                        if price > 0 and atr > 0:
+                            candle_body = abs(float(ai_result.get("close", price)) - float(ai_result.get("open", price)))
+                            eq_result = entry_eng.score_entry_quality(
+                                side=side,
+                                entry_price=price,
+                                current_price=price,
+                                ema9=v15_data["ema9"],
+                                ema21=v15_data["ema21"],
+                                vwap=ai_result.get("vwap", 0.0),
+                                atr=atr,
+                                atr_pct=ai_result.get("atr_pct", 0.0),
+                                rsi=ai_result.get("rsi", 50.0),
+                                nearest_support=struct.nearest_support,
+                                nearest_resistance=struct.nearest_resistance,
+                                candle_body=candle_body,
+                                upper_wick=float(ai_result.get("high", price)) - max(float(ai_result.get("close", price)), float(ai_result.get("open", price))),
+                                lower_wick=min(float(ai_result.get("close", price)), float(ai_result.get("open", price))) - float(ai_result.get("low", price)),
+                                volume_ratio=ai_result.get("volume_ratio", 1.0),
+                                exhaustion_score=struct.exhaustion_score,
+                                reversal_risk=struct.reversal_risk,
+                                btc_relative_strength=struct.btc_relative_strength,
+                            )
+                            v15_data["entry_quality_score"] = eq_result.total_score
+                    except Exception as struct_err:
+                        logger.warning(f"V15 structure analysis failed for {symbol}: {struct_err}")
+
+                # V15: Derive quality tier
+                conf = ai_result.get("confidence", 0)
+                if conf >= settings.V15_TIER_ELITE_MIN:
+                    v15_data["quality_tier"] = "ELITE"
+                elif conf >= settings.V15_TIER_STRONG_MIN:
+                    v15_data["quality_tier"] = "STRONG"
+                elif conf >= settings.V15_TIER_NORMAL_MIN:
+                    v15_data["quality_tier"] = "NORMAL"
+                elif conf >= settings.V15_TIER_WEAK_MIN:
+                    v15_data["quality_tier"] = "WEAK"
+
+                return symbol, ai_result, v15_data
             except Exception as e:
                 logger.warning(f"Scalp analysis failed for {symbol}: {e}")
-                return symbol, None
+                return symbol, None, {}
 
     tasks = [analyze_scalp_coin(c.symbol, c.spread_pct) for c in req.coins]
     results = await asyncio.gather(*tasks)
 
     analyzed = []
-    for symbol, ai_result in results:
+    for symbol, ai_result, v15_data in results:
         if ai_result is None:
             continue
         coin_info = scanner_data.get(symbol)
-        analyzed.append({
+        entry = {
             "symbol": symbol,
             "action": ai_result.get("action", "HOLD"),
             "confidence": int(ai_result.get("confidence", 0) * session_mult),
@@ -454,7 +551,10 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
             "volume_24h": coin_info.volume_24h if coin_info else 0.0,
             "strategy_type": ai_result.get("strategy_type", "scalp_trend_pullback"),
             "regime": regime,
-        })
+        }
+        # V15: Merge structure/entry quality data
+        entry.update(v15_data)
+        analyzed.append(entry)
 
     # Step 3: Sniper engine (fast momentum plays)
     sniper_signals = []
@@ -510,10 +610,12 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
     SCALP_MIN = settings.SCALP_MIN_CONFIDENCE       # 65
     SCALP_WATCH = settings.SCALP_WATCHLIST_CONFIDENCE  # 55
 
+    # V15: Allow multiple tradeable signals per cycle
+    max_signals = settings.V15_MAX_SIGNALS_PER_CYCLE if settings.V15_MULTI_SIGNAL_ENABLED else settings.MAX_TRADES_PER_CYCLE
     tradeable = [
         c for c in filtered
         if c.get("action") not in ("HOLD", None) and c.get("confidence", 0) >= SCALP_MIN
-    ][:settings.MAX_TRADES_PER_CYCLE]
+    ][:max_signals]
 
     scalp_watchlist = [
         c for c in filtered
@@ -522,7 +624,7 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
     ]
 
     logger.info(
-        f"  V11 Scalp result: {len(analyzed)} scalp | {len(sniper_signals)} sniper | "
+        f"  V15 Scalp result: {len(analyzed)} scalp | {len(sniper_signals)} sniper | "
         f"Tradeable: {len(tradeable)} | Watchlist: {len(scalp_watchlist)} | "
         f"Regime: {regime} | Session: {session_mult}"
     )

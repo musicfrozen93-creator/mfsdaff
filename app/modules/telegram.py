@@ -72,23 +72,42 @@ class TelegramNotifier:
         strategy_type: str = "",
         regime: str = "",
         reason: str = "",
+        # V15: Entry zone fields
+        entry_zone_low: float = 0.0,
+        entry_zone_high: float = 0.0,
+        ideal_entry: float = 0.0,
+        invalidation: float = 0.0,
+        quality_tier: str = "",
+        entry_quality_score: int = -1,
+        zone_sources: list = None,
     ) -> str:
         """
-        V14 Professional signal message builder.
-        Full premium format with TP/SL/ROI/RR/leverage/protection/analysis.
+        V15 Professional signal message builder.
+        Full premium format with Entry Zones, TP/SL/ROI/RR/leverage/quality tiers.
         No execution references, no account info — pure AI signal intelligence.
         """
         from datetime import datetime, timezone
 
         direction = "\U0001f7e2 LONG" if side == "BUY" else "\U0001f534 SHORT"
 
+        # Quality tier with emoji
+        tier = quality_tier or ""
+        tier_emoji_map = {
+            "ELITE": "\U0001f451",     # 👑
+            "STRONG": "\U0001f537",    # 🔷
+            "NORMAL": "\U0001f538",    # 🔸
+            "WEAK": "\u26aa",          # ⚪
+        }
+        tier_emoji = tier_emoji_map.get(tier, "")
+        tier_display = f" [{tier_emoji} {tier}]" if tier else ""
+
         # Mode-specific title
         if strategy_type.startswith("swing"):
-            title = "\U0001f30a <b>SWING SIGNAL \u2014 AI Engine V14</b>"
+            title = f"\U0001f30a <b>SWING SIGNAL \u2014 AI Engine V15</b>{tier_display}"
         elif strategy_type.startswith("sniper"):
-            title = "\U0001f3af <b>SNIPER SIGNAL \u2014 AI Engine V14</b>"
+            title = f"\U0001f3af <b>SNIPER SIGNAL \u2014 AI Engine V15</b>{tier_display}"
         else:
-            title = "\U0001f680 <b>SCALP SIGNAL \u2014 AI Engine V14</b>"
+            title = f"\U0001f680 <b>SCALP SIGNAL \u2014 AI Engine V15</b>{tier_display}"
 
         # Grade line
         grade_emoji = {"A": "\u2b50", "B": "\U0001f537", "C": "\U0001f538"}.get(setup_grade, "")
@@ -117,8 +136,21 @@ class TelegramNotifier:
             regime_display = regime_map.get(regime, regime)
         regime_line = f"\nRegime: <b>{regime_display}</b>" if regime_display else ""
 
-        # Entry price
-        entry_str = f"${entry_price:,.6f}" if entry_price > 0 else "market"
+        # ── V15: ENTRY ZONE BLOCK (replaces single entry price) ──────
+        if entry_zone_low > 0 and entry_zone_high > 0:
+            ideal_str = f"\n\U0001f3af Ideal Entry: <b>${ideal_entry:,.6f}</b>" if ideal_entry > 0 else ""
+            invalidation_str = f"\n\u274c Invalidation: <b>${invalidation:,.6f}</b>" if invalidation > 0 else ""
+            entry_block = (
+                f"\U0001f4cd <b>Entry Zone:</b>\n"
+                f"<b>${entry_zone_low:,.6f} \u2013 ${entry_zone_high:,.6f}</b>"
+                f"{ideal_str}"
+                f"{invalidation_str}"
+            )
+        elif entry_price > 0:
+            entry_block = f"Entry: <b>${entry_price:,.6f}</b>"
+        else:
+            entry_block = "Entry: <b>market</b>"
+
         leverage_str = f"{leverage}x" if leverage > 0 else "auto"
 
         # TP/SL price block with percentages
@@ -141,6 +173,16 @@ class TelegramNotifier:
         # R:R line
         rr_line = f"\n\nR:R = <b>1:{risk_reward:.1f}</b>" if risk_reward > 0 else ""
 
+        # V15: Entry quality score line
+        eq_line = ""
+        if entry_quality_score >= 0:
+            eq_line = f"\nEntry Quality: <b>{entry_quality_score}/100</b>"
+
+        # Zone sources
+        sources_line = ""
+        if zone_sources:
+            sources_line = f"\n\U0001f4ca <i>Zone: {', '.join(zone_sources[:3])}</i>"
+
         # Protection line
         protection_line = "\U0001f6e1\ufe0f <b>External Engine Active</b>"
 
@@ -160,11 +202,13 @@ class TelegramNotifier:
             f"{grade_line}"
             f"{strategy_line}"
             f"{regime_line}\n\n"
-            f"Entry: <b>{entry_str}</b>\n"
+            f"{entry_block}\n"
             f"Leverage: <b>{leverage_str}</b>"
+            f"{eq_line}"
             f"{roi_line}\n\n"
             f"{tp_block}"
-            f"{rr_line}\n\n"
+            f"{rr_line}"
+            f"{sources_line}\n\n"
             f"<b>Protection:</b>\n{protection_line}"
             f"{reason_block}\n\n"
             f"<i>Signal from AI analysis \u2014 no execution dependency</i>\n"
@@ -190,8 +234,16 @@ class TelegramNotifier:
         strategy_type: str = "",
         regime: str = "",
         risk_reward: float = 0.0,
+        # V15: Entry zone fields
+        entry_zone_low: float = 0.0,
+        entry_zone_high: float = 0.0,
+        ideal_entry: float = 0.0,
+        invalidation: float = 0.0,
+        quality_tier: str = "",
+        entry_quality_score: int = -1,
+        zone_sources: list = None,
     ):
-        """Signal-only delivery — send AI signal to Telegram immediately."""
+        """V15: Signal-only delivery — send AI signal with entry zones to Telegram."""
         msg = self._build_signal_message(
             symbol=symbol, side=side, confidence=confidence,
             entry_price=entry_price, leverage=leverage,
@@ -200,6 +252,10 @@ class TelegramNotifier:
             tp_pct=tp_pct, sl_pct=sl_pct, risk_reward=risk_reward,
             setup_grade=setup_grade, strategy_type=strategy_type,
             regime=regime, reason=reason,
+            entry_zone_low=entry_zone_low, entry_zone_high=entry_zone_high,
+            ideal_entry=ideal_entry, invalidation=invalidation,
+            quality_tier=quality_tier, entry_quality_score=entry_quality_score,
+            zone_sources=zone_sources,
         )
         await self.send(msg)
 

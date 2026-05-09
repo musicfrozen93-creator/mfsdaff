@@ -1,8 +1,12 @@
 """
-V7 Confidence Engine — Weighted Normalized Scoring (0-100 Hard Cap)
+V15 Confidence Engine — Weighted Normalized Scoring (0-100 Hard Cap)
 
-Replaces the old percentage-based scoring with a 6-pillar weighted system.
-Every engine (Scalp, Swing, Sniper) uses this module for consistent scoring.
+V15 Upgrades over V7:
+  - Anti-momentum-chase penalties (exhaustion, late breakout, volume climax)
+  - Entry quality score integration (30% weight on final confidence)
+  - BTC relative strength integration (reduces long bias)
+  - Market structure integration (S/R proximity, reversal risk)
+  - Pre-reversal detection (CHoCH, exhaustion candles)
 
 Scoring Pillars:
   1. Trend Strength     → 25 pts max  (EMA alignment, distance, slope)
@@ -17,7 +21,7 @@ Total = 100 max. NEVER exceeds 100.
 Confidence Tiers:
   0-59   = NO TRADE (return HOLD)
   60-69  = Weak (tradable only if nothing better)
-  70-79  = Tradable
+  70-79  = Normal (tradable)
   80-89  = Strong
   90-100 = Elite
 
@@ -27,6 +31,8 @@ Entry Quality Filters:
 
 import logging
 from dataclasses import dataclass, field
+
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -538,6 +544,90 @@ class ConfidenceEngine:
         return bonus, descriptions
 
     # ═══════════════════════════════════════════════════════════════════
+    # V15: ANTI-MOMENTUM-CHASE PENALTIES
+    # ═══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _calc_anti_chase_penalty(
+        side: str,
+        rsi: float,
+        body: float,
+        atr: float,
+        price: float,
+        ema_slow: float,
+        vwap: float,
+        volume_ratio: float,
+        open_price: float,
+        close_price: float,
+        candles_data: list = None,
+    ) -> tuple[int, list[str]]:
+        """
+        V15: Detect and penalize momentum-chasing entries.
+        Returns (penalty_points, [reason_strings])
+        """
+        penalty = 0
+        reasons = []
+
+        # 1. Body > 2.2x ATR (overextended candle)
+        if atr > 0:
+            body_atr = body / atr
+            if body_atr > settings.V15_MAX_BODY_ATR_RATIO:
+                p = min(int((body_atr - 2.0) * 12), 20)
+                penalty += p
+                reasons.append(f"Overextended candle {body_atr:.1f}x ATR (-{p})")
+
+        # 2. Price too far from EMA21 (chasing)
+        if ema_slow > 0:
+            ema_dist = abs(price - ema_slow) / ema_slow * 100
+            if ema_dist > settings.V15_MAX_EMA_DISTANCE_PCT:
+                p = min(int((ema_dist - 1.5) * 8), 15)
+                penalty += p
+                reasons.append(f"Far from EMA21 {ema_dist:.2f}% (-{p})")
+
+        # 3. RSI exhaustion on entry
+        if side == "BUY" and rsi > settings.V15_RSI_OVERBOUGHT_LONG:
+            p = min(int((rsi - 70) * 1.2), 15)
+            penalty += p
+            reasons.append(f"RSI overbought {rsi:.0f} on LONG (-{p})")
+        elif side == "SELL" and rsi < settings.V15_RSI_OVERSOLD_SHORT:
+            p = min(int((30 - rsi) * 1.2), 15)
+            penalty += p
+            reasons.append(f"RSI oversold {rsi:.0f} on SHORT (-{p})")
+
+        # 4. Distance from VWAP too large
+        if vwap > 0:
+            vwap_dist = abs(price - vwap) / vwap * 100
+            if vwap_dist > settings.V15_MAX_VWAP_DISTANCE_PCT:
+                p = min(int((vwap_dist - 1.0) * 6), 12)
+                penalty += p
+                reasons.append(f"Far from VWAP {vwap_dist:.2f}% (-{p})")
+
+        # 5. Volume climax (exhaustion signal)
+        if volume_ratio > settings.V15_VOLUME_CLIMAX_RATIO:
+            p = min(int((volume_ratio - 2.0) * 5), 10)
+            penalty += p
+            reasons.append(f"Volume climax {volume_ratio:.1f}x (-{p})")
+
+        # 6. Consecutive impulse candles (detect via candles_data if available)
+        if candles_data and len(candles_data) >= 5:
+            impulse_count = 0
+            for c in candles_data[-5:-1]:  # last 4 candles before current
+                c_open = float(c[1])
+                c_close = float(c[4])
+                if side == "BUY" and c_close > c_open:
+                    impulse_count += 1
+                elif side == "SELL" and c_close < c_open:
+                    impulse_count += 1
+                else:
+                    break
+            if impulse_count >= settings.V15_MAX_IMPULSE_CANDLES:
+                p = min(impulse_count * 5, 15)
+                penalty += p
+                reasons.append(f"{impulse_count} impulse candles before entry (-{p})")
+
+        return penalty, reasons
+
+    # ═══════════════════════════════════════════════════════════════════
     # MAIN SCORING METHOD
     # ═══════════════════════════════════════════════════════════════════
 
@@ -574,13 +664,22 @@ class ConfidenceEngine:
         low: float = 0.0,
         open_price: float = 0.0,
         close_price: float = 0.0,
+        # V15: New inputs
+        entry_quality_score: int = -1,      # -1 = not computed yet
+        exhaustion_score: int = 0,
+        reversal_risk: int = 0,
+        btc_relative_strength: float = 1.0,
+        distance_to_support_pct: float = 5.0,
+        distance_to_resistance_pct: float = 5.0,
+        candles_data: list = None,
     ) -> ConfidenceResult:
         """
-        V7: Calculate weighted confidence score from 6 pillars.
+        V15: Calculate weighted confidence score from 6 pillars
+        + entry quality integration + anti-chase penalties.
         
         Returns ConfidenceResult with:
           - score: 0-100 (HARD CLAMPED, never exceeds 100)
-          - tier: NO_TRADE | WEAK | TRADABLE | STRONG | ELITE
+          - tier: NO_TRADE | WEAK | NORMAL | STRONG | ELITE
           - breakdown: per-pillar scores
         """
 
@@ -597,6 +696,28 @@ class ConfidenceEngine:
                 score=0, tier="NO_TRADE", action="HOLD",
                 reason=f"Entry quality rejected: {eq_reason}",
                 rejected=True, reject_reason=eq_reason,
+            )
+
+        # ── V15: Hard reject on extreme exhaustion ────────────────────
+        if settings.V15_EXHAUSTION_PENALTY_ENABLED and exhaustion_score >= settings.V15_EXHAUSTION_HARD_REJECT:
+            return ConfidenceResult(
+                score=0, tier="NO_TRADE", action="HOLD",
+                reason=f"V15 Exhaustion hard reject: score={exhaustion_score}",
+                rejected=True, reject_reason=f"Momentum exhaustion {exhaustion_score}/100",
+            )
+
+        # ── V15: Hard reject on S/R collision ─────────────────────────
+        if side == "BUY" and distance_to_resistance_pct < 0.15:
+            return ConfidenceResult(
+                score=0, tier="NO_TRADE", action="HOLD",
+                reason=f"V15 LONG into resistance: {distance_to_resistance_pct:.2f}% away",
+                rejected=True, reject_reason="LONG directly into resistance",
+            )
+        if side == "SELL" and distance_to_support_pct < 0.15:
+            return ConfidenceResult(
+                score=0, tier="NO_TRADE", action="HOLD",
+                reason=f"V15 SHORT into support: {distance_to_support_pct:.2f}% away",
+                rejected=True, reject_reason="SHORT directly into support",
             )
 
         # ── Step 2: Calculate 6 pillars ───────────────────────────────
@@ -635,17 +756,71 @@ class ConfidenceEngine:
             raw_score -= eq_penalty
             penalty_descriptions.append(f"entry quality penalty -{eq_penalty}")
 
-        # ── Step 6: HARD CLAMP to 0-100 ──────────────────────────────
-        final_score = max(0, min(int(round(raw_score)), 100))
+        # ── V15 Step 5b: Anti-momentum-chase penalties ────────────────
+        if settings.V15_EXHAUSTION_PENALTY_ENABLED:
+            chase_penalty, chase_reasons = self._calc_anti_chase_penalty(
+                side=side, rsi=rsi, body=body, atr=atr,
+                price=price, ema_slow=ema_slow, vwap=vwap,
+                volume_ratio=volume_ratio,
+                open_price=open_price, close_price=close_price,
+                candles_data=candles_data,
+            )
+            if chase_penalty > 0:
+                raw_score -= chase_penalty
+                penalty_descriptions.extend(chase_reasons)
+                logger.info(
+                    f"  [V15 ANTI-CHASE] {side}: total penalty={chase_penalty} | "
+                    f"{'; '.join(chase_reasons)}"
+                )
+
+        # ── V15 Step 5c: Exhaustion / reversal risk penalty ───────────
+        if exhaustion_score >= 40:
+            exh_penalty = int(exhaustion_score * 0.15)
+            raw_score -= exh_penalty
+            penalty_descriptions.append(f"exhaustion penalty -{exh_penalty} (score={exhaustion_score})")
+
+        if reversal_risk >= settings.V15_REVERSAL_RISK_THRESHOLD:
+            rev_penalty = int(reversal_risk * 0.12)
+            raw_score -= rev_penalty
+            penalty_descriptions.append(f"reversal risk -{rev_penalty} (risk={reversal_risk})")
+
+        # ── V15 Step 5d: BTC Relative Strength penalty ────────────────
+        if settings.V15_BTC_RS_ENABLED:
+            if side == "BUY" and btc_relative_strength < settings.V15_BTC_RS_LONG_MIN:
+                rs_penalty = min(int((1.0 - btc_relative_strength) * 40), 12)
+                raw_score -= rs_penalty
+                penalty_descriptions.append(
+                    f"Weak vs BTC RS={btc_relative_strength:.3f} (-{rs_penalty})"
+                )
+            elif side == "SELL" and btc_relative_strength > settings.V15_BTC_RS_SHORT_MAX:
+                rs_penalty = min(int((btc_relative_strength - 1.0) * 40), 12)
+                raw_score -= rs_penalty
+                penalty_descriptions.append(
+                    f"Strong vs BTC on SHORT RS={btc_relative_strength:.3f} (-{rs_penalty})"
+                )
+
+        # ── Step 6: HARD CLAMP to 0-100 (pillar score) ────────────────
+        pillar_score = max(0, min(int(round(raw_score)), 100))
+
+        # ── V15 Step 6b: Blend with entry quality score ───────────────
+        if settings.V15_ENTRY_ENGINE_ENABLED and entry_quality_score >= 0:
+            eq_weight = settings.V15_ENTRY_QUALITY_WEIGHT  # 0.30
+            final_score = int(
+                pillar_score * (1 - eq_weight) + entry_quality_score * eq_weight
+            )
+            final_score = max(0, min(final_score, 100))
+            bonus_descriptions.append(f"EQ={entry_quality_score} blend@{eq_weight:.0%}")
+        else:
+            final_score = pillar_score
 
         # ── Step 7: Determine tier ────────────────────────────────────
-        if final_score >= 90:
+        if final_score >= settings.V15_TIER_ELITE_MIN:
             tier = "ELITE"
-        elif final_score >= 80:
+        elif final_score >= settings.V15_TIER_STRONG_MIN:
             tier = "STRONG"
-        elif final_score >= 70:
-            tier = "TRADABLE"
-        elif final_score >= 60:
+        elif final_score >= settings.V15_TIER_NORMAL_MIN:
+            tier = "NORMAL"
+        elif final_score >= settings.V15_TIER_WEAK_MIN:
             tier = "WEAK"
         else:
             tier = "NO_TRADE"
@@ -655,7 +830,7 @@ class ConfidenceEngine:
 
         # ── Build reason string ───────────────────────────────────────
         reason_parts = [
-            f"V7 confidence={final_score} [{tier}]",
+            f"V15 confidence={final_score} [{tier}]",
             f"T:{trend_score:.0f}/25",
             f"V:{volume_score:.0f}/20",
             f"M:{momentum_score:.0f}/15",
@@ -663,6 +838,8 @@ class ConfidenceEngine:
             f"B:{btc_score:.0f}/15",
             f"L:{spread_score:.0f}/10",
         ]
+        if entry_quality_score >= 0:
+            reason_parts.append(f"EQ:{entry_quality_score}/100")
         if bonus_descriptions:
             reason_parts.append(f"bonus: {', '.join(bonus_descriptions)}")
         if penalty_descriptions:
@@ -678,13 +855,19 @@ class ConfidenceEngine:
             "bonus": bonus,
             "penalty": eq_penalty,
             "raw_total": round(raw_score, 1),
+            "entry_quality": entry_quality_score,
+            "exhaustion": exhaustion_score,
+            "reversal_risk": reversal_risk,
+            "btc_rs": round(btc_relative_strength, 3),
+            "pillar_score": pillar_score,
         }
 
-        logger.debug(
-            f"  V7 Confidence: {final_score} [{tier}] | "
+        logger.info(
+            f"  [V15] Confidence: {final_score} [{tier}] | "
             f"T={trend_score:.0f} V={volume_score:.0f} M={momentum_score:.0f} "
             f"S={structure_score:.0f} B={btc_score:.0f} L={spread_score:.0f} "
-            f"bonus={bonus} penalty={eq_penalty}"
+            f"EQ={entry_quality_score} exh={exhaustion_score} rev={reversal_risk} "
+            f"BTC_RS={btc_relative_strength:.3f} bonus={bonus} penalty={eq_penalty}"
         )
 
         return ConfidenceResult(

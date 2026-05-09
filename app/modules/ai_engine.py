@@ -74,6 +74,15 @@ class AIDecision:
     ai_model: str = ""
     ai_latency_ms: int = 0
     ai_fallback: bool = False
+    # V15: Additional fields for structure/entry analysis
+    volume_ratio: float = 1.0
+    open_price: float = 0.0
+    close_price: float = 0.0
+    high_price: float = 0.0
+    low_price: float = 0.0
+    bb_lower: float = 0.0
+    bb_upper: float = 0.0
+    candles_data: list = None  # Raw candle data for structure analysis
 
 
 class ScalpingEngine:
@@ -601,6 +610,15 @@ class ScalpingEngine:
                 conditions_passed=conditions_passed,
                 strategy_type=strategy_type,
                 regime=regime,
+                # V15: Additional fields for structure/entry engine
+                volume_ratio=round(volume_ratio, 4),
+                open_price=float(o),
+                close_price=float(c),
+                high_price=float(h),
+                low_price=float(l),
+                bb_lower=round(float(bb_lower), 8),
+                bb_upper=round(float(bb_upper), 8),
+                candles_data=raw,  # Pass raw candle data for structure analysis
             )
 
             # ── Layer 2: OpenAI Verification (only if Layer 1 produced a signal) ──
@@ -842,5 +860,16 @@ class ScalpingEngine:
             "ai_model": decision.ai_model,
             "ai_latency_ms": decision.ai_latency_ms,
             "ai_fallback": decision.ai_fallback,
+            # V15: Additional fields for structure/entry analysis
+            "ema_fast": decision.ema_fast,
+            "ema_slow": decision.ema_slow,
+            "volume_ratio": decision.volume_ratio,
+            "open": decision.open_price,
+            "close": decision.close_price,
+            "high": decision.high_price,
+            "low": decision.low_price,
+            "bb_lower": decision.bb_lower,
+            "bb_upper": decision.bb_upper,
+            "candles_data": decision.candles_data,
         }
         return clean_json_types(raw)

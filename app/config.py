@@ -291,6 +291,49 @@ class Settings:
     V13_LEARNING_WEEKLY_ENABLED: bool = os.getenv("V13_LEARNING_WEEKLY_ENABLED", "true").lower() == "true"
     V13_LEARNING_AUTO_DISABLE_WEIGHT: float = float(os.getenv("V13_LEARNING_AUTO_DISABLE_WEIGHT", "0.3"))
 
+    # ══════════════════════════════════════════════════════════════════════
+    # V15 — Signal Quality + Entry Engine Overhaul
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── V15 Entry Engine ─────────────────────────────────────────────────
+    V15_ENTRY_ENGINE_ENABLED: bool = os.getenv("V15_ENTRY_ENGINE_ENABLED", "true").lower() == "true"
+    V15_ENTRY_QUALITY_WEIGHT: float = float(os.getenv("V15_ENTRY_QUALITY_WEIGHT", "0.30"))  # 30% of final confidence
+
+    # ── V15 Anti-Chase / Exhaustion Penalties ────────────────────────────
+    V15_EXHAUSTION_PENALTY_ENABLED: bool = os.getenv("V15_EXHAUSTION_PENALTY_ENABLED", "true").lower() == "true"
+    V15_MAX_BODY_ATR_RATIO: float = float(os.getenv("V15_MAX_BODY_ATR_RATIO", "2.2"))
+    V15_MAX_EMA_DISTANCE_PCT: float = float(os.getenv("V15_MAX_EMA_DISTANCE_PCT", "2.0"))
+    V15_RSI_OVERBOUGHT_LONG: float = float(os.getenv("V15_RSI_OVERBOUGHT_LONG", "72.0"))
+    V15_RSI_OVERSOLD_SHORT: float = float(os.getenv("V15_RSI_OVERSOLD_SHORT", "28.0"))
+    V15_MAX_IMPULSE_CANDLES: int = int(os.getenv("V15_MAX_IMPULSE_CANDLES", "3"))
+    V15_VOLUME_CLIMAX_RATIO: float = float(os.getenv("V15_VOLUME_CLIMAX_RATIO", "2.5"))
+    V15_MAX_VWAP_DISTANCE_PCT: float = float(os.getenv("V15_MAX_VWAP_DISTANCE_PCT", "1.5"))
+
+    # ── V15 Market Structure ─────────────────────────────────────────────
+    V15_STRUCTURE_ENABLED: bool = os.getenv("V15_STRUCTURE_ENABLED", "true").lower() == "true"
+    V15_REVERSAL_RISK_THRESHOLD: int = int(os.getenv("V15_REVERSAL_RISK_THRESHOLD", "50"))
+    V15_EXHAUSTION_HARD_REJECT: int = int(os.getenv("V15_EXHAUSTION_HARD_REJECT", "80"))
+
+    # ── V15 BTC Relative Strength ────────────────────────────────────────
+    V15_BTC_RS_ENABLED: bool = os.getenv("V15_BTC_RS_ENABLED", "true").lower() == "true"
+    V15_BTC_RS_LONG_MIN: float = float(os.getenv("V15_BTC_RS_LONG_MIN", "0.95"))  # coin must outperform
+    V15_BTC_RS_SHORT_MAX: float = float(os.getenv("V15_BTC_RS_SHORT_MAX", "1.05"))  # coin must underperform
+
+    # ── V15 Multi-Signal Broadcast ───────────────────────────────────────
+    V15_MULTI_SIGNAL_ENABLED: bool = os.getenv("V15_MULTI_SIGNAL_ENABLED", "true").lower() == "true"
+    V15_MAX_SIGNALS_PER_CYCLE: int = int(os.getenv("V15_MAX_SIGNALS_PER_CYCLE", "10"))
+
+    # ── V15 Quality Tiers ────────────────────────────────────────────────
+    V15_TIER_ELITE_MIN: int = int(os.getenv("V15_TIER_ELITE_MIN", "90"))
+    V15_TIER_STRONG_MIN: int = int(os.getenv("V15_TIER_STRONG_MIN", "80"))
+    V15_TIER_NORMAL_MIN: int = int(os.getenv("V15_TIER_NORMAL_MIN", "70"))
+    V15_TIER_WEAK_MIN: int = int(os.getenv("V15_TIER_WEAK_MIN", "60"))
+
+    # ── V15 Adaptive TP/SL ───────────────────────────────────────────────
+    V15_ADAPTIVE_TPSL_ENABLED: bool = os.getenv("V15_ADAPTIVE_TPSL_ENABLED", "true").lower() == "true"
+    V15_SL_ATR_MULTIPLIER: float = float(os.getenv("V15_SL_ATR_MULTIPLIER", "1.5"))
+    V15_TP_ATR_MULTIPLIER: float = float(os.getenv("V15_TP_ATR_MULTIPLIER", "3.0"))
+
     def __post_init__(self):
         self.EXCLUDED_COINS = []
 

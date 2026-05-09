@@ -561,6 +561,23 @@ class RegisterSignalRequest(BaseModel):
     strategy_type: str = "scalp_trend_pullback"
     regime: str = ""
     indicators: dict = {}
+    # V15: Entry engine inputs (passed from analyzer)
+    ema9: Any = 0.0
+    ema21: Any = 0.0
+    vwap: Any = 0.0
+    atr: Any = 0.0
+    rsi: Any = 50.0
+    nearest_support: Any = 0.0
+    nearest_resistance: Any = 0.0
+    bb_lower: Any = 0.0
+    bb_upper: Any = 0.0
+    swing_low: Any = 0.0
+    swing_high: Any = 0.0
+    entry_quality_score: Any = -1
+    exhaustion_score: Any = 0
+    reversal_risk: Any = 0
+    btc_relative_strength: Any = 1.0
+    quality_tier: str = ""
 
     @field_validator("confidence", mode="before")
     @classmethod
@@ -570,13 +587,24 @@ class RegisterSignalRequest(BaseModel):
         except (ValueError, TypeError):
             return 70
 
-    @field_validator("current_price", "atr_pct", "spread_pct", mode="before")
+    @field_validator("current_price", "atr_pct", "spread_pct", "ema9", "ema21",
+                     "vwap", "atr", "rsi", "nearest_support", "nearest_resistance",
+                     "bb_lower", "bb_upper", "swing_low", "swing_high",
+                     "btc_relative_strength", mode="before")
     @classmethod
     def coerce_float(cls, v):
         try:
             return float(str(v)) if v is not None else 0.0
         except (ValueError, TypeError):
             return 0.0
+
+    @field_validator("entry_quality_score", "exhaustion_score", "reversal_risk", mode="before")
+    @classmethod
+    def coerce_int(cls, v):
+        try:
+            return int(float(str(v))) if v is not None else 0
+        except (ValueError, TypeError):
+            return 0
 
     @field_validator("indicators", mode="before")
     @classmethod
@@ -595,20 +623,17 @@ class RegisterSignalRequest(BaseModel):
 @router.post("/register-signal")
 async def register_signal(req: RegisterSignalRequest):
     """
-    V14: Full signal registration + Telegram delivery endpoint.
+    V15: Full signal registration + Telegram delivery endpoint.
     Called by n8n workflow AFTER signal validation passes.
 
-    This endpoint:
+    V15 upgrades:
       1. Checks signal dedup (blocks duplicate broadcasts)
-      2. Computes full TP/SL/ROI/leverage via RiskEngine
-      3. Sends PROFESSIONAL Telegram signal with all trade data
-      4. Saves signal to DB
-      5. Records state (cooldowns, daily counts)
-      6. Returns full computed data to n8n
-
-    CRITICAL: Signal dedup prevents the same symbol+side+strategy
-    from being broadcast multiple times within the cooldown window
-    (scalp=45min, swing=6hr) unless confidence improved by 10+ points.
+      2. Computes LIMIT ENTRY ZONES via EntryEngine
+      3. Computes full TP/SL/ROI/leverage via RiskEngine
+      4. Sends PROFESSIONAL Telegram signal with entry zones + quality tiers
+      5. Saves signal to DB
+      6. Records state (cooldowns, daily counts)
+      7. Returns full computed data including entry zones to n8n
     """
     try:
         symbol = req.symbol.upper().strip()
@@ -618,7 +643,7 @@ async def register_signal(req: RegisterSignalRequest):
             return {"status": "error", "message": f"Invalid action: {req.action}"}
 
         logger.info(
-            f"📝 [V14 REGISTER] Signal received: {symbol} {side} "
+            f"📝 [V15 REGISTER] Signal received: {symbol} {side} "
             f"conf={req.confidence} strategy={req.strategy_type} "
             f"regime={req.regime}"
         )
@@ -628,7 +653,7 @@ async def register_signal(req: RegisterSignalRequest):
             symbol, side, req.strategy_type, req.confidence
         )
         if is_dup:
-            logger.info(f"🔇 [V14 DEDUP] {dup_reason}")
+            logger.info(f"🔇 [V15 DEDUP] {dup_reason}")
             return {
                 "status": "duplicate_blocked",
                 "message": dup_reason,
@@ -670,9 +695,67 @@ async def register_signal(req: RegisterSignalRequest):
         tp_pct_display = round(tp_price_pct * 100, 2)
         sl_pct_display = round(sl_price_pct * 100, 2)
 
+        # ── V15: COMPUTE ENTRY ZONE via EntryEngine ──────────────────
+        entry_zone_low = 0.0
+        entry_zone_high = 0.0
+        ideal_entry = 0.0
+        invalidation_price = 0.0
+        zone_sources = []
+
+        if settings.V15_ENTRY_ENGINE_ENABLED and entry_price > 0:
+            try:
+                from app.modules.entry_engine import EntryEngine
+                entry_eng = EntryEngine()
+
+                atr_val = req.atr if req.atr > 0 else (entry_price * req.atr_pct / 100 if req.atr_pct > 0 else 0)
+
+                zone = entry_eng.calculate_entry_zone(
+                    side=side,
+                    current_price=entry_price,
+                    ema9=req.ema9,
+                    ema21=req.ema21,
+                    vwap=req.vwap,
+                    atr=atr_val,
+                    nearest_support=req.nearest_support,
+                    nearest_resistance=req.nearest_resistance,
+                    bb_lower=req.bb_lower,
+                    bb_upper=req.bb_upper,
+                    swing_low=req.swing_low,
+                    swing_high=req.swing_high,
+                    tp_price=take_profit,
+                    sl_price=stop_loss,
+                )
+
+                entry_zone_low = zone.zone_low
+                entry_zone_high = zone.zone_high
+                ideal_entry = zone.ideal_entry
+                invalidation_price = zone.invalidation
+                zone_sources = zone.zone_sources
+
+                logger.info(
+                    f"📐 [V15 ENTRY ZONE] {symbol} {side}: "
+                    f"zone={entry_zone_low:.6f}-{entry_zone_high:.6f} "
+                    f"ideal={ideal_entry:.6f} invalidation={invalidation_price:.6f} "
+                    f"sources={zone_sources}"
+                )
+            except Exception as ez_err:
+                logger.warning(f"[V15] Entry zone calc failed (non-critical): {ez_err}")
+
+        # Quality tier
+        quality_tier = req.quality_tier
+        if not quality_tier:
+            if req.confidence >= settings.V15_TIER_ELITE_MIN:
+                quality_tier = "ELITE"
+            elif req.confidence >= settings.V15_TIER_STRONG_MIN:
+                quality_tier = "STRONG"
+            elif req.confidence >= settings.V15_TIER_NORMAL_MIN:
+                quality_tier = "NORMAL"
+            elif req.confidence >= settings.V15_TIER_WEAK_MIN:
+                quality_tier = "WEAK"
+
         logger.info(
-            f"📡 [V14] SIGNAL COMPUTED: {symbol} {side} conf={req.confidence} "
-            f"strategy={req.strategy_type} grade={setup_grade} | "
+            f"📡 [V15] SIGNAL COMPUTED: {symbol} {side} conf={req.confidence} "
+            f"strategy={req.strategy_type} grade={setup_grade} tier={quality_tier} | "
             f"entry={entry_price} TP={take_profit} SL={stop_loss} "
             f"lev={leverage}x RR={risk_reward} regime={req.regime}"
         )
@@ -697,10 +780,18 @@ async def register_signal(req: RegisterSignalRequest):
                 strategy_type=req.strategy_type,
                 regime=req.regime,
                 risk_reward=risk_reward,
+                # V15 entry zone fields
+                entry_zone_low=entry_zone_low,
+                entry_zone_high=entry_zone_high,
+                ideal_entry=ideal_entry,
+                invalidation=invalidation_price,
+                quality_tier=quality_tier,
+                entry_quality_score=req.entry_quality_score,
+                zone_sources=zone_sources,
             )
-            logger.info(f"✅ [V14] Professional Telegram signal sent for {symbol} {side}")
+            logger.info(f"✅ [V15] Professional Telegram signal sent for {symbol} {side}")
         except Exception as tg_err:
-            logger.error(f"❌ [V14] Telegram send failed: {tg_err}")
+            logger.error(f"❌ [V15] Telegram send failed: {tg_err}")
 
         # ── RECORD DEDUP FINGERPRINT — only after successful processing ─
         state_manager.record_signal_sent(symbol, side, req.strategy_type, req.confidence)
@@ -746,6 +837,14 @@ async def register_signal(req: RegisterSignalRequest):
             "leverage": leverage,
             "risk_reward": risk_reward,
             "setup_grade": setup_grade,
+            "quality_tier": quality_tier,
+            # V15 entry zone fields
+            "entry_zone_low": entry_zone_low,
+            "entry_zone_high": entry_zone_high,
+            "ideal_entry": ideal_entry,
+            "invalidation": invalidation_price,
+            "zone_sources": zone_sources,
+            "entry_quality_score": req.entry_quality_score,
             "mode": "signal_only",
         }
 
