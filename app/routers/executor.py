@@ -733,13 +733,76 @@ async def register_signal(req: RegisterSignalRequest):
                 zone_sources = zone.zone_sources
 
                 logger.info(
-                    f"📐 [V15 ENTRY ZONE] {symbol} {side}: "
+                    f"📐 [V16 ENTRY ZONE] {symbol} {side}: "
                     f"zone={entry_zone_low:.6f}-{entry_zone_high:.6f} "
                     f"ideal={ideal_entry:.6f} invalidation={invalidation_price:.6f} "
+                    f"width={zone.zone_width_pct:.3f}% dist={zone.distance_from_market_pct:.3f}% "
                     f"sources={zone_sources}"
                 )
             except Exception as ez_err:
-                logger.warning(f"[V15] Entry zone calc failed (non-critical): {ez_err}")
+                logger.warning(f"[V16] Entry zone calc failed (non-critical): {ez_err}")
+
+        # ── V16: ENTRY VALIDATION GUARDS ──────────────────────────────
+        # Guard 1: Reject zero-width zones
+        if entry_zone_low > 0 and entry_zone_high > 0:
+            zone_width = entry_zone_high - entry_zone_low
+            if zone_width <= 0 or (entry_price > 0 and (zone_width / entry_price * 100) < 0.01):
+                logger.warning(f"[V16 REJECT] {symbol}: Zero-width entry zone {entry_zone_low}-{entry_zone_high}")
+                return {"status": "rejected", "reason": "zero-width entry zone", "symbol": symbol}
+
+        # Guard 2: Reject if invalidation == entry (fake invalidation)
+        if ideal_entry > 0 and invalidation_price > 0:
+            inv_dist = abs(ideal_entry - invalidation_price)
+            if inv_dist < 0.000001:
+                logger.warning(f"[V16 REJECT] {symbol}: Invalidation equals entry price")
+                return {"status": "rejected", "reason": "invalidation equals entry", "symbol": symbol}
+
+        # Guard 3: Reject if price already >70% toward TP
+        if ideal_entry > 0 and take_profit > 0 and entry_price > 0:
+            total_tp_dist = abs(take_profit - ideal_entry)
+            already_traveled = abs(entry_price - ideal_entry)
+            if total_tp_dist > 0:
+                traveled_pct = (already_traveled / total_tp_dist) * 100
+                if traveled_pct > settings.V16_MAX_TP_TRAVELED_PCT:
+                    logger.warning(
+                        f"[V16 REJECT] {symbol}: Price already {traveled_pct:.1f}% toward TP "
+                        f"(max {settings.V16_MAX_TP_TRAVELED_PCT}%)"
+                    )
+                    return {"status": "rejected", "reason": f"already {traveled_pct:.0f}% toward TP", "symbol": symbol}
+
+        # ── V16: COMPUTE TP/SL FROM IDEAL ENTRY ──────────────────────
+        from app.modules.risk_engine import RiskEngine as RE16
+        multi_tp_data = None
+
+        if ideal_entry > 0 and ideal_entry != entry_price:
+            # Recompute TP/SL from ideal entry for better R:R
+            ideal_tp, ideal_sl = RE16.compute_tp_sl_from_ideal_entry(
+                ideal_entry=ideal_entry, side=side,
+                tp_roi_pct=tp_roi_pct, sl_roi_pct=sl_roi_pct, leverage=leverage,
+            )
+            if ideal_tp > 0 and ideal_sl > 0:
+                take_profit = ideal_tp
+                stop_loss = ideal_sl
+                if entry_price > 0:
+                    tp_pct_display = round(abs(take_profit - ideal_entry) / ideal_entry * 100, 2)
+                    sl_pct_display = round(abs(ideal_entry - stop_loss) / ideal_entry * 100, 2)
+                sl_dist = abs(ideal_entry - stop_loss)
+                tp_dist = abs(take_profit - ideal_entry)
+                risk_reward = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
+                logger.info(f"[V16] TP/SL recomputed from ideal entry: TP={take_profit:.6f} SL={stop_loss:.6f} RR={risk_reward}")
+
+        # Guard 4: Reject if R:R at ideal entry < minimum
+        if risk_reward > 0 and risk_reward < settings.V16_MIN_RR_AT_IDEAL:
+            logger.warning(f"[V16 REJECT] {symbol}: R:R {risk_reward} < min {settings.V16_MIN_RR_AT_IDEAL}")
+            return {"status": "rejected", "reason": f"R:R {risk_reward} too low", "symbol": symbol}
+
+        # ── V16: COMPUTE MULTI-TP ─────────────────────────────────────
+        ref_entry = ideal_entry if ideal_entry > 0 else entry_price
+        if ref_entry > 0 and take_profit > 0 and stop_loss > 0:
+            multi_tp_data = RE16.calculate_multi_tp(
+                entry_price=ref_entry, take_profit=take_profit,
+                stop_loss=stop_loss, side=side,
+            )
 
         # Quality tier
         quality_tier = req.quality_tier
@@ -754,9 +817,9 @@ async def register_signal(req: RegisterSignalRequest):
                 quality_tier = "WEAK"
 
         logger.info(
-            f"📡 [V15] SIGNAL COMPUTED: {symbol} {side} conf={req.confidence} "
+            f"📡 [V16] SIGNAL COMPUTED: {symbol} {side} conf={req.confidence} "
             f"strategy={req.strategy_type} grade={setup_grade} tier={quality_tier} | "
-            f"entry={entry_price} TP={take_profit} SL={stop_loss} "
+            f"entry={entry_price} ideal={ideal_entry} TP={take_profit} SL={stop_loss} "
             f"lev={leverage}x RR={risk_reward} regime={req.regime}"
         )
 
@@ -788,10 +851,12 @@ async def register_signal(req: RegisterSignalRequest):
                 quality_tier=quality_tier,
                 entry_quality_score=req.entry_quality_score,
                 zone_sources=zone_sources,
+                # V16 multi-TP
+                multi_tp=multi_tp_data,
             )
-            logger.info(f"✅ [V15] Professional Telegram signal sent for {symbol} {side}")
+            logger.info(f"✅ [V16] Professional Telegram signal sent for {symbol} {side}")
         except Exception as tg_err:
-            logger.error(f"❌ [V15] Telegram send failed: {tg_err}")
+            logger.error(f"❌ [V16] Telegram send failed: {tg_err}")
 
         # ── RECORD DEDUP FINGERPRINT — only after successful processing ─
         state_manager.record_signal_sent(symbol, side, req.strategy_type, req.confidence)

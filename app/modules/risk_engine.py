@@ -537,3 +537,83 @@ class RiskEngine:
             tp1_price = round(entry_price - tp1_distance, price_precision)
 
         return True, tp1_price, take_profit
+
+    # ─── V16: Multi-TP Calculator ─────────────────────────────────────
+
+    @staticmethod
+    def calculate_multi_tp(
+        entry_price: float,
+        take_profit: float,
+        stop_loss: float,
+        side: str,
+        price_precision: int = 6,
+    ) -> dict:
+        """
+        V16: Generate TP1/TP2/TP3 price levels with ROI percentages.
+
+        Returns dict with tp1/tp2/tp3 prices, ROI%, and close percentages.
+        """
+        if not settings.V16_MULTI_TP_ENABLED or entry_price <= 0 or take_profit <= 0:
+            return {"enabled": False}
+
+        tp_distance = abs(take_profit - entry_price)
+        sl_distance = abs(entry_price - stop_loss) if stop_loss > 0 else tp_distance * 0.5
+
+        if side == "BUY":
+            tp1 = round(entry_price + tp_distance * settings.V16_TP1_DISTANCE_PCT, price_precision)
+            tp2 = round(entry_price + tp_distance * settings.V16_TP2_DISTANCE_PCT, price_precision)
+            tp3 = round(entry_price + tp_distance * settings.V16_TP3_DISTANCE_PCT, price_precision)
+            sl_roi = round(-sl_distance / entry_price * 100, 2) if entry_price > 0 else 0
+            tp1_roi = round((tp1 - entry_price) / entry_price * 100, 2)
+            tp2_roi = round((tp2 - entry_price) / entry_price * 100, 2)
+            tp3_roi = round((tp3 - entry_price) / entry_price * 100, 2)
+        else:
+            tp1 = round(entry_price - tp_distance * settings.V16_TP1_DISTANCE_PCT, price_precision)
+            tp2 = round(entry_price - tp_distance * settings.V16_TP2_DISTANCE_PCT, price_precision)
+            tp3 = round(entry_price - tp_distance * settings.V16_TP3_DISTANCE_PCT, price_precision)
+            sl_roi = round(-sl_distance / entry_price * 100, 2) if entry_price > 0 else 0
+            tp1_roi = round((entry_price - tp1) / entry_price * 100, 2)
+            tp2_roi = round((entry_price - tp2) / entry_price * 100, 2)
+            tp3_roi = round((entry_price - tp3) / entry_price * 100, 2)
+
+        return {
+            "enabled": True,
+            "tp1_price": tp1,
+            "tp2_price": tp2,
+            "tp3_price": tp3,
+            "tp1_roi_pct": tp1_roi,
+            "tp2_roi_pct": tp2_roi,
+            "tp3_roi_pct": tp3_roi,
+            "sl_roi_pct": sl_roi,
+            "tp1_close_pct": settings.V16_TP1_CLOSE_PCT,
+            "tp2_close_pct": settings.V16_TP2_CLOSE_PCT,
+            "tp3_close_pct": settings.V16_TP3_CLOSE_PCT,
+            "stop_loss": stop_loss,
+        }
+
+    @staticmethod
+    def compute_tp_sl_from_ideal_entry(
+        ideal_entry: float,
+        side: str,
+        tp_roi_pct: float,
+        sl_roi_pct: float,
+        leverage: int,
+    ) -> tuple:
+        """
+        V16: Compute TP/SL from ideal entry price instead of market price.
+        Returns (take_profit, stop_loss) price levels.
+        """
+        if ideal_entry <= 0:
+            return 0.0, 0.0
+
+        tp_price_pct = tp_roi_pct / leverage / 100.0 if leverage > 0 else tp_roi_pct / 100.0
+        sl_price_pct = sl_roi_pct / leverage / 100.0 if leverage > 0 else sl_roi_pct / 100.0
+
+        if side == "BUY":
+            tp = round(ideal_entry * (1 + tp_price_pct), 6)
+            sl = round(ideal_entry * (1 - sl_price_pct), 6)
+        else:
+            tp = round(ideal_entry * (1 - tp_price_pct), 6)
+            sl = round(ideal_entry * (1 + sl_price_pct), 6)
+
+        return tp, sl

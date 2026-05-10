@@ -80,11 +80,12 @@ class TelegramNotifier:
         quality_tier: str = "",
         entry_quality_score: int = -1,
         zone_sources: list = None,
+        # V16: Multi-TP fields
+        multi_tp: dict = None,
     ) -> str:
         """
-        V15 Professional signal message builder.
-        Full premium format with Entry Zones, TP/SL/ROI/RR/leverage/quality tiers.
-        No execution references, no account info — pure AI signal intelligence.
+        V16 Professional signal message builder.
+        Multi-TP format with entry zones, ROI/RR/leverage/quality tiers.
         """
         from datetime import datetime, timezone
 
@@ -103,11 +104,11 @@ class TelegramNotifier:
 
         # Mode-specific title
         if strategy_type.startswith("swing"):
-            title = f"\U0001f30a <b>SWING SIGNAL \u2014 AI Engine V15</b>{tier_display}"
+            title = f"\U0001f30a <b>SWING SIGNAL \u2014 AI Engine V16</b>{tier_display}"
         elif strategy_type.startswith("sniper"):
-            title = f"\U0001f3af <b>SNIPER SIGNAL \u2014 AI Engine V15</b>{tier_display}"
+            title = f"\U0001f3af <b>SNIPER SIGNAL \u2014 AI Engine V16</b>{tier_display}"
         else:
-            title = f"\U0001f680 <b>SCALP SIGNAL \u2014 AI Engine V15</b>{tier_display}"
+            title = f"\U0001f680 <b>SCALP SIGNAL \u2014 AI Engine V16</b>{tier_display}"
 
         # Grade line
         grade_emoji = {"A": "\u2b50", "B": "\U0001f537", "C": "\U0001f538"}.get(setup_grade, "")
@@ -136,13 +137,22 @@ class TelegramNotifier:
             regime_display = regime_map.get(regime, regime)
         regime_line = f"\nRegime: <b>{regime_display}</b>" if regime_display else ""
 
-        # ── V15: ENTRY ZONE BLOCK (replaces single entry price) ──────
+        # ── V16: ENTRY ZONE BLOCK with distance from market ──────────
         if entry_zone_low > 0 and entry_zone_high > 0:
+            dist_str = ""
+            if ideal_entry > 0 and entry_price > 0:
+                dist_pct = abs(entry_price - ideal_entry) / entry_price * 100
+                direction_word = "below" if side == "BUY" else "above"
+                dist_str = f"  <i>({dist_pct:.1f}% {direction_word} market)</i>"
+
             ideal_str = f"\n\U0001f3af Ideal Entry: <b>${ideal_entry:,.6f}</b>" if ideal_entry > 0 else ""
-            invalidation_str = f"\n\u274c Invalidation: <b>${invalidation:,.6f}</b>" if invalidation > 0 else ""
+
+            inv_direction = "below" if side == "BUY" else "above"
+            invalidation_str = f"\n\u274c Invalidation: <b>{inv_direction} ${invalidation:,.6f}</b>" if invalidation > 0 else ""
+
             entry_block = (
                 f"\U0001f4cd <b>Entry Zone:</b>\n"
-                f"<b>${entry_zone_low:,.6f} \u2013 ${entry_zone_high:,.6f}</b>"
+                f"<b>${entry_zone_low:,.6f} \u2013 ${entry_zone_high:,.6f}</b>{dist_str}"
                 f"{ideal_str}"
                 f"{invalidation_str}"
             )
@@ -153,8 +163,27 @@ class TelegramNotifier:
 
         leverage_str = f"{leverage}x" if leverage > 0 else "auto"
 
-        # TP/SL price block with percentages
-        if take_profit > 0 and stop_loss > 0:
+        # ── V16: MULTI-TP BLOCK ──────────────────────────────────────
+        if multi_tp and multi_tp.get("enabled"):
+            tp1_p = multi_tp.get("tp1_price", 0)
+            tp2_p = multi_tp.get("tp2_price", 0)
+            tp3_p = multi_tp.get("tp3_price", 0)
+            tp1_r = multi_tp.get("tp1_roi_pct", 0)
+            tp2_r = multi_tp.get("tp2_roi_pct", 0)
+            tp3_r = multi_tp.get("tp3_roi_pct", 0)
+            sl_r = multi_tp.get("sl_roi_pct", 0)
+            sl_p = multi_tp.get("stop_loss", stop_loss)
+            tp1_c = multi_tp.get("tp1_close_pct", 40)
+            tp2_c = multi_tp.get("tp2_close_pct", 30)
+            tp3_c = multi_tp.get("tp3_close_pct", 30)
+
+            tp_block = (
+                f"\U0001f3af TP1: <b>${tp1_p:,.6f}</b> (+{tp1_r:.1f}%) \u2014 close {tp1_c}%\n"
+                f"\U0001f3af TP2: <b>${tp2_p:,.6f}</b> (+{tp2_r:.1f}%) \u2014 close {tp2_c}%\n"
+                f"\U0001f3af TP3: <b>${tp3_p:,.6f}</b> (+{tp3_r:.1f}%) \u2014 trail {tp3_c}%\n\n"
+                f"\U0001f6d1 SL: <b>${sl_p:,.6f}</b> ({sl_r:.1f}%)"
+            )
+        elif take_profit > 0 and stop_loss > 0:
             tp_pct_display = f" (+{tp_pct:.2f}%)" if tp_pct > 0 else ""
             sl_pct_display = f" (-{sl_pct:.2f}%)" if sl_pct > 0 else ""
             tp_block = (
@@ -164,11 +193,11 @@ class TelegramNotifier:
         else:
             tp_block = "TP/SL: <i>calculate based on your risk</i>"
 
-        # TP/SL ROI line
-        if tp_roi_pct > 0 and sl_roi_pct > 0:
-            roi_line = f"\nTP ROI: <b>+{tp_roi_pct:.0f}%</b> | SL ROI: <b>-{sl_roi_pct:.0f}%</b>"
-        else:
-            roi_line = ""
+        # TP/SL ROI line (only if no multi-TP)
+        roi_line = ""
+        if not (multi_tp and multi_tp.get("enabled")):
+            if tp_roi_pct > 0 and sl_roi_pct > 0:
+                roi_line = f"\nTP ROI: <b>+{tp_roi_pct:.0f}%</b> | SL ROI: <b>-{sl_roi_pct:.0f}%</b>"
 
         # R:R line
         rr_line = f"\n\nR:R = <b>1:{risk_reward:.1f}</b>" if risk_reward > 0 else ""
@@ -242,8 +271,10 @@ class TelegramNotifier:
         quality_tier: str = "",
         entry_quality_score: int = -1,
         zone_sources: list = None,
+        # V16: Multi-TP
+        multi_tp: dict = None,
     ):
-        """V15: Signal-only delivery — send AI signal with entry zones to Telegram."""
+        """V16: Signal-only delivery — send AI signal with entry zones + multi-TP to Telegram."""
         msg = self._build_signal_message(
             symbol=symbol, side=side, confidence=confidence,
             entry_price=entry_price, leverage=leverage,
@@ -256,6 +287,7 @@ class TelegramNotifier:
             ideal_entry=ideal_entry, invalidation=invalidation,
             quality_tier=quality_tier, entry_quality_score=entry_quality_score,
             zone_sources=zone_sources,
+            multi_tp=multi_tp,
         )
         await self.send(msg)
 

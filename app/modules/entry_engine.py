@@ -110,6 +110,50 @@ class EntryEngine:
                 bb_upper, swing_high, tp_price, sl_price,
             )
 
+    def _ensure_atr(self, price: float, atr: float) -> float:
+        """V16: Ensure ATR is never zero/tiny. Synthesize from price if needed."""
+        if atr > 0 and (atr / price * 100) > 0.05:
+            return atr
+        # Synthesize ATR from config fallback percentage
+        return price * settings.V16_FALLBACK_ATR_PCT / 100.0
+
+    def _enforce_zone_constraints(
+        self, ideal: float, zone_low: float, zone_high: float,
+        invalidation: float, price: float, atr: float, side: str,
+    ) -> tuple:
+        """V16: Enforce minimum zone width, distance from market, and invalidation distance."""
+        min_width = atr * settings.V16_MIN_ZONE_WIDTH_ATR
+        min_dist = atr * settings.V16_MIN_ENTRY_DISTANCE_ATR
+        min_inv_dist = atr * settings.V16_MIN_INVALIDATION_ATR
+
+        # Enforce minimum zone width
+        current_width = zone_high - zone_low
+        if current_width < min_width:
+            expand = (min_width - current_width) / 2
+            zone_low -= expand
+            zone_high += expand
+
+        if side == "BUY":
+            # Entry zone must be BELOW market price by at least min_dist
+            if ideal > price - min_dist:
+                ideal = price - min_dist
+                zone_high = min(zone_high, price - min_dist * 0.5)
+                zone_low = min(zone_low, ideal - (zone_high - ideal))
+            # Invalidation must be below zone_low by min_inv_dist
+            if invalidation > zone_low - min_inv_dist:
+                invalidation = zone_low - min_inv_dist
+        else:
+            # Entry zone must be ABOVE market price by at least min_dist
+            if ideal < price + min_dist:
+                ideal = price + min_dist
+                zone_low = max(zone_low, price + min_dist * 0.5)
+                zone_high = max(zone_high, ideal + (ideal - zone_low))
+            # Invalidation must be above zone_high by min_inv_dist
+            if invalidation < zone_high + min_inv_dist:
+                invalidation = zone_high + min_inv_dist
+
+        return ideal, zone_low, zone_high, invalidation
+
     def _calc_long_zone(
         self,
         price: float, ema9: float, ema21: float, vwap: float, atr: float,
@@ -117,14 +161,14 @@ class EntryEngine:
         bb_lower: float, swing_low: float,
         tp_price: float, sl_price: float,
     ) -> EntryZone:
-        """Calculate LONG entry zone (below market price)."""
+        """V16: Calculate LONG entry zone (below market price) with real depth."""
+        atr = self._ensure_atr(price, atr)
         candidates = []
         sources = []
 
         # 1. EMA21 retest zone
         if ema21 > 0 and ema21 < price:
-            ema_zone = ema21 + atr * 0.1  # Slightly above EMA21
-            candidates.append(ema_zone)
+            candidates.append(ema21 + atr * 0.1)
             sources.append("EMA21 retest")
 
         # 2. EMA9 retest (shallower pullback)
@@ -149,7 +193,7 @@ class EntryEngine:
             fib_618 = price - fib_range * 0.618
             candidates.append(fib_382)
             sources.append("Fib 0.382")
-            if fib_618 > support * 0.99:
+            if fib_618 > support * 0.99 if support > 0 else True:
                 candidates.append(fib_618)
                 sources.append("Fib 0.618")
 
@@ -158,39 +202,44 @@ class EntryEngine:
             candidates.append(bb_lower + atr * 0.2)
             sources.append("BB lower zone")
 
+        # 7. V16: Fair Value Gap zone (pullback to 50% of recent impulse)
+        fvg_zone = price - atr * 1.0
+        if fvg_zone > 0 and fvg_zone < price * 0.99:
+            candidates.append(fvg_zone)
+            sources.append("FVG pullback")
+
+        # V16: If no real candidates, generate ATR-based retracement levels
         if not candidates:
-            # Fallback: small pullback from current price
-            fallback = price - atr * 0.5
-            candidates.append(fallback)
-            sources.append("ATR pullback (fallback)")
+            candidates.append(price - atr * 1.2)
+            sources.append("ATR retracement 1.2x")
+            candidates.append(price - atr * 0.8)
+            sources.append("ATR retracement 0.8x")
 
         # Filter: only levels below current price
         valid = [(c, s) for c, s in zip(candidates, sources) if c < price]
         if not valid:
-            # Nothing below price — use small offset
-            ideal = price - atr * 0.3
+            ideal = price - atr * 0.8
+            zone_low = ideal - atr * 0.3
+            zone_high = ideal + atr * 0.3
+            invalidation = zone_low - atr * 1.2
+            ideal, zone_low, zone_high, invalidation = self._enforce_zone_constraints(
+                ideal, zone_low, zone_high, invalidation, price, atr, "BUY"
+            )
             return EntryZone(
-                zone_low=round(ideal - atr * 0.2, 6),
-                zone_high=round(ideal + atr * 0.2, 6),
-                ideal_entry=round(ideal, 6),
-                invalidation=round(ideal - atr * 1.5, 6),
-                current_price=price,
-                entry_quality_score=40,
-                zone_width_pct=round((atr * 0.4 / price) * 100, 3),
+                zone_low=round(zone_low, 6), zone_high=round(zone_high, 6),
+                ideal_entry=round(ideal, 6), invalidation=round(invalidation, 6),
+                current_price=price, entry_quality_score=30,
+                zone_width_pct=round(((zone_high - zone_low) / price) * 100, 3),
                 zone_sources=["ATR offset (no levels found)"],
                 distance_from_market_pct=round(((price - ideal) / price) * 100, 3),
-                rr_at_ideal=0.0,
-                side="BUY",
+                rr_at_ideal=0.0, side="BUY",
             )
 
-        # Select best zone: closest cluster of levels
+        # Cluster nearby valid levels
         valid_prices = [v[0] for v in valid]
         valid_sources = [v[1] for v in valid]
-
-        # Sort by proximity to price (prefer shallower pullback)
         combined = sorted(zip(valid_prices, valid_sources), key=lambda x: -x[0])
 
-        # Take the cluster of nearest levels (within 1 ATR of each other)
         cluster = [combined[0]]
         for p, s in combined[1:]:
             if abs(p - cluster[0][0]) < atr * 1.5:
@@ -204,6 +253,11 @@ class EntryEngine:
         zone_high = max(cluster_prices) + atr * 0.15
         invalidation = zone_low - atr * 1.2
 
+        # V16: Enforce constraints
+        ideal, zone_low, zone_high, invalidation = self._enforce_zone_constraints(
+            ideal, zone_low, zone_high, invalidation, price, atr, "BUY"
+        )
+
         # R:R at ideal entry
         rr = 0.0
         if sl_price > 0 and tp_price > 0 and ideal > sl_price:
@@ -215,17 +269,12 @@ class EntryEngine:
         width_pct = ((zone_high - zone_low) / price) * 100
 
         return EntryZone(
-            zone_low=round(zone_low, 6),
-            zone_high=round(zone_high, 6),
-            ideal_entry=round(ideal, 6),
-            invalidation=round(invalidation, 6),
-            current_price=price,
-            entry_quality_score=0,  # Scored separately
-            zone_width_pct=round(width_pct, 3),
-            zone_sources=cluster_sources,
+            zone_low=round(zone_low, 6), zone_high=round(zone_high, 6),
+            ideal_entry=round(ideal, 6), invalidation=round(invalidation, 6),
+            current_price=price, entry_quality_score=0,
+            zone_width_pct=round(width_pct, 3), zone_sources=cluster_sources,
             distance_from_market_pct=round(dist_pct, 3),
-            rr_at_ideal=rr,
-            side="BUY",
+            rr_at_ideal=rr, side="BUY",
         )
 
     def _calc_short_zone(
@@ -235,7 +284,8 @@ class EntryEngine:
         bb_upper: float, swing_high: float,
         tp_price: float, sl_price: float,
     ) -> EntryZone:
-        """Calculate SHORT entry zone (above market price)."""
+        """V16: Calculate SHORT entry zone (above market price) with real depth."""
+        atr = self._ensure_atr(price, atr)
         candidates = []
         sources = []
 
@@ -260,26 +310,36 @@ class EntryEngine:
             candidates.append(bb_upper - atr * 0.2)
             sources.append("BB upper zone")
 
+        # V16: Fair Value Gap zone (rally to 50% of recent impulse)
+        fvg_zone = price + atr * 1.0
+        if fvg_zone > price * 1.01:
+            candidates.append(fvg_zone)
+            sources.append("FVG rally")
+
+        # V16: ATR-based fallback
         if not candidates:
-            fallback = price + atr * 0.5
-            candidates.append(fallback)
-            sources.append("ATR rally (fallback)")
+            candidates.append(price + atr * 1.2)
+            sources.append("ATR rally 1.2x")
+            candidates.append(price + atr * 0.8)
+            sources.append("ATR rally 0.8x")
 
         valid = [(c, s) for c, s in zip(candidates, sources) if c > price]
         if not valid:
-            ideal = price + atr * 0.3
+            ideal = price + atr * 0.8
+            zone_low = ideal - atr * 0.3
+            zone_high = ideal + atr * 0.3
+            invalidation = zone_high + atr * 1.2
+            ideal, zone_low, zone_high, invalidation = self._enforce_zone_constraints(
+                ideal, zone_low, zone_high, invalidation, price, atr, "SELL"
+            )
             return EntryZone(
-                zone_low=round(ideal - atr * 0.2, 6),
-                zone_high=round(ideal + atr * 0.2, 6),
-                ideal_entry=round(ideal, 6),
-                invalidation=round(ideal + atr * 1.5, 6),
-                current_price=price,
-                entry_quality_score=40,
-                zone_width_pct=round((atr * 0.4 / price) * 100, 3),
+                zone_low=round(zone_low, 6), zone_high=round(zone_high, 6),
+                ideal_entry=round(ideal, 6), invalidation=round(invalidation, 6),
+                current_price=price, entry_quality_score=30,
+                zone_width_pct=round(((zone_high - zone_low) / price) * 100, 3),
                 zone_sources=["ATR offset (no levels found)"],
                 distance_from_market_pct=round(((ideal - price) / price) * 100, 3),
-                rr_at_ideal=0.0,
-                side="SELL",
+                rr_at_ideal=0.0, side="SELL",
             )
 
         combined = sorted(zip([v[0] for v in valid], [v[1] for v in valid]),
@@ -296,6 +356,11 @@ class EntryEngine:
         zone_high = max(cluster_prices) + atr * 0.15
         invalidation = zone_high + atr * 1.2
 
+        # V16: Enforce constraints
+        ideal, zone_low, zone_high, invalidation = self._enforce_zone_constraints(
+            ideal, zone_low, zone_high, invalidation, price, atr, "SELL"
+        )
+
         rr = 0.0
         if sl_price > 0 and tp_price > 0 and sl_price > ideal:
             sl_dist = sl_price - ideal
@@ -306,17 +371,12 @@ class EntryEngine:
         width_pct = ((zone_high - zone_low) / price) * 100
 
         return EntryZone(
-            zone_low=round(zone_low, 6),
-            zone_high=round(zone_high, 6),
-            ideal_entry=round(ideal, 6),
-            invalidation=round(invalidation, 6),
-            current_price=price,
-            entry_quality_score=0,
-            zone_width_pct=round(width_pct, 3),
-            zone_sources=cluster_sources,
+            zone_low=round(zone_low, 6), zone_high=round(zone_high, 6),
+            ideal_entry=round(ideal, 6), invalidation=round(invalidation, 6),
+            current_price=price, entry_quality_score=0,
+            zone_width_pct=round(width_pct, 3), zone_sources=cluster_sources,
             distance_from_market_pct=round(dist_pct, 3),
-            rr_at_ideal=rr,
-            side="SELL",
+            rr_at_ideal=rr, side="SELL",
         )
 
     # ─── Entry Quality Scoring ────────────────────────────────────────
