@@ -334,6 +334,37 @@ class Settings:
     V15_SL_ATR_MULTIPLIER: float = float(os.getenv("V15_SL_ATR_MULTIPLIER", "1.5"))
     V15_TP_ATR_MULTIPLIER: float = float(os.getenv("V15_TP_ATR_MULTIPLIER", "3.0"))
 
+    # ══════════════════════════════════════════════════════════════════════
+    # V16 — Real Entry Engine + Multi-TP + Signal Timing Fix
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── V16 Entry Zone Constraints ───────────────────────────────────────
+    # Minimum zone width as ATR multiplier (prevents zero-width zones)
+    V16_MIN_ZONE_WIDTH_ATR: float = float(os.getenv("V16_MIN_ZONE_WIDTH_ATR", "0.4"))
+    # Minimum distance of ideal entry from market price as ATR multiplier
+    V16_MIN_ENTRY_DISTANCE_ATR: float = float(os.getenv("V16_MIN_ENTRY_DISTANCE_ATR", "0.3"))
+    # Fallback ATR% when no ATR data is available (synthetic ATR = price * this / 100)
+    V16_FALLBACK_ATR_PCT: float = float(os.getenv("V16_FALLBACK_ATR_PCT", "1.5"))
+    # Minimum invalidation distance from ideal entry as ATR multiplier
+    V16_MIN_INVALIDATION_ATR: float = float(os.getenv("V16_MIN_INVALIDATION_ATR", "1.0"))
+
+    # ── V16 Entry Validation Guards ──────────────────────────────────────
+    # Reject if price has already traveled >N% toward TP from ideal entry
+    V16_MAX_TP_TRAVELED_PCT: float = float(os.getenv("V16_MAX_TP_TRAVELED_PCT", "70.0"))
+    # Minimum R:R at ideal entry for signal to pass
+    V16_MIN_RR_AT_IDEAL: float = float(os.getenv("V16_MIN_RR_AT_IDEAL", "1.5"))
+    # Minimum entry quality score for signal broadcast (0-100)
+    V16_MIN_ENTRY_QUALITY: int = int(os.getenv("V16_MIN_ENTRY_QUALITY", "25"))
+
+    # ── V16 Multi-TP Structure ───────────────────────────────────────────
+    V16_MULTI_TP_ENABLED: bool = os.getenv("V16_MULTI_TP_ENABLED", "true").lower() == "true"
+    V16_TP1_DISTANCE_PCT: float = float(os.getenv("V16_TP1_DISTANCE_PCT", "0.40"))   # 40% of full target
+    V16_TP2_DISTANCE_PCT: float = float(os.getenv("V16_TP2_DISTANCE_PCT", "0.75"))   # 75% of full target
+    V16_TP3_DISTANCE_PCT: float = float(os.getenv("V16_TP3_DISTANCE_PCT", "1.00"))   # 100% full target
+    V16_TP1_CLOSE_PCT: int = int(os.getenv("V16_TP1_CLOSE_PCT", "40"))               # close 40% at TP1
+    V16_TP2_CLOSE_PCT: int = int(os.getenv("V16_TP2_CLOSE_PCT", "30"))               # close 30% at TP2
+    V16_TP3_CLOSE_PCT: int = int(os.getenv("V16_TP3_CLOSE_PCT", "30"))               # trail 30% at TP3
+
     def __post_init__(self):
         self.EXCLUDED_COINS = []
 
