@@ -578,6 +578,8 @@ class RegisterSignalRequest(BaseModel):
     reversal_risk: Any = 0
     btc_relative_strength: Any = 1.0
     quality_tier: str = ""
+    # V17: Signal creation timestamp (ISO format or epoch seconds)
+    signal_created_at: Optional[str] = None
 
     @field_validator("confidence", mode="before")
     @classmethod
@@ -660,6 +662,48 @@ async def register_signal(req: RegisterSignalRequest):
                 "symbol": symbol,
                 "side": side,
             }
+
+        # ── V17: STALENESS CHECK — reject signals that are too old ───
+        if settings.V17_STALENESS_CHECK_ENABLED and req.signal_created_at:
+            try:
+                from datetime import datetime, timezone
+                import time as _time
+
+                # Parse ISO timestamp or epoch seconds
+                created_at = req.signal_created_at
+                if isinstance(created_at, str) and created_at.replace('.', '').replace('-', '').replace(':', '').replace('T', '').replace('Z', '').isdigit() and len(created_at) < 15:
+                    # Epoch seconds
+                    signal_time = datetime.fromtimestamp(float(created_at), tz=timezone.utc)
+                elif isinstance(created_at, str):
+                    # ISO format
+                    signal_time = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                else:
+                    signal_time = None
+
+                if signal_time:
+                    now_utc = datetime.now(timezone.utc)
+                    age_seconds = (now_utc - signal_time).total_seconds()
+
+                    is_swing = req.strategy_type.startswith("swing")
+                    ttl = settings.V17_SIGNAL_TTL_SWING_SEC if is_swing else settings.V17_SIGNAL_TTL_SCALP_SEC
+
+                    if age_seconds > ttl:
+                        logger.info(
+                            f"⏰ [V17 STALE] {symbol} {side}: signal is {age_seconds:.0f}s old "
+                            f"(TTL={ttl}s). Rejecting."
+                        )
+                        return {
+                            "status": "expired",
+                            "reason": f"Signal is {age_seconds:.0f}s old (max {ttl}s)",
+                            "symbol": symbol,
+                            "side": side,
+                        }
+                    else:
+                        logger.debug(
+                            f"  [V17] Signal age: {age_seconds:.0f}s (TTL={ttl}s) — OK"
+                        )
+            except Exception as stale_err:
+                logger.debug(f"V17 staleness check failed (non-critical): {stale_err}")
 
         # ── Calculate TP/SL via RiskEngine (NO Binance API needed) ───
         risk_engine = RiskEngine()

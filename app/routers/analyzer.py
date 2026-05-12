@@ -31,6 +31,7 @@ from app.modules.strategy_tracker import strategy_tracker
 from app.modules.telegram import TelegramNotifier
 from app.modules.market_structure import MarketStructureAnalyzer
 from app.modules.entry_engine import EntryEngine
+from app.modules.confidence_engine import ConfidenceEngine
 from app.config import settings
 from app.utils.serialization import clean_json_types
 
@@ -500,6 +501,67 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
                                 btc_relative_strength=struct.btc_relative_strength,
                             )
                             v15_data["entry_quality_score"] = eq_result.total_score
+
+                        # ── V17: MOVE COMPLETION GATE ─────────────────────
+                        # Reject exhausted setups HERE (at analysis time),
+                        # not at register-signal time (too late).
+                        if settings.V17_ANTICIPATION_ENABLED and price > 0:
+                            try:
+                                from app.modules.risk_engine import RiskEngine as _RE
+                                _re = _RE()
+                                _lev = _re.get_leverage(ai_result.get("confidence", 70), ai_result.get("strategy_type", ""), ai_result.get("atr_pct", 0))
+                                _tp_roi, _sl_roi = _re.get_tp_sl_roi(ai_result.get("confidence", 70), strategy_type=ai_result.get("strategy_type", ""))
+                                _tp_pct = _re.roi_to_price_pct(_tp_roi, _lev)
+                                if side == "BUY":
+                                    _tp_price = price * (1 + _tp_pct)
+                                else:
+                                    _tp_price = price * (1 - _tp_pct)
+
+                                move_check = entry_eng.check_move_completion(
+                                    side=side,
+                                    current_price=price,
+                                    ideal_entry=price,  # At analysis time, ideal = current
+                                    tp_price=_tp_price,
+                                    ema21=v15_data["ema21"],
+                                    vwap=ai_result.get("vwap", 0.0),
+                                    strategy_type=ai_result.get("strategy_type", ""),
+                                )
+                                v15_data["move_exhausted"] = move_check.is_exhausted
+                                v15_data["move_traveled_pct"] = move_check.traveled_pct
+                                v15_data["move_rejection_reason"] = move_check.rejection_reason
+
+                                if move_check.is_exhausted:
+                                    ai_result["action"] = "HOLD"
+                                    ai_result["reason"] = f"V17 MOVE FILTER: {move_check.rejection_reason}"
+                                    logger.info(
+                                        f"  [V17 REJECT] {symbol} {side}: "
+                                        f"{move_check.rejection_reason}"
+                                    )
+                            except Exception as mc_err:
+                                logger.warning(f"V17 move check failed for {symbol}: {mc_err}")
+
+                        # ── V17: EARLY SETUP DETECTION (WATCH tier) ───────
+                        if settings.V17_ANTICIPATION_ENABLED:
+                            try:
+                                early_result = ConfidenceEngine.detect_early_setup(
+                                    ema9=v15_data["ema9"],
+                                    ema21=v15_data["ema21"],
+                                    price=price,
+                                    vwap=ai_result.get("vwap", 0.0),
+                                    volume_ratio=ai_result.get("volume_ratio", 1.0),
+                                    rsi=ai_result.get("rsi", 50.0),
+                                    bos_detected=getattr(struct, "bos_detected", False) if struct else False,
+                                    choch_detected=getattr(struct, "choch_detected", False) if struct else False,
+                                    liquidity_sweep=getattr(struct, "liquidity_sweep", False) if struct else False,
+                                    sweep_direction=getattr(struct, "sweep_direction", "NONE") if struct else "NONE",
+                                    side=side,
+                                )
+                                v15_data["early_setup_score"] = early_result["early_score"]
+                                v15_data["early_signals"] = early_result["signals"]
+                                v15_data["is_watch_worthy"] = early_result["is_watch_worthy"]
+                            except Exception as es_err:
+                                logger.debug(f"V17 early setup detection failed for {symbol}: {es_err}")
+
                     except Exception as struct_err:
                         logger.warning(f"V15 structure analysis failed for {symbol}: {struct_err}")
 
@@ -623,10 +685,52 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
         and SCALP_WATCH <= c.get("confidence", 0) < SCALP_MIN
     ]
 
+    # ═══════════════════════════════════════════════════════════════════
+    # V17: WATCH SIGNAL EXTRACTION + TELEGRAM DELIVERY
+    # Identify setups that are forming (high early score, moderate conf)
+    # and send compact WATCH alerts directly to Telegram.
+    # ═══════════════════════════════════════════════════════════════════
+    watch_signals = []
+    if settings.V17_ANTICIPATION_ENABLED:
+        V17_WATCH_MIN = settings.V17_WATCH_MIN_CONFIDENCE
+        watch_signals = [
+            c for c in filtered
+            if c.get("action") not in ("HOLD", None)
+            and V17_WATCH_MIN <= c.get("confidence", 0) < SCALP_MIN
+            and c.get("early_setup_score", 0) >= settings.V17_WATCH_MIN_EARLY_SCORE
+            and c.get("is_watch_worthy", False)
+        ][:settings.V17_MAX_WATCH_PER_CYCLE]
+
+        # Send WATCH alerts via Telegram (non-blocking, best-effort)
+        if watch_signals:
+            try:
+                telegram = TelegramNotifier()
+                is_swing_mode = False  # This is the scalp endpoint
+                ttl = settings.V17_SIGNAL_TTL_SCALP_SEC
+                for ws in watch_signals:
+                    try:
+                        await telegram.send_watch_signal(
+                            symbol=ws.get("symbol", ""),
+                            side=ws.get("action", "BUY"),
+                            confidence=ws.get("confidence", 0),
+                            current_price=ws.get("current_price", 0.0),
+                            entry_zone_low=ws.get("entry_zone_low", 0.0),
+                            entry_zone_high=ws.get("entry_zone_high", 0.0),
+                            ideal_entry=ws.get("ideal_entry", 0.0),
+                            strategy_type=ws.get("strategy_type", ""),
+                            early_signals=ws.get("early_signals", []),
+                            ttl_seconds=ttl,
+                        )
+                    except Exception as ws_err:
+                        logger.debug(f"V17 WATCH telegram failed for {ws.get('symbol')}: {ws_err}")
+                logger.info(f"  [V17] Sent {len(watch_signals)} WATCH alerts")
+            except Exception as watch_err:
+                logger.warning(f"V17 WATCH alert delivery failed: {watch_err}")
+
     logger.info(
-        f"  V15 Scalp result: {len(analyzed)} scalp | {len(sniper_signals)} sniper | "
+        f"  V17 Scalp result: {len(analyzed)} scalp | {len(sniper_signals)} sniper | "
         f"Tradeable: {len(tradeable)} | Watchlist: {len(scalp_watchlist)} | "
-        f"Regime: {regime} | Session: {session_mult}"
+        f"WATCH: {len(watch_signals)} | Regime: {regime} | Session: {session_mult}"
     )
 
     return clean_json_types({
@@ -638,6 +742,8 @@ async def analyze_scalp_batch(req: ScalpBatchRequest):
         "regime": regime,
         "session_multiplier": session_mult,
         "scalp_watchlist": scalp_watchlist,
+        "watch_signals": watch_signals,
+        "watch_count": len(watch_signals),
         "coins": tradeable if tradeable else filtered[:req.top_n],
     })
 

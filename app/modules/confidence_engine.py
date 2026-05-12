@@ -880,6 +880,130 @@ class ConfidenceEngine:
             penalty_applied=penalty_descriptions,
         )
 
+    # ═══════════════════════════════════════════════════════════════════
+    # V17: EARLY SETUP DETECTION — Pre-breakout condition scoring
+    # Identifies setups BEFORE full expansion triggers.
+    # Used to emit WATCH signals for setups that are forming.
+    # ═══════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def detect_early_setup(
+        ema9: float = 0.0,
+        ema21: float = 0.0,
+        price: float = 0.0,
+        vwap: float = 0.0,
+        volume_ratio: float = 1.0,
+        rsi: float = 50.0,
+        bos_detected: bool = False,
+        choch_detected: bool = False,
+        liquidity_sweep: bool = False,
+        sweep_direction: str = "NONE",
+        side: str = "BUY",
+        ema_distance_pct: float = 0.0,
+    ) -> dict:
+        """
+        V17: Score pre-breakout conditions that indicate a setup is forming.
+
+        Returns:
+            {
+                "early_score": int (0-100),
+                "signals": list[str],
+                "is_watch_worthy": bool,
+            }
+
+        Scoring:
+          - EMA compression releasing (0.05-0.20% distance): +15
+          - Volume pre-build (1.3-1.8x avg): +10
+          - Volume building (1.0-1.3x with momentum): +5
+          - Liquidity sweep detected: +15
+          - VWAP interaction (price near VWAP): +10
+          - BOS/CHoCH forming: +10
+          - RSI positioned well (not extended): +5
+        """
+        score = 0
+        signals = []
+
+        if not settings.V17_ANTICIPATION_ENABLED:
+            return {"early_score": 0, "signals": [], "is_watch_worthy": False}
+
+        # 1. EMA compression release detection
+        # Very tight EMAs that are starting to separate = setup forming
+        if ema9 > 0 and ema21 > 0:
+            dist = ema_distance_pct if ema_distance_pct > 0 else (
+                abs(ema9 - ema21) / ema21 * 100 if ema21 > 0 else 0
+            )
+            if 0.03 <= dist <= 0.20:
+                # Tight compression — check if curling in right direction
+                if side == "BUY" and ema9 >= ema21:
+                    score += 15
+                    signals.append(f"EMA compression releasing bullish ({dist:.2f}%)")
+                elif side == "SELL" and ema9 <= ema21:
+                    score += 15
+                    signals.append(f"EMA compression releasing bearish ({dist:.2f}%)")
+                else:
+                    # Compression exists but direction not confirmed yet
+                    score += 8
+                    signals.append(f"EMA compression detected ({dist:.2f}%)")
+
+        # 2. Volume pre-build (building but not spiking yet)
+        if volume_ratio >= 1.3 and volume_ratio <= 1.8:
+            score += 10
+            signals.append(f"Volume pre-building {volume_ratio:.1f}x avg")
+        elif volume_ratio >= 1.1 and volume_ratio < 1.3:
+            score += 5
+            signals.append(f"Volume building {volume_ratio:.1f}x avg")
+
+        # 3. Liquidity sweep detection (institutional catalyst)
+        if liquidity_sweep:
+            if (side == "BUY" and sweep_direction == "BULL_SWEEP") or \
+               (side == "SELL" and sweep_direction == "BEAR_SWEEP"):
+                score += 15
+                signals.append(f"Liquidity sweep: {sweep_direction}")
+            elif sweep_direction != "NONE":
+                score += 8
+                signals.append(f"Liquidity sweep (counter): {sweep_direction}")
+
+        # 4. VWAP interaction (price touching/crossing VWAP)
+        if vwap > 0 and price > 0:
+            vwap_dist = abs(price - vwap) / vwap * 100
+            if vwap_dist <= 0.15:
+                score += 10
+                signals.append(f"Price at VWAP ({vwap_dist:.2f}%)")
+            elif vwap_dist <= 0.30:
+                score += 5
+                signals.append(f"Price near VWAP ({vwap_dist:.2f}%)")
+
+        # 5. BOS/CHoCH forming (market structure shift)
+        if bos_detected:
+            score += 10
+            signals.append("Break of Structure detected")
+        elif choch_detected:
+            score += 10
+            signals.append("Change of Character detected")
+
+        # 6. RSI positioned well (not overextended)
+        if side == "BUY" and 35 <= rsi <= 55:
+            score += 5
+            signals.append(f"RSI well-positioned for LONG ({rsi:.0f})")
+        elif side == "SELL" and 45 <= rsi <= 65:
+            score += 5
+            signals.append(f"RSI well-positioned for SHORT ({rsi:.0f})")
+
+        is_watch = score >= settings.V17_WATCH_MIN_EARLY_SCORE
+
+        if is_watch:
+            logger.info(
+                f"  [V17 EARLY] {side} early_score={score} | "
+                f"{', '.join(signals)}"
+            )
+
+        return {
+            "early_score": min(score, 100),
+            "signals": signals,
+            "is_watch_worthy": is_watch,
+        }
+
 
 # Singleton
 confidence_engine = ConfidenceEngine()
+

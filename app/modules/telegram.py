@@ -292,6 +292,124 @@ class TelegramNotifier:
         await self.send(msg)
 
     # ═══════════════════════════════════════════════════════════════════
+    # V17: WATCH SIGNAL — Setup forming, not yet confirmed
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def send_watch_signal(
+        self,
+        symbol: str,
+        side: str,
+        confidence: int,
+        current_price: float,
+        entry_zone_low: float = 0.0,
+        entry_zone_high: float = 0.0,
+        ideal_entry: float = 0.0,
+        strategy_type: str = "",
+        early_signals: list = None,
+        ttl_seconds: int = 600,
+    ):
+        """V17: Send compact WATCH alert for a forming setup."""
+        msg = self._build_watch_message(
+            symbol=symbol, side=side, confidence=confidence,
+            current_price=current_price,
+            entry_zone_low=entry_zone_low, entry_zone_high=entry_zone_high,
+            ideal_entry=ideal_entry, strategy_type=strategy_type,
+            early_signals=early_signals or [],
+            ttl_seconds=ttl_seconds,
+        )
+        await self.send(msg)
+
+    @staticmethod
+    def _build_watch_message(
+        symbol: str,
+        side: str,
+        confidence: int,
+        current_price: float,
+        entry_zone_low: float = 0.0,
+        entry_zone_high: float = 0.0,
+        ideal_entry: float = 0.0,
+        strategy_type: str = "",
+        early_signals: list = None,
+        ttl_seconds: int = 600,
+    ) -> str:
+        """V17: Build compact WATCH notification message."""
+        from datetime import datetime, timezone
+
+        direction = "\U0001f7e2 LONG" if side == "BUY" else "\U0001f534 SHORT"
+
+        # Type line
+        if strategy_type.startswith("swing"):
+            type_display = "\U0001f30a Swing"
+        elif strategy_type.startswith("sniper"):
+            type_display = "\U0001f3af Sniper"
+        else:
+            type_display = "\u26a1 Scalping"
+
+        # Entry zone block
+        zone_block = ""
+        if entry_zone_low > 0 and entry_zone_high > 0:
+            zone_block = (
+                f"\n\n\U0001f4cd <b>Watching Zone:</b>\n"
+                f"<b>${entry_zone_low:,.6f} \u2013 ${entry_zone_high:,.6f}</b>"
+            )
+            if ideal_entry > 0:
+                zone_block += f"\n\U0001f3af Ideal Entry: <b>${ideal_entry:,.6f}</b>"
+        elif current_price > 0:
+            zone_block = f"\n\nPrice: <b>${current_price:,.6f}</b>"
+
+        # Early signals (what's forming)
+        signals_block = ""
+        if early_signals:
+            signals_str = "\n".join(f"  \u2022 {s}" for s in early_signals[:4])
+            signals_block = f"\n\n\U0001f4ca <i>Forming signals:</i>\n{signals_str}"
+
+        # TTL line
+        ttl_min = ttl_seconds // 60
+        ttl_line = f"\n\n\u23f0 Expires in <b>{ttl_min} minutes</b>"
+
+        # Timestamp
+        ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+        msg = (
+            f"\U0001f441\ufe0f <b>WATCH \u2014 Setup Forming</b>\n"
+            f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+            f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+            f"\u2500\u2500\n"
+            f"Coin: <b>{symbol}</b>\n"
+            f"Side: <b>{direction}</b>\n"
+            f"Confidence: <b>{confidence}%</b>\n"
+            f"Type: <b>{type_display}</b>"
+            f"{zone_block}"
+            f"{signals_block}"
+            f"{ttl_line}\n\n"
+            f"\u2139\ufe0f <i>This is a WATCH alert \u2014 setup is forming.</i>\n"
+            f"<i>Wait for CONFIRMED signal before entering.</i>\n"
+            f"<i>\U0001f552 {ts}</i>"
+        )
+        return msg
+
+    # ═══════════════════════════════════════════════════════════════════
+    # V17: EXPIRED SIGNAL — Setup expired before confirmation
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def send_expired_signal(
+        self,
+        symbol: str,
+        side: str,
+        reason: str = "Setup expired before confirmation",
+    ):
+        """V17: Send brief expiration notice."""
+        from datetime import datetime, timezone
+        direction = "\U0001f7e2 LONG" if side == "BUY" else "\U0001f534 SHORT"
+        ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+        msg = (
+            f"\u23f0 <b>EXPIRED</b> \u2014 {symbol} {direction}\n"
+            f"<i>{reason}. No entry.</i>\n"
+            f"<i>\U0001f552 {ts}</i>"
+        )
+        await self.send(msg)
+
+    # ═══════════════════════════════════════════════════════════════════
     # LEGACY: Execution-based messages (kept for backward compat)
     # ═══════════════════════════════════════════════════════════════════
 

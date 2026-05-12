@@ -365,6 +365,37 @@ class Settings:
     V16_TP2_CLOSE_PCT: int = int(os.getenv("V16_TP2_CLOSE_PCT", "30"))               # close 30% at TP2
     V16_TP3_CLOSE_PCT: int = int(os.getenv("V16_TP3_CLOSE_PCT", "30"))               # trail 30% at TP3
 
+    # ══════════════════════════════════════════════════════════════════════
+    # V17 — Signal Anticipation Engine (Latency + Timing Fix)
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── V17 Master Toggle ────────────────────────────────────────────────
+    V17_ANTICIPATION_ENABLED: bool = os.getenv("V17_ANTICIPATION_ENABLED", "true").lower() == "true"
+
+    # ── V17 Move Completion Filter ───────────────────────────────────────
+    # Reject signal if price already traveled >N% toward TP from ideal entry
+    V17_SCALP_MAX_MOVE_PCT: float = float(os.getenv("V17_SCALP_MAX_MOVE_PCT", "35.0"))
+    V17_SWING_MAX_MOVE_PCT: float = float(os.getenv("V17_SWING_MAX_MOVE_PCT", "40.0"))
+    # Reject if price is too extended from key MAs
+    V17_MAX_EMA_EXTENSION_PCT: float = float(os.getenv("V17_MAX_EMA_EXTENSION_PCT", "2.0"))
+    V17_MAX_VWAP_EXTENSION_PCT: float = float(os.getenv("V17_MAX_VWAP_EXTENSION_PCT", "1.5"))
+
+    # ── V17 WATCH Signal Tier ────────────────────────────────────────────
+    # Minimum confidence for WATCH alerts (setup forming, not yet confirmed)
+    V17_WATCH_MIN_CONFIDENCE: int = int(os.getenv("V17_WATCH_MIN_CONFIDENCE", "55"))
+    # Minimum early-setup detection score to emit WATCH (0-100)
+    V17_WATCH_MIN_EARLY_SCORE: int = int(os.getenv("V17_WATCH_MIN_EARLY_SCORE", "25"))
+    # Max WATCH alerts per scan cycle (prevent spam)
+    V17_MAX_WATCH_PER_CYCLE: int = int(os.getenv("V17_MAX_WATCH_PER_CYCLE", "5"))
+
+    # ── V17 Signal Staleness / TTL ───────────────────────────────────────
+    V17_STALENESS_CHECK_ENABLED: bool = os.getenv("V17_STALENESS_CHECK_ENABLED", "true").lower() == "true"
+    # Signal time-to-live in seconds (reject if older than this)
+    V17_SIGNAL_TTL_SCALP_SEC: int = int(os.getenv("V17_SIGNAL_TTL_SCALP_SEC", "600"))    # 10 minutes
+    V17_SIGNAL_TTL_SWING_SEC: int = int(os.getenv("V17_SIGNAL_TTL_SWING_SEC", "1800"))   # 30 minutes
+    # Reject if price drifted >N% toward TP since signal creation
+    V17_STALE_DRIFT_PCT: float = float(os.getenv("V17_STALE_DRIFT_PCT", "50.0"))
+
     def __post_init__(self):
         self.EXCLUDED_COINS = []
 

@@ -639,3 +639,133 @@ class EntryEngine:
             penalties=penalties,
             bonuses=bonuses,
         )
+
+    # ═══════════════════════════════════════════════════════════════════
+    # V17: MOVE COMPLETION FILTER
+    # Rejects signals where the move has already traveled too far
+    # toward TP, or price is overextended from key MAs.
+    # ═══════════════════════════════════════════════════════════════════
+
+    def check_move_completion(
+        self,
+        side: str,
+        current_price: float,
+        ideal_entry: float,
+        tp_price: float,
+        ema21: float = 0.0,
+        vwap: float = 0.0,
+        strategy_type: str = "",
+    ) -> 'MoveCompletionResult':
+        """
+        V17: Check if a setup is exhausted (move already completed).
+
+        Returns MoveCompletionResult with:
+          - is_exhausted: True if signal should be rejected
+          - traveled_pct: how much of the TP distance is already gone
+          - rejection_reason: human-readable reason
+
+        Rejection triggers:
+          1. Price already >35% (scalp) / >40% (swing) toward TP from ideal entry
+          2. Price extended >2.0% from EMA21
+          3. Price extended >1.5% from VWAP
+        """
+        reasons = []
+        traveled_pct = 0.0
+        ema_extension_pct = 0.0
+        vwap_extension_pct = 0.0
+        is_exhausted = False
+
+        if not settings.V17_ANTICIPATION_ENABLED:
+            return MoveCompletionResult(
+                is_exhausted=False, traveled_pct=0.0,
+                ema_extension_pct=0.0, vwap_extension_pct=0.0,
+                rejection_reason="",
+            )
+
+        is_swing = strategy_type.startswith("swing")
+        max_move_pct = settings.V17_SWING_MAX_MOVE_PCT if is_swing else settings.V17_SCALP_MAX_MOVE_PCT
+
+        # ── Check 1: TP progress (how much of the move is done) ──────
+        ref_entry = ideal_entry if ideal_entry > 0 else current_price
+        if tp_price > 0 and ref_entry > 0:
+            total_tp_dist = abs(tp_price - ref_entry)
+            if total_tp_dist > 0:
+                if side == "BUY":
+                    already_traveled = max(current_price - ref_entry, 0)
+                else:
+                    already_traveled = max(ref_entry - current_price, 0)
+
+                traveled_pct = (already_traveled / total_tp_dist) * 100
+
+                if traveled_pct > max_move_pct:
+                    is_exhausted = True
+                    reasons.append(
+                        f"Price already {traveled_pct:.0f}% toward TP "
+                        f"(max {max_move_pct:.0f}%)"
+                    )
+
+        # ── Check 2: EMA21 extension ─────────────────────────────────
+        if ema21 > 0 and current_price > 0:
+            ema_extension_pct = abs(current_price - ema21) / ema21 * 100
+            max_ema = settings.V17_MAX_EMA_EXTENSION_PCT
+
+            # Only flag as extended if price is on the WRONG side of EMA
+            # (for BUY: extended above EMA, for SELL: extended below EMA)
+            if side == "BUY" and current_price > ema21 and ema_extension_pct > max_ema:
+                is_exhausted = True
+                reasons.append(
+                    f"Price {ema_extension_pct:.1f}% above EMA21 "
+                    f"(max {max_ema:.1f}%)"
+                )
+            elif side == "SELL" and current_price < ema21 and ema_extension_pct > max_ema:
+                is_exhausted = True
+                reasons.append(
+                    f"Price {ema_extension_pct:.1f}% below EMA21 "
+                    f"(max {max_ema:.1f}%)"
+                )
+
+        # ── Check 3: VWAP extension ──────────────────────────────────
+        if vwap > 0 and current_price > 0:
+            vwap_extension_pct = abs(current_price - vwap) / vwap * 100
+            max_vwap = settings.V17_MAX_VWAP_EXTENSION_PCT
+
+            if side == "BUY" and current_price > vwap and vwap_extension_pct > max_vwap:
+                is_exhausted = True
+                reasons.append(
+                    f"Price {vwap_extension_pct:.1f}% above VWAP "
+                    f"(max {max_vwap:.1f}%)"
+                )
+            elif side == "SELL" and current_price < vwap and vwap_extension_pct > max_vwap:
+                is_exhausted = True
+                reasons.append(
+                    f"Price {vwap_extension_pct:.1f}% below VWAP "
+                    f"(max {max_vwap:.1f}%)"
+                )
+
+        rejection_reason = " | ".join(reasons) if reasons else ""
+
+        if is_exhausted:
+            logger.info(
+                f"  [V17 MOVE FILTER] {side}: EXHAUSTED — {rejection_reason} | "
+                f"tp_progress={traveled_pct:.1f}% ema_ext={ema_extension_pct:.1f}% "
+                f"vwap_ext={vwap_extension_pct:.1f}%"
+            )
+
+        return MoveCompletionResult(
+            is_exhausted=is_exhausted,
+            traveled_pct=round(traveled_pct, 1),
+            ema_extension_pct=round(ema_extension_pct, 1),
+            vwap_extension_pct=round(vwap_extension_pct, 1),
+            rejection_reason=rejection_reason,
+        )
+
+
+@dataclass
+class MoveCompletionResult:
+    """V17: Result of move completion check."""
+    is_exhausted: bool           # True = reject this signal
+    traveled_pct: float          # % of TP distance already traveled
+    ema_extension_pct: float     # % distance from EMA21
+    vwap_extension_pct: float    # % distance from VWAP
+    rejection_reason: str        # Human-readable rejection reason
+
