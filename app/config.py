@@ -396,6 +396,39 @@ class Settings:
     # Reject if price drifted >N% toward TP since signal creation
     V17_STALE_DRIFT_PCT: float = float(os.getenv("V17_STALE_DRIFT_PCT", "50.0"))
 
+    # ══════════════════════════════════════════════════════════════════════
+    # V18 — Signal Lifecycle Engine (Local Rule-Based Monitoring)
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── V18 Master Toggle ────────────────────────────────────────────────
+    V18_LIFECYCLE_ENABLED: bool = os.getenv("V18_LIFECYCLE_ENABLED", "true").lower() == "true"
+
+    # ── V18 Monitor Interval (seconds between price checks) ─────────────
+    # Lower = faster entry detection. Higher = less API usage.
+    # Recommended: 10-30s. Default 15s.
+    V18_MONITOR_INTERVAL_SEC: int = int(os.getenv("V18_MONITOR_INTERVAL_SEC", "15"))
+
+    # ── V18 Entry Validity Timers (seconds) ──────────────────────────────
+    # How long a WATCHING signal stays valid before expiring.
+    V18_SCALP_ENTRY_TTL_SEC: int = int(os.getenv("V18_SCALP_ENTRY_TTL_SEC", "1200"))    # 20 minutes
+    V18_SWING_ENTRY_TTL_SEC: int = int(os.getenv("V18_SWING_ENTRY_TTL_SEC", "21600"))   # 6 hours
+    V18_SNIPER_ENTRY_TTL_SEC: int = int(os.getenv("V18_SNIPER_ENTRY_TTL_SEC", "900"))   # 15 minutes
+
+    # ── V18 Stale Signal Rejection (before WATCH emission) ───────────────
+    # Max % of TP1 distance already traveled before rejecting as stale
+    V18_SCALP_MAX_STALE_PCT: float = float(os.getenv("V18_SCALP_MAX_STALE_PCT", "30.0"))
+    V18_SWING_MAX_STALE_PCT: float = float(os.getenv("V18_SWING_MAX_STALE_PCT", "40.0"))
+
+    # ── V18 Signal Flow Mode ────────────────────────────────────────────
+    # When True: /register-signal sends WATCH first, then lifecycle tracks entry
+    # When False: legacy behavior (immediate signal as if entry happened)
+    V18_WATCH_FIRST_MODE: bool = os.getenv("V18_WATCH_FIRST_MODE", "true").lower() == "true"
+
+    # ── V18 Auto-cleanup ─────────────────────────────────────────────────
+    # Remove terminal signals older than N hours from the store
+    V18_CLEANUP_AGE_HOURS: int = int(os.getenv("V18_CLEANUP_AGE_HOURS", "24"))
+
+
     def __post_init__(self):
         self.EXCLUDED_COINS = []
 

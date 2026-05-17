@@ -861,46 +861,194 @@ async def register_signal(req: RegisterSignalRequest):
                 quality_tier = "WEAK"
 
         logger.info(
-            f"📡 [V16] SIGNAL COMPUTED: {symbol} {side} conf={req.confidence} "
+            f"📡 [V18] SIGNAL COMPUTED: {symbol} {side} conf={req.confidence} "
             f"strategy={req.strategy_type} grade={setup_grade} tier={quality_tier} | "
             f"entry={entry_price} ideal={ideal_entry} TP={take_profit} SL={stop_loss} "
             f"lev={leverage}x RR={risk_reward} regime={req.regime}"
         )
 
-        # ── SEND PROFESSIONAL TELEGRAM SIGNAL ────────────────────────
+        # ══════════════════════════════════════════════════════════════
+        # V18: SIGNAL LIFECYCLE ENGINE — WATCH-FIRST MODE
+        # ══════════════════════════════════════════════════════════════
+        # Instead of sending an immediate "trade now" signal, we:
+        #   1. Check if signal is already stale (reject if so)
+        #   2. Save signal to local store with all lifecycle data
+        #   3. Send WATCH SIGNAL to Telegram
+        #   4. Let the lifecycle monitor track entry/TP/SL/expiry
+        # ══════════════════════════════════════════════════════════════
+
+        lifecycle_id = None
         telegram = TelegramNotifier()
-        try:
-            await telegram.send_signal(
-                symbol=symbol,
-                side=side,
-                confidence=req.confidence,
-                entry_price=entry_price,
-                leverage=leverage,
-                take_profit=take_profit,
-                stop_loss=stop_loss,
-                tp_pct=tp_pct_display,
-                sl_pct=sl_pct_display,
-                tp_roi_pct=tp_roi_pct,
-                sl_roi_pct=sl_roi_pct,
-                reason=req.reason,
-                setup_grade=setup_grade,
-                strategy_type=req.strategy_type,
-                regime=req.regime,
-                risk_reward=risk_reward,
-                # V15 entry zone fields
-                entry_zone_low=entry_zone_low,
-                entry_zone_high=entry_zone_high,
-                ideal_entry=ideal_entry,
-                invalidation=invalidation_price,
-                quality_tier=quality_tier,
-                entry_quality_score=req.entry_quality_score,
-                zone_sources=zone_sources,
-                # V16 multi-TP
-                multi_tp=multi_tp_data,
-            )
-            logger.info(f"✅ [V16] Professional Telegram signal sent for {symbol} {side}")
-        except Exception as tg_err:
-            logger.error(f"❌ [V16] Telegram send failed: {tg_err}")
+
+        if settings.V18_LIFECYCLE_ENABLED and settings.V18_WATCH_FIRST_MODE:
+            try:
+                import time as _t
+                from app.modules.signal_store import StoredSignal, signal_store as _store
+                from app.modules.signal_lifecycle import SignalLifecycleEngine
+
+                # ── Determine signal type and TTL ─────────────────────
+                if req.strategy_type.startswith("swing"):
+                    sig_type = "swing"
+                    ttl_sec = settings.V18_SWING_ENTRY_TTL_SEC
+                elif req.strategy_type.startswith("sniper"):
+                    sig_type = "sniper"
+                    ttl_sec = settings.V18_SNIPER_ENTRY_TTL_SEC
+                else:
+                    sig_type = "scalp"
+                    ttl_sec = settings.V18_SCALP_ENTRY_TTL_SEC
+
+                # ── Check if already tracking this symbol+side ────────
+                if _store.has_active_for_symbol(symbol, side):
+                    logger.info(
+                        f"🔇 [V18] Already tracking {symbol} {side} — skipping duplicate"
+                    )
+                    return {
+                        "status": "duplicate_blocked",
+                        "message": f"Already tracking {symbol} {side} in lifecycle",
+                        "symbol": symbol,
+                        "side": side,
+                    }
+
+                # ── Extract TP1/TP2/TP3 from multi-TP or fallback ─────
+                tp1 = 0.0
+                tp2 = 0.0
+                tp3 = 0.0
+                if multi_tp_data and multi_tp_data.get("enabled"):
+                    tp1 = multi_tp_data.get("tp1_price", 0)
+                    tp2 = multi_tp_data.get("tp2_price", 0)
+                    tp3 = multi_tp_data.get("tp3_price", 0)
+                elif take_profit > 0:
+                    # Create synthetic multi-TP from single TP
+                    ref = ideal_entry if ideal_entry > 0 else entry_price
+                    if ref > 0:
+                        full_dist = abs(take_profit - ref)
+                        if side == "BUY":
+                            tp1 = round(ref + full_dist * 0.4, 6)
+                            tp2 = round(ref + full_dist * 0.75, 6)
+                            tp3 = take_profit
+                        else:
+                            tp1 = round(ref - full_dist * 0.4, 6)
+                            tp2 = round(ref - full_dist * 0.75, 6)
+                            tp3 = take_profit
+
+                now = _t.time()
+
+                # ── Build stored signal ──────────────────────────────
+                stored = StoredSignal(
+                    symbol=symbol,
+                    side=side,
+                    entry_price=entry_price,
+                    entry_zone_low=entry_zone_low,
+                    entry_zone_high=entry_zone_high,
+                    ideal_entry=ideal_entry,
+                    tp1_price=tp1,
+                    tp2_price=tp2,
+                    tp3_price=tp3,
+                    stop_loss=stop_loss,
+                    invalidation_price=invalidation_price,
+                    signal_type=sig_type,
+                    strategy_type=req.strategy_type,
+                    confidence=req.confidence,
+                    leverage=leverage,
+                    risk_reward=risk_reward,
+                    setup_grade=setup_grade,
+                    quality_tier=quality_tier,
+                    regime=req.regime,
+                    reason=req.reason,
+                    created_at=now,
+                    expiry_time=now + ttl_sec,
+                    expiry_seconds=ttl_sec,
+                    tp_roi_pct=tp_roi_pct,
+                    sl_roi_pct=sl_roi_pct,
+                    tp_pct=tp_pct_display,
+                    sl_pct=sl_pct_display,
+                )
+
+                # ── STALE CHECK — reject if move already too far ─────
+                is_stale, stale_reason = SignalLifecycleEngine.check_stale_before_watch(
+                    stored, entry_price
+                )
+                if is_stale:
+                    logger.info(
+                        f"⏰ [V18 STALE] {symbol} {side}: {stale_reason} — rejected"
+                    )
+                    return {
+                        "status": "rejected",
+                        "reason": f"Stale: {stale_reason}",
+                        "symbol": symbol,
+                        "side": side,
+                    }
+
+                # ── SAVE to local store ──────────────────────────────
+                lifecycle_id = _store.add_signal(stored)
+
+                # ── SEND WATCH SIGNAL to Telegram ────────────────────
+                ttl_min = ttl_sec // 60
+                try:
+                    await telegram.send_watch_signal(
+                        symbol=symbol,
+                        side=side,
+                        confidence=req.confidence,
+                        current_price=entry_price,
+                        entry_zone_low=entry_zone_low,
+                        entry_zone_high=entry_zone_high,
+                        ideal_entry=ideal_entry,
+                        strategy_type=req.strategy_type,
+                        early_signals=[
+                            f"Conf: {req.confidence}% | Grade: {setup_grade}",
+                            f"R:R = 1:{risk_reward:.1f} | Leverage: {leverage}x",
+                            f"TP1: ${tp1:,.6f}" if tp1 > 0 else "",
+                            f"SL: ${stop_loss:,.6f}" if stop_loss > 0 else "",
+                        ],
+                        ttl_seconds=ttl_sec,
+                    )
+                    logger.info(
+                        f"👁️ [V18] WATCH signal sent for {symbol} {side} "
+                        f"(lifecycle={lifecycle_id}, TTL={ttl_min}m)"
+                    )
+                except Exception as tg_err:
+                    logger.error(f"❌ [V18] WATCH Telegram send failed: {tg_err}")
+
+            except Exception as lc_err:
+                logger.error(
+                    f"[V18] Lifecycle setup failed, falling back to legacy: {lc_err}",
+                    exc_info=True,
+                )
+                # Fall through to legacy signal send below
+                lifecycle_id = None
+
+        # ── LEGACY FALLBACK: Send immediate signal if lifecycle disabled ──
+        if not lifecycle_id:
+            try:
+                await telegram.send_signal(
+                    symbol=symbol,
+                    side=side,
+                    confidence=req.confidence,
+                    entry_price=entry_price,
+                    leverage=leverage,
+                    take_profit=take_profit,
+                    stop_loss=stop_loss,
+                    tp_pct=tp_pct_display,
+                    sl_pct=sl_pct_display,
+                    tp_roi_pct=tp_roi_pct,
+                    sl_roi_pct=sl_roi_pct,
+                    reason=req.reason,
+                    setup_grade=setup_grade,
+                    strategy_type=req.strategy_type,
+                    regime=req.regime,
+                    risk_reward=risk_reward,
+                    entry_zone_low=entry_zone_low,
+                    entry_zone_high=entry_zone_high,
+                    ideal_entry=ideal_entry,
+                    invalidation=invalidation_price,
+                    quality_tier=quality_tier,
+                    entry_quality_score=req.entry_quality_score,
+                    zone_sources=zone_sources,
+                    multi_tp=multi_tp_data,
+                )
+                logger.info(f"✅ [LEGACY] Immediate signal sent for {symbol} {side}")
+            except Exception as tg_err:
+                logger.error(f"❌ Telegram send failed: {tg_err}")
 
         # ── RECORD DEDUP FINGERPRINT — only after successful processing ─
         state_manager.record_signal_sent(symbol, side, req.strategy_type, req.confidence)
@@ -929,11 +1077,12 @@ async def register_signal(req: RegisterSignalRequest):
             logger.warning(f"State update failed (non-critical): {state_err}")
 
         return {
-            "status": "signal_sent",
+            "status": "watching" if lifecycle_id else "signal_sent",
             "symbol": symbol,
             "side": side,
             "confidence": req.confidence,
             "signal_id": signal_id,
+            "lifecycle_id": lifecycle_id,
             "strategy_type": req.strategy_type,
             "regime": req.regime,
             "entry_price": entry_price,
@@ -954,7 +1103,7 @@ async def register_signal(req: RegisterSignalRequest):
             "invalidation": invalidation_price,
             "zone_sources": zone_sources,
             "entry_quality_score": req.entry_quality_score,
-            "mode": "signal_only",
+            "mode": "lifecycle" if lifecycle_id else "signal_only",
         }
 
     except Exception as exc:
@@ -965,6 +1114,158 @@ async def register_signal(req: RegisterSignalRequest):
             "symbol": getattr(req, "symbol", "?"),
         }
 
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# V18: SIGNAL LIFECYCLE ENDPOINTS — monitoring, status, manual control
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@router.get("/lifecycle/active")
+async def get_active_lifecycle_signals():
+    """
+    V18: List all active (non-terminal) signals being tracked.
+    Used by n8n monitoring node and admin dashboard.
+    NO AI CALLS.
+    """
+    try:
+        from app.modules.signal_store import signal_store
+        active = signal_store.get_active_signals()
+        return {
+            "status": "ok",
+            "count": len(active),
+            "signals": [
+                {
+                    "signal_id": s.signal_id,
+                    "symbol": s.symbol,
+                    "side": s.side,
+                    "state": s.state,
+                    "signal_type": s.signal_type,
+                    "confidence": s.confidence,
+                    "entry_price": s.entry_price,
+                    "ideal_entry": s.ideal_entry,
+                    "entry_zone_low": s.entry_zone_low,
+                    "entry_zone_high": s.entry_zone_high,
+                    "tp1_price": s.tp1_price,
+                    "tp2_price": s.tp2_price,
+                    "tp3_price": s.tp3_price,
+                    "stop_loss": s.stop_loss,
+                    "last_price": s.last_price,
+                    "age_seconds": round(s.age_seconds, 0),
+                    "expiry_seconds": s.expiry_seconds,
+                    "created_at": s.created_at,
+                    "entry_hit_at": s.entry_hit_at,
+                }
+                for s in active
+            ],
+        }
+    except Exception as e:
+        logger.error(f"[LIFECYCLE] Error fetching active signals: {e}")
+        return {"status": "error", "message": str(e), "count": 0, "signals": []}
+
+
+@router.get("/lifecycle/status")
+async def get_lifecycle_status():
+    """
+    V18: Get lifecycle monitor status and summary statistics.
+    NO AI CALLS.
+    """
+    try:
+        from app.modules.signal_store import signal_store
+        from app.modules.signal_lifecycle import signal_monitor
+
+        all_signals = signal_store.get_all_signals()
+        active = [s for s in all_signals if not s.is_terminal]
+        watching = [s for s in active if s.state == "WATCHING"]
+        in_trade = [s for s in active if s.is_active_trade]
+        terminal = [s for s in all_signals if s.is_terminal]
+
+        # Count by terminal state
+        state_counts = {}
+        for s in all_signals:
+            state_counts[s.state] = state_counts.get(s.state, 0) + 1
+
+        return {
+            "status": "ok",
+            "monitor_running": signal_monitor.is_running,
+            "monitor_interval_sec": settings.V18_MONITOR_INTERVAL_SEC,
+            "watch_first_mode": settings.V18_WATCH_FIRST_MODE,
+            "total_signals": len(all_signals),
+            "active_count": len(active),
+            "watching_count": len(watching),
+            "in_trade_count": len(in_trade),
+            "terminal_count": len(terminal),
+            "state_distribution": state_counts,
+            "scalp_ttl_sec": settings.V18_SCALP_ENTRY_TTL_SEC,
+            "swing_ttl_sec": settings.V18_SWING_ENTRY_TTL_SEC,
+        }
+    except Exception as e:
+        logger.error(f"[LIFECYCLE] Error fetching status: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@router.post("/lifecycle/trigger-check")
+async def trigger_lifecycle_check():
+    """
+    V18: Manually trigger a monitoring cycle.
+    Called by n8n monitoring scheduler as a backup heartbeat.
+    NO AI CALLS — just price comparison logic.
+    """
+    try:
+        from app.modules.signal_lifecycle import signal_monitor
+
+        if not signal_monitor.is_running:
+            return {
+                "status": "error",
+                "message": "Lifecycle monitor is not running",
+            }
+
+        # Trigger one check cycle
+        await signal_monitor._tick()
+
+        from app.modules.signal_store import signal_store
+        active = signal_store.count_active()
+
+        return {
+            "status": "ok",
+            "message": "Lifecycle check completed",
+            "active_signals": active,
+        }
+    except Exception as e:
+        logger.error(f"[LIFECYCLE] Manual trigger error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@router.delete("/lifecycle/signal/{signal_id}")
+async def cancel_lifecycle_signal(signal_id: str):
+    """
+    V18: Manually cancel/remove a signal from lifecycle tracking.
+    NO AI CALLS.
+    """
+    try:
+        from app.modules.signal_store import signal_store, SignalState
+
+        sig = signal_store.get_signal(signal_id)
+        if not sig:
+            return {
+                "status": "error",
+                "message": f"Signal {signal_id} not found",
+            }
+
+        old_state = sig.state
+        signal_store.update_state(signal_id, SignalState.INVALIDATED)
+
+        return {
+            "status": "ok",
+            "message": f"Signal {signal_id} cancelled",
+            "symbol": sig.symbol,
+            "side": sig.side,
+            "old_state": old_state,
+            "new_state": SignalState.INVALIDATED.value,
+        }
+    except Exception as e:
+        logger.error(f"[LIFECYCLE] Cancel signal error: {e}")
+        return {"status": "error", "message": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════════
