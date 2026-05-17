@@ -1207,9 +1207,31 @@ async def get_lifecycle_status():
 @router.post("/lifecycle/trigger-check")
 async def trigger_lifecycle_check():
     """
-    V18: Manually trigger a monitoring cycle.
-    Called by n8n monitoring scheduler as a backup heartbeat.
-    NO AI CALLS — just price comparison logic.
+    V18: Lifecycle monitoring cycle — triggered by n8n every 30s.
+    Returns structured event data for n8n event routing.
+
+    NO AI CALLS — purely deterministic price comparison logic.
+
+    Response structure:
+      {
+        "status": "ok",
+        "active_signals": N,
+        "has_events": true/false,
+        "event_count": N,
+        "events": [
+          {
+            "event_type": "ENTRY_HIT" | "ACTIVE" | "TP1_HIT" | ... ,
+            "symbol": "BTCUSDT",
+            "side": "BUY",
+            "entry_price": 68000.0,
+            "current_price": 68500.0,
+            "roi_pct": 0.74,
+            "tp_progress": "ACTIVE",
+            ...
+          }
+        ],
+        "signal_summary": [ ... ]
+      }
     """
     try:
         from app.modules.signal_lifecycle import signal_monitor
@@ -1218,22 +1240,26 @@ async def trigger_lifecycle_check():
             return {
                 "status": "error",
                 "message": "Lifecycle monitor is not running",
+                "has_events": False,
+                "event_count": 0,
+                "events": [],
+                "active_signals": 0,
             }
 
-        # Trigger one check cycle
-        await signal_monitor._tick()
+        # Trigger full evaluation cycle with event collection
+        result = await signal_monitor.trigger_check_for_n8n()
+        return result
 
-        from app.modules.signal_store import signal_store
-        active = signal_store.count_active()
-
-        return {
-            "status": "ok",
-            "message": "Lifecycle check completed",
-            "active_signals": active,
-        }
     except Exception as e:
         logger.error(f"[LIFECYCLE] Manual trigger error: {e}")
-        return {"status": "error", "message": str(e)}
+        return {
+            "status": "error",
+            "message": str(e),
+            "has_events": False,
+            "event_count": 0,
+            "events": [],
+            "active_signals": 0,
+        }
 
 
 @router.delete("/lifecycle/signal/{signal_id}")

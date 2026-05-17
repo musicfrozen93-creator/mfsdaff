@@ -320,15 +320,34 @@ class SignalMonitor:
             await asyncio.sleep(interval)
 
     async def _tick(self) -> None:
-        """Single monitoring cycle."""
+        """Single monitoring cycle. Returns list of events for n8n routing."""
         self._cycle_count += 1
+        events = await self._evaluate_signals()
+
+        # Periodic save (every 4 cycles = ~1 minute at 15s interval)
+        if self._cycle_count % 4 == 0:
+            self._store.periodic_save()
+
+        # Periodic cleanup (every 240 cycles = ~1 hour)
+        if self._cycle_count % 240 == 0:
+            self._store.cleanup_old_signals(max_age_hours=24)
+
+        return events
+
+    async def _evaluate_signals(self) -> list:
+        """
+        Evaluate all active signals and collect lifecycle events.
+        Returns list of event dicts for n8n routing.
+        NO AI CALLS — only price comparisons.
+        """
+        events = []
         active_signals = self._store.get_active_signals()
 
         if not active_signals:
             # Periodic cleanup even when idle
             if self._cycle_count % 60 == 0:  # Every ~15 minutes
                 self._store.cleanup_old_signals(max_age_hours=24)
-            return
+            return events
 
         # Get unique symbols to fetch
         symbols = list(set(s.symbol for s in active_signals))
@@ -339,7 +358,7 @@ class SignalMonitor:
 
         if not prices:
             logger.debug("[LIFECYCLE MONITOR] No prices fetched this cycle")
-            return
+            return events
 
         # Evaluate each signal
         transitions = 0
@@ -362,26 +381,133 @@ class SignalMonitor:
                         f"📊 [LIFECYCLE] {sig.symbol} {sig.side}: "
                         f"{old_state} → {new_state.value} @ ${price:.6f}"
                     )
-                    # Send Telegram notification for this transition
-                    await self._notify_transition(updated, old_state, price)
+
+                    # DEDUP CHECK: Only notify if not already notified for this state
+                    is_first = self._store.mark_notified(
+                        sig.signal_id, new_state.value
+                    )
+
+                    if is_first:
+                        # Send Telegram notification for this transition
+                        await self._notify_transition(updated, old_state, price)
+
+                        # Build event data for n8n routing
+                        event = self._build_event(updated, old_state, new_state, price)
+                        events.append(event)
+                    else:
+                        logger.debug(
+                            f"[LIFECYCLE] Skipping duplicate notification: "
+                            f"{sig.symbol} {new_state.value}"
+                        )
 
                     # After TP1 hit, move SL to breakeven
                     if new_state == SignalState.TP1_HIT:
                         self._move_sl_to_breakeven(sig)
-
-        # Periodic save (every 4 cycles = ~1 minute at 15s interval)
-        if self._cycle_count % 4 == 0:
-            self._store.periodic_save()
-
-        # Periodic cleanup (every 240 cycles = ~1 hour)
-        if self._cycle_count % 240 == 0:
-            self._store.cleanup_old_signals(max_age_hours=24)
 
         if transitions > 0:
             logger.info(
                 f"[LIFECYCLE MONITOR] Cycle #{self._cycle_count}: "
                 f"{transitions} transitions, {len(active_signals)} active signals"
             )
+
+        return events
+
+    def _build_event(
+        self, signal: StoredSignal, old_state: str,
+        new_state: SignalState, price: float
+    ) -> dict:
+        """
+        Build structured event dict for n8n routing.
+        Contains all data needed for Telegram message formatting.
+        NO AI CALLS.
+        """
+        from datetime import datetime, timezone
+
+        entry_ref = signal.ideal_entry or signal.entry_price
+
+        # Calculate current ROI
+        roi_pct = 0.0
+        if entry_ref > 0:
+            if signal.side == "BUY":
+                roi_pct = ((price - entry_ref) / entry_ref) * 100
+            else:
+                roi_pct = ((entry_ref - price) / entry_ref) * 100
+
+        # TP progress tracker
+        tp_progress = "NONE"
+        if new_state in (SignalState.TP3_HIT,):
+            tp_progress = "TP3_COMPLETE"
+        elif new_state in (SignalState.TP2_HIT,):
+            tp_progress = "TP2_HIT"
+        elif new_state in (SignalState.TP1_HIT,):
+            tp_progress = "TP1_HIT"
+        elif signal.state in (SignalState.TP2_HIT.value,):
+            tp_progress = "TP2_HIT"
+        elif signal.state in (SignalState.TP1_HIT.value,):
+            tp_progress = "TP1_HIT"
+        elif signal.state in (SignalState.ACTIVE.value, SignalState.ENTRY_HIT.value):
+            tp_progress = "ACTIVE"
+
+        return {
+            "event_type": new_state.value,
+            "previous_state": old_state,
+            "signal_id": signal.signal_id,
+            "symbol": signal.symbol,
+            "side": signal.side,
+            "entry_price": entry_ref,
+            "current_price": price,
+            "current_status": new_state.value,
+            "tp1_price": signal.tp1_price,
+            "tp2_price": signal.tp2_price,
+            "tp3_price": signal.tp3_price,
+            "stop_loss": signal.stop_loss,
+            "entry_zone_low": signal.entry_zone_low,
+            "entry_zone_high": signal.entry_zone_high,
+            "strategy_type": signal.strategy_type,
+            "signal_type": signal.signal_type,
+            "confidence": signal.confidence,
+            "leverage": signal.leverage,
+            "risk_reward": signal.risk_reward,
+            "quality_tier": signal.quality_tier,
+            "roi_pct": round(roi_pct, 2),
+            "tp_progress": tp_progress,
+            "age_seconds": round(signal.age_seconds, 0),
+            "expiry_seconds": signal.expiry_seconds,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "notified_states": signal.notified_states.copy()
+                if isinstance(signal.notified_states, list) else [],
+        }
+
+    async def trigger_check_for_n8n(self) -> dict:
+        """
+        N8n-specific lifecycle check. Triggers one evaluation cycle
+        and returns structured data for n8n event routing.
+        NO AI CALLS.
+        """
+        events = await self._evaluate_signals()
+        active_count = self._store.count_active()
+
+        # Get current summary of all active signals for context
+        active_signals = self._store.get_active_signals()
+        signal_summary = []
+        for s in active_signals:
+            signal_summary.append({
+                "signal_id": s.signal_id,
+                "symbol": s.symbol,
+                "side": s.side,
+                "state": s.state,
+                "last_price": s.last_price,
+                "age_seconds": round(s.age_seconds, 0),
+            })
+
+        return {
+            "status": "ok",
+            "active_signals": active_count,
+            "has_events": len(events) > 0,
+            "event_count": len(events),
+            "events": events,
+            "signal_summary": signal_summary,
+        }
 
     def _move_sl_to_breakeven(self, signal: StoredSignal) -> None:
         """After TP1 hit, move SL to entry price (breakeven)."""
@@ -512,5 +638,5 @@ class SignalMonitor:
             )
 
 
-# ── Singleton ─────────────────────────────────────────────────────────
+# ── Singleton ─────────────────────────────────────────────────────────────────
 signal_monitor = SignalMonitor()

@@ -69,6 +69,7 @@ class StoredSignal:
 
     # Lifecycle
     state: str = SignalState.WATCHING.value
+    previous_state: str = ""          # Previous state before last transition
     created_at: float = 0.0          # Unix timestamp
     entry_hit_at: float = 0.0        # When entry was touched
     active_at: float = 0.0           # When confirmed active
@@ -81,6 +82,9 @@ class StoredSignal:
     last_checked_at: float = 0.0
     last_price: float = 0.0
 
+    # Notification tracking — prevents duplicate Telegram spam
+    notified_states: list = field(default_factory=list)  # States already sent to Telegram
+
     # Validity
     expiry_time: float = 0.0         # Unix timestamp when signal expires
     expiry_seconds: int = 0          # Original TTL in seconds
@@ -92,13 +96,20 @@ class StoredSignal:
     sl_pct: float = 0.0
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # Ensure notified_states is always a list (survives JSON round-trip)
+        if not isinstance(d.get('notified_states'), list):
+            d['notified_states'] = []
+        return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "StoredSignal":
         # Filter to only known fields
         known = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in known}
+        # Ensure notified_states is a list
+        if 'notified_states' in filtered and not isinstance(filtered['notified_states'], list):
+            filtered['notified_states'] = []
         return cls(**filtered)
 
     @property
@@ -188,6 +199,12 @@ class SignalStore:
                 return None
 
             old_state = sig.state
+
+            # STATE CHANGE PROTECTION: Only transition if state actually changed
+            if old_state == new_state.value:
+                return None
+
+            sig.previous_state = old_state
             sig.state = new_state.value
             now = time.time()
 
@@ -221,6 +238,40 @@ class SignalStore:
             f"price={price:.6f}" if price > 0 else ""
         )
         return sig
+
+    def mark_notified(self, signal_id: str, state: str) -> bool:
+        """
+        Mark a state as notified to prevent duplicate Telegram messages.
+        Returns True if this is the FIRST notification for this state.
+        Returns False if already notified (duplicate — skip sending).
+        """
+        with self._lock:
+            sig = self._signals.get(signal_id)
+            if not sig:
+                return False
+
+            # Initialize notified_states if needed
+            if not isinstance(sig.notified_states, list):
+                sig.notified_states = []
+
+            # DUPLICATE CHECK: already notified for this state
+            if state in sig.notified_states:
+                return False
+
+            # Mark as notified
+            sig.notified_states.append(state)
+            self._save()
+            return True
+
+    def is_notified(self, signal_id: str, state: str) -> bool:
+        """Check if a state has already been notified."""
+        with self._lock:
+            sig = self._signals.get(signal_id)
+            if not sig:
+                return False
+            if not isinstance(sig.notified_states, list):
+                return False
+            return state in sig.notified_states
 
     def update_price(self, signal_id: str, price: float) -> None:
         """Update last known price for a signal."""
